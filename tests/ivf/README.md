@@ -66,6 +66,30 @@ Validation targets explicitly disable fast-math so NaN/Inf checks survive the
 parent project's optimization flags. Contract tests use checked failures, not
 C++ `assert`, so they still test in Release.
 
+## Full-project administrator prerequisites
+
+See [README.md](../../baselines/DiskANN/README.md) installation guides.
+
+Fresh installed-library verification and full-project build commands are in
+[system-build-and-s02-verification.md](../../docs/system-build-and-s02-verification.md).
+The corrected D01 record uses that fresh evidence, not earlier history. The current system build
+links the real BufANN driver and passes three suites, including the heap test.
+
+The D01 local-package/discovery workaround and its added math smoke-test target
+were rolled back. Current dependency/build success is established by the new
+verification, not those historical test results. S00/S01 and the two
+dependency-light test suites remain unchanged.
+
+## S02 prerequisite — graph-free heap
+
+`ivf_heap_tests` is available only in the full Linux BufANN configuration with
+`IVF_BUILD_CONTRACT_TESTS=ON`. It tests zero-degree, no-PQ storage for all dtypes;
+guarded padded-coordinate copies into aligned scratch; external tags;
+publication; flush and clean reopen. An unpublished allocation stays invisible,
+but its checkpoint is explicitly rejected by the backend. Streaming loading,
+the IVF storage adapter, allocation rollback, and batched candidate fetches
+are not implemented by this test. S02 remains in progress.
+
 ## Coverage and limits
 
 `ivf_contracts` covers invalid counts/settings, sample support, candidate ceiling

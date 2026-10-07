@@ -1,5 +1,5 @@
 # DiskANN
-##Linux build:
+## Linux build:
 
 Install the following packages through apt-get, and Intel MKL either by downloading the installer or using [apt](https://software.intel.com/en-us/articles/installing-intel-free-libs-and-python-apt-repo) (we tested with build 2019.4-070).
 ```
@@ -11,7 +11,7 @@ Build
 mkdir build && cd build && cmake .. && make -j 
 ```
 
-##Windows build:
+## Windows build:
 
 The Windows version has been tested with the enterprise editions of Visual Studio 2017 and Visual Studio 2019
 

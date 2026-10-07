@@ -99,3 +99,6 @@ The single-node Lindorm IVF backend is under development. `ivf_build` and
 search. See [tests/ivf/README.md](tests/ivf/README.md) for review segments, test
 coverage, and dependency-light build commands. Existing BufANN/SPFresh workloads
 remain the comparison baselines.
+
+Administrator actions for Linux/WSL libaio and MKL/Intel OpenMP dependencies
+have been used for installing dependencies. 

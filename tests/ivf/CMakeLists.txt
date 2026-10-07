@@ -24,6 +24,13 @@ endforeach()
 option(IVF_BUILD_CONTRACT_TESTS "Build IVF input and PQ contract tests" ON)
 if(IVF_BUILD_CONTRACT_TESTS)
     enable_testing()
+    if(TARGET BufANN AND NOT MSVC)
+        add_executable(ivf_heap_tests ivf_heap_tests.cpp)
+        target_link_libraries(ivf_heap_tests PRIVATE BufANN aio -ltcmalloc)
+        target_compile_options(ivf_heap_tests PRIVATE -fno-fast-math)
+        add_test(NAME ivf_heap_storage COMMAND ivf_heap_tests
+            "${CMAKE_CURRENT_BINARY_DIR}/heap_fixtures")
+    endif()
     add_executable(ivf_contract_tests ivf_contract_tests.cpp
         "${IVF_ROOT}/src/logger.cpp" "${IVF_ROOT}/src/ann_exception.cpp")
     target_link_libraries(ivf_contract_tests PRIVATE ivf_contracts Threads::Threads)
