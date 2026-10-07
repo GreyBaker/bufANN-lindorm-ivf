@@ -91,3 +91,11 @@ NTHREADS=16 MERGE_THREADS=8 bash benchmark/BufANN/sift/update.sh
 ```
 
 The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
+
+## IVF development (in progress)
+
+The single-node Lindorm IVF backend is under development. `ivf_build` and
+`ivf_driver` currently provide input validation only, not index construction or
+search. See [tests/ivf/README.md](tests/ivf/README.md) for review segments, test
+coverage, and dependency-light build commands. Existing BufANN/SPFresh workloads
+remain the comparison baselines.

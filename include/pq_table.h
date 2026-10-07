@@ -321,10 +321,10 @@ namespace diskann {
 #ifdef EXEC_ENV_OLS
     void load_pq_centroid_bin(MemoryMappedFiles& files,
                               const char* pq_table_file, size_t num_chunks,
-                              size_t offset = 0){
+                              size_t offset = 0, bool load_pair_distances = true){
 #else
     void load_pq_centroid_bin(const char* pq_table_file, size_t num_chunks,
-                              size_t offset = 0) {
+                              size_t offset = 0, bool load_pair_distances = true) {
 #endif
 
         std::string pq_pivots_path(pq_table_file);
@@ -348,6 +348,13 @@ namespace diskann {
 #else
         load_pq_pivots_old(pq_table_file, num_chunks);
 #endif
+    }
+
+    // IVF uses raw-query ADC and deflate_vec, not graph PQ-to-PQ scoring.
+    // Opting out also avoids writing runtime caches beside shared pivots.
+    if (!load_pair_distances) {
+      initialize_transposed_tables();
+      return;
     }
 
     const std::string tables_t_cache_path =
@@ -375,12 +382,7 @@ namespace diskann {
     }
 
     // alloc and compute transpose
-    tables_T = new float[256 * ndims];
-    for (_u64 i = 0; i < 256; i++) {
-      for (_u64 j = 0; j < ndims; j++) {
-        tables_T[j * 256 + i] = tables[i * ndims + j];
-      }
-    }
+    initialize_transposed_tables();
 
     // added this for easy PQ-PQ squared-distance calculations
     // TODO: Create only for StreamingMerger.
@@ -409,6 +411,17 @@ namespace diskann {
 
   }
 
+ private:
+  void initialize_transposed_tables() {
+    tables_T = new float[256 * ndims];
+    for (_u64 i = 0; i < 256; i++) {
+      for (_u64 j = 0; j < ndims; j++) {
+        tables_T[j * 256 + i] = tables[i * ndims + j];
+      }
+    }
+  }
+
+ public:
   // Transpose all_to_all_dists from on-disk [src][dst][chunk] order to the
   // in-memory [src][chunk][dst] order used by the ADC fast path. Allocates a
   // scratch copy, rewrites in place, frees the scratch.

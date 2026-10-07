@@ -55,3 +55,6 @@ target_link_libraries(bufann_gt_computer ${PROJECT_NAME} aio -ltcmalloc)
 # Driver 3: use an index — search_only or search_after_update workloads.
 add_executable(bufann_driver bufann_driver.cpp)
 target_link_libraries(bufann_driver ${PROJECT_NAME} aio -ltcmalloc)
+
+# IVF contracts and explicitly validation-only command scaffolds.
+add_subdirectory(ivf)

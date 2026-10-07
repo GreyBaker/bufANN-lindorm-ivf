@@ -50,11 +50,16 @@ namespace diskann {
   int ANNStreamBuf::overflow(int c) {
     std::lock_guard<std::mutex> lock(_mutex);
     if (c != EOF) {
+      // overflow() is called with pptr() at the end of the put area.
+      // Flush before appending, including for the normal one-byte buffer.
+      if (pptr() == epptr()) {
+        flush();
+      }
       *pptr() = (char) c;
       pbump(1);
     }
     flush();
-    return c;
+    return std::char_traits<char>::not_eof(c);
   }
 
   int ANNStreamBuf::sync() {

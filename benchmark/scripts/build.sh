@@ -7,7 +7,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/utils.sh"
 
 note "Building BufANN"
-configure_cmake_repo "$REPO_DIR" bufann_driver
+configure_cmake_repo "$REPO_DIR" bufann_driver ivf_build ivf_driver
 
 note "Building DiskANN canonical-index helpers"
 configure_cmake_repo "$REPO_DIR/baselines/DiskANN" \

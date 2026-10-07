@@ -1,6 +1,8 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT license.
 
+include(${PROJECT_SOURCE_DIR}/cmake/IVFContracts.cmake)
+
 if(MSVC)
 	add_subdirectory(dll)
 else()
