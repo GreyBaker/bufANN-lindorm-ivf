@@ -82,6 +82,8 @@ def main():
         run(prefix_build, False)
         Path(str(prefix) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 2, 2) + bytes(4))
         run(driver + ["--workload", "search_only"])
+        for flag, value in (("--index_format", "mutable"), ("--private_heap_path", "new.heap"), ("--checkpoint_prefix", "new")):
+            run(driver + ["--workload", "search_only", flag, value], False)
         for workload in ("insert_only", "delete_only", "search_after_update"):
             run(driver + ["--workload", workload, "--full_data_file", str(data),
                           "--insert_ids_file", str(ids), "--delete_ids_file", str(ids)])

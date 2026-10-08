@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IVF-only immutable query preparation/cache and single-pass run orchestration.
+"""IVF-only query and sequential insert/delete preparation/cache/run orchestration.
 
 Trusted local files, SHA-256 identity/integrity (not authentication), no deletes,
 no atomic publication/recovery. Native bundle validation remains authoritative.
@@ -17,6 +17,28 @@ import sys
 
 SUFFIXES = (".centroids.bin", ".hnsw", ".router", ".lists", ".heap", ".heap.meta",
             ".heap.meta.ivf", ".pq.bin", ".manifest")
+MUTABLE_SUFFIXES = (".centroids.bin", ".hnsw", ".router", ".mlists", ".heap", ".heap.meta",
+                    ".heap.meta.ivf", ".pq.bin", ".heap.state", ".origin", ".manifest")
+
+
+def mutation_identity(args, work):
+    if args.workload == "query":
+        require(args.update_count == 0, "query cannot have update IDs")
+        return None
+    count = args.update_count
+    require(0 < count <= (args.full_count - args.base_count if args.workload == "insert" else args.base_count - 1),
+            "invalid mutation count for canonical base split")
+    first = args.base_count if args.workload == "insert" else args.base_count - count
+    ids = work / (args.workload + "_ids.bin")
+    require(ids.stat().st_size == 4 + 4 * count, "invalid prepared counted-ID framing")
+    with ids.open("rb") as source:
+        require(source.read(4) == struct.pack("<I", count), "counted-ID count mismatch")
+        for offset in range(0, count, 4096):
+            length = min(4096, count - offset)
+            require(source.read(4 * length) == struct.pack("<" + "I" * length, *range(first + offset, first + offset + length)),
+                    "prepared update IDs differ from SPFresh source-row range")
+    return {"workload": args.workload, "count": count, "first_id": first, "ids_identity": digest(ids),
+            "source_identity": digest(work / "data/full.bin")}
 
 
 def require(ok, message):
@@ -115,6 +137,7 @@ def prepare(args):
     data = work / "data/full.bin"
     require(args.metric == "l2" and 0 < args.base_count < args.full_count, "invalid profile metric/base split")
     header(data, args.dtype, args.full_count, args.dim)
+    mutation = mutation_identity(args, work)
     query_truth_shapes(args.query, args.truth, args.dtype, args.dim, args.recall_at)
     # Query row count is arbitrary, but dimension, framing and GT shape are
     # checked by the native driver before timed queries.
@@ -165,12 +188,19 @@ def prepare(args):
         "query": str(args.query.resolve()), "query_identity": digest(args.query),
         "truth": str(args.truth.resolve()), "truth_identity": digest(args.truth),
         "manifest_identity": digest(Path(str(prefix) + ".manifest"))})
+    if mutation is not None:
+        write_json(work / "mutation_prepared.json", mutation)
 
 
 def run(args):
     work = args.work_dir.resolve()
     prepared = read_json(work / "prepared.json")
     require(prepared["version"] == 1 and prepared["profile"] == profile(args), "profile changed since prepare")
+    mutation = mutation_identity(args, work)
+    if mutation is not None:
+        require(read_json(work / "mutation_prepared.json") == mutation, "mutation/source identity changed since prepare")
+    else:
+        require(not (work / "mutation_prepared.json").exists(), "prepared workload is not query")
     require(digest(prepared["query"]) == prepared["query_identity"], "query changed since prepare")
     require(digest(prepared["truth"]) == prepared["truth_identity"], "GT changed since prepare")
     query_truth_shapes(prepared["query"], prepared["truth"], args.dtype, args.dim, args.recall_at)
@@ -185,6 +215,30 @@ def run(args):
     for name in ("run.log", "native_result.json", "result.json", "neighbors.bin"):
         path = output / name
         require(not path.exists() and not path.is_symlink(), f"run output exists: {path}; use a fresh IVF_RUN_TAG")
+    if mutation is not None:
+        for name in ("mutation.log", "mutation_result.json", "mutation_metrics.json", "private.heap", "private.heap.pq.bin", "query.heap", "query.heap.pq.bin", "checkpoint"):
+            path = output / name
+            require(not path.exists() and not path.is_symlink(), f"mutation output exists: {path}")
+        checkpoint = output / "checkpoint"
+        checkpoint.mkdir()
+        saved = checkpoint / args.dataset
+        command = [os.environ["IVF_DRIVER_BIN"], "--validate_inputs", "0", "--data_type", args.dtype,
+            "--metric", args.metric, "--dim", str(args.dim), "--nlist", prepared["settings"]["nlist"],
+            "--index_prefix", str(prefix), "--workload", args.workload + "_only",
+            "--full_data_file", str(work / "data/full.bin"), "--" + args.workload + "_ids_file", str(work / (args.workload + "_ids.bin")),
+            "--private_heap_path", str(output / "private.heap"), "--checkpoint_prefix", str(saved),
+            "--buffer_frames", os.environ.get("IVF_BUFFER_FRAMES", "64"),
+            "--memory_budget_gb", os.environ.get("IVF_MEMORY_BUDGET_GB", "1"),
+            "--result_file", str(output / "mutation_result.json")]
+        command_log(command, output / "mutation.log")
+        record = read_json(output / "mutation_result.json")
+        require(record["phase"] == args.workload and record[args.workload + "_count"] == args.update_count and
+                record["live_count"] == args.base_count + (args.update_count if args.workload == "insert" else -args.update_count),
+                "mutation execution count/live set mismatch")
+        require(mutation_identity(args, work) == mutation, "source/update IDs changed during mutation")
+        require(all(Path(str(saved) + suffix).is_file() and not Path(str(saved) + suffix).is_symlink()
+                    for suffix in MUTABLE_SUFFIXES), "missing mutable checkpoint family")
+        prefix = saved
     command = [os.environ["IVF_DRIVER_BIN"], "--validate_inputs", "0", "--data_type", args.dtype,
         "--metric", args.metric, "--dim", str(args.dim), "--nlist", prepared["settings"]["nlist"],
         "--index_prefix", str(prefix), "--workload", "search_only", "--query_file", prepared["query"],
@@ -194,6 +248,8 @@ def run(args):
         "--buffer_frames", os.environ.get("IVF_BUFFER_FRAMES", "64"),
         "--memory_budget_gb", os.environ.get("IVF_QUERY_MEMORY_BUDGET_GB", os.environ.get("IVF_MEMORY_BUDGET_GB", "1")),
         "--result_file", str(output / "native_result.json"), "--search_result_file", str(output / "neighbors.bin")]
+    if mutation is not None:
+        command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
     command_log(command, output / "run.log")
     record = read_json(output / "native_result.json")
     require(record["baseline"] == "IVF" and record["phase"] == "query" and record["workload"] == "query" and "recall" in record,
@@ -212,6 +268,8 @@ def main():
             p.add_argument("--" + field, required=True, type=int)
         p.add_argument("--work-dir", required=True, type=Path)
         p.add_argument("--recall-at", required=True, type=int)
+        p.add_argument("--workload", choices=("query", "insert", "delete"), default="query")
+        p.add_argument("--update-count", type=int, default=0)
         if name == "prepare":
             for field in ("pq-prefix", "query", "truth", "cache-root"):
                 p.add_argument("--" + field, required=True, type=Path)

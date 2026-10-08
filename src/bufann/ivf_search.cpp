@@ -124,4 +124,131 @@ template QueryResult search<uint8_t>(const CentroidRouter&, const PostingLists&,
 template uint64_t estimate_query_workspace<float>(const CentroidRouter&, const PostingLists&, const PQCodebook<float>&, const HeapStorage<float>&, const SearchConfig&, bool);
 template uint64_t estimate_query_workspace<int8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<int8_t>&, const HeapStorage<int8_t>&, const SearchConfig&, bool);
 template uint64_t estimate_query_workspace<uint8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<uint8_t>&, const HeapStorage<uint8_t>&, const SearchConfig&, bool);
+
+template<typename T>
+uint64_t estimate_mutable_query_workspace(const CentroidRouter& router, const MutablePostingLists& lists,
+    const PQCodebook<T>& codebook, const HeapStorage<T>& heap, const SearchConfig& config, bool exact_routing) {
+    config.validate(router.nlist());
+    check(codebook.dim() == router.dim() && heap.dim() == router.dim() && lists.nlist() == router.nlist() &&
+          lists.chunks() == codebook.chunks() && lists.id_capacity() == heap.id_capacity(), "Incompatible mutable IVF query components");
+    check(heap.mutable_mode() && !heap.failed() && !heap.read_only(), "Mutable IVF query requires a healthy mutable heap session");
+    // Capacity, not a racing live-count snapshot: concurrent inserts cannot
+    // exceed the preflighted scan/rerank workspace. Empty live sets are valid.
+    const auto budget = config.candidate_budget(lists.id_capacity() - lists.first_id());
+    check(budget > 0 && budget <= UINT32_MAX, "Invalid mutable IVF query candidate budget");
+    const size_t stride = ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    uint64_t bytes = 65536;
+    add_product(bytes, budget, 128); // Scan/output/filtered candidates, ID validation, hits.
+    add_product(bytes, codebook.chunks(), 256 * sizeof(float));
+    add_product(bytes, config.nprobe, 32);
+    add_product(bytes, router.dim(), sizeof(T) + sizeof(float));
+    add_product(bytes, router.nlist(), 2);
+    add_product(bytes, exact_routing || config.nprobe == router.nlist() ? router.nlist() :
+        std::min(router.nlist(), std::max(config.nprobe, router.options().query_breadth)), 64);
+    add_product(bytes, std::min<size_t>(budget, heap.copy_batch_limit()), stride * sizeof(T) + 5);
+    check(bytes <= SIZE_MAX, "Mutable IVF query workspace exceeds size_t"); return bytes;
+}
+
+template<typename T>
+QueryResult rerank_mutable_candidates(const CentroidRouter& router, const MutablePostingLists& lists,
+    const PQCodebook<T>& codebook, HeapStorage<T>& heap, std::span<const T> query,
+    std::span<const PQCandidate> candidates, const SearchConfig& config, const QueryLimits& limits) {
+    check(query.size() == router.dim(), "Invalid mutable IVF query dimension");
+    for (T coordinate : query) check(std::isfinite(double(coordinate)), "Nonfinite mutable IVF query");
+    check(estimate_mutable_query_workspace(router, lists, codebook, heap, config, limits.exact_routing) <= limits.workspace_bytes,
+          "Mutable IVF query exceeds workspace allowance");
+    const auto budget = config.candidate_budget(lists.id_capacity() - lists.first_id());
+    check(candidates.size() <= budget, "Mutable IVF candidate set exceeds declared budget");
+    std::vector<uint32_t> validation;
+    validation.reserve(candidates.size());
+    for (auto hit : candidates) {
+        check(hit.id >= lists.first_id() && hit.id < lists.id_capacity() &&
+              std::isfinite(hit.squared_distance) && hit.squared_distance >= 0, "Invalid mutable IVF candidate");
+        validation.push_back(hit.id);
+    }
+    std::sort(validation.begin(), validation.end());
+    check(std::adjacent_find(validation.begin(), validation.end()) == validation.end(), "Duplicate mutable IVF candidate ID");
+    QueryResult result;
+    std::vector<PQCandidate> active;
+    active.reserve(candidates.size());
+    for (auto hit : candidates) {
+        if (lists.contains(hit.id)) active.push_back(hit);
+        else ++result.stale_candidates;
+    }
+    if (active.empty()) return result;
+    result.logical_fetch_stages = 1;
+    const size_t stride = ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t batch = std::min<size_t>(active.size(), heap.copy_batch_limit());
+    std::unique_ptr<void, decltype(&std::free)> scratch(std::aligned_alloc(64, batch * stride * sizeof(T)), &std::free);
+    if (!scratch) throw std::bad_alloc();
+    std::vector<uint32_t> ids; ids.reserve(batch);
+    result.hits.reserve(active.size());
+    for (size_t begin = 0; begin < active.size(); begin += batch) {
+        const size_t count = std::min(batch, active.size() - begin);
+        ids.clear();
+        for (size_t i = 0; i < count; ++i) ids.push_back(active[begin + i].id);
+        auto start = Clock::now();
+        const auto copied = heap.copy_coordinates_batch(ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
+        result.backend_batch_calls += copied.backend_batch_calls; result.heap_pages_read += copied.heap_pages_read;
+        result.fetch_us += elapsed_us(start);
+        start = Clock::now();
+        for (size_t i = 0; i < count; ++i) {
+            if (!lists.contains(ids[i])) { ++result.stale_candidates; continue; }
+            check(copied.present[i], "Live mutable IVF posting references a missing heap ID");
+            const auto* vector = static_cast<const T*>(scratch.get()) + i * stride;
+            double distance = 0;
+            for (uint32_t d = 0; d < router.dim(); ++d) {
+                const double delta = double(query[d]) - double(vector[d]); distance += delta * delta;
+            }
+            check(std::isfinite(distance), "Nonfinite mutable IVF exact distance");
+            result.hits.push_back({ids[i], distance});
+        }
+        result.rerank_us += elapsed_us(start);
+    }
+    result.reranked_vectors = result.hits.size();
+    auto start = Clock::now();
+    std::sort(result.hits.begin(), result.hits.end(), [](const ExactHit& a, const ExactHit& b) {
+        return a.squared_distance < b.squared_distance || (a.squared_distance == b.squared_distance && a.id < b.id);
+    });
+    std::erase_if(result.hits, [&](auto hit) {
+        if (lists.contains(hit.id)) return false;
+        ++result.stale_candidates; return true;
+    });
+    if (result.hits.size() > config.recall_at) result.hits.resize(config.recall_at);
+    result.rerank_us += elapsed_us(start); return result;
+}
+
+template<typename T>
+QueryResult search_mutable(const CentroidRouter& router, const MutablePostingLists& lists,
+    const PQCodebook<T>& codebook, HeapStorage<T>& heap, std::span<const T> query,
+    const SearchConfig& config, const QueryLimits& limits) {
+    check(query.size() == router.dim(), "Invalid mutable IVF query dimension");
+    for (T coordinate : query) check(std::isfinite(double(coordinate)), "Nonfinite mutable IVF query");
+    check(estimate_mutable_query_workspace(router, lists, codebook, heap, config, limits.exact_routing) <= limits.workspace_bytes,
+          "Mutable IVF query exceeds workspace allowance");
+    auto start = Clock::now();
+    const auto routed = router.search(query, config.nprobe, limits.exact_routing);
+    std::vector<uint32_t> selected; selected.reserve(routed.size());
+    for (auto hit : routed) selected.push_back(hit.list_id);
+    const double routing = elapsed_us(start);
+    start = Clock::now();
+    std::vector<float> distances; codebook.populate_distances(query.data(), distances);
+    const double adc = elapsed_us(start);
+    start = Clock::now();
+    const auto scanned = lists.scan(selected, distances,
+        static_cast<uint32_t>(config.candidate_budget(lists.id_capacity() - lists.first_id())), limits.workspace_bytes);
+    const double scan = elapsed_us(start);
+    auto result = rerank_mutable_candidates(router, lists, codebook, heap, query, scanned.candidates, config, limits);
+    result.selected_lists = std::move(selected); result.scanned_codes = scanned.scanned_codes;
+    result.routing_us = routing; result.adc_us = adc; result.scan_select_us = scan; return result;
+}
+
+#define IVF_MUTABLE_SEARCH_INSTANTIATE(T) \
+template uint64_t estimate_mutable_query_workspace<T>(const CentroidRouter&, const MutablePostingLists&, const PQCodebook<T>&, const HeapStorage<T>&, const SearchConfig&, bool); \
+template QueryResult search_mutable<T>(const CentroidRouter&, const MutablePostingLists&, const PQCodebook<T>&, HeapStorage<T>&, std::span<const T>, const SearchConfig&, const QueryLimits&); \
+template QueryResult rerank_mutable_candidates<T>(const CentroidRouter&, const MutablePostingLists&, const PQCodebook<T>&, HeapStorage<T>&, std::span<const T>, std::span<const PQCandidate>, const SearchConfig&, const QueryLimits&);
+IVF_MUTABLE_SEARCH_INSTANTIATE(float)
+IVF_MUTABLE_SEARCH_INSTANTIATE(int8_t)
+IVF_MUTABLE_SEARCH_INSTANTIATE(uint8_t)
+#undef IVF_MUTABLE_SEARCH_INSTANTIATE
 } // namespace diskann::ivf

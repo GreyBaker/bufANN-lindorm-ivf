@@ -101,13 +101,21 @@ performance remain unqualified. No DiskANN/Vamana graph conversion is required.
 
 See [benchmark/IVF/README.md](benchmark/IVF/README.md) for explicit system build,
 full-source PQ, dataset/GT, caching and query commands. Dependency-isolated
-`ivf_build`/`ivf_driver` still provide validation only; mutations/mixed workloads
-are not implemented.
+`ivf_build`/`ivf_driver` still provide validation only. Full routing-enabled builds
+also execute sequential inserts/deletes with checkpoint/reopen; mixed execution
+remains pending.
 Bounded training comparisons and repeated query sweeps are documented in
 [benchmark/IVF/QUALIFICATION.md](benchmark/IVF/QUALIFICATION.md); fixtures pass,
 but no production dataset is currently configured or qualified.
 [tests/ivf/README.md](tests/ivf/README.md) records review segments and coverage.
 Existing BufANN/SPFresh workloads remain unchanged comparison baselines.
+
+S05 mutable posting-list/locator components and native heap/query/checkpoint
+sessions pass focused concurrency and sanitizer fixtures; [component scope](docs/MUTABLE_LISTS.md)
+and [native checkpoint API/limits](docs/MUTABLE_INDEX.md). Arbitrary live sets,
+tombstones and aborted heap records survive quiescent checkpoint/reopen onto
+new private files. Insert/delete scripts preserve SPFresh's canonical ranges/GT
+and score after reopening; [CLI/script scope](docs/s05-cli-and-mutation-harness.md).
 
 Administrator actions for Linux/WSL libaio and MKL/Intel OpenMP dependencies
 have been used for installing dependencies. 

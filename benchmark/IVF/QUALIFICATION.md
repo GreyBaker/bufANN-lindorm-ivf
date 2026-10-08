@@ -136,8 +136,8 @@ native sweeps, warmup exclusion, canonical extraction, preserved output/results,
 native setting validation, collisions, changed GT, failed trials and RSS gates.
 These are small fixtures, not meaningful QPS/latency/RSS measurements.
 
-Latest verification: full Release **12/12** with optional trained helpers (11
-without); Linux routing-enabled isolated Release/ASan+UBSan **6/6** each;
+Latest verification including the S05 mutable-list component: full Release **13/13** with optional trained helpers (12
+without); Linux routing-enabled isolated Release/ASan+UBSan **7/7** each;
 routing-disabled isolation **3/3**. Full instrumented diagnostic and expanded
 harness suites each pass **1/1** with leak detection. External system/helper
 binaries are not instrumented; no complete full sanitizer-roster claim is made.

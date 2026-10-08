@@ -1,10 +1,11 @@
-# Native IVF query harness (S04, partial production milestone)
+# Native IVF query and mutation harness (S04/S05)
 
 Linux/WSL query-only scripts are implemented and tested with synthetic and
 standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
 production SIFT training, recall/QPS or memory qualification. No vector-level
 graph, Vamana conversion, distributed service or SPFresh source change is required.
-Mutation/mixed prepare/run pairs remain pending (S05/S06).
+Sequential insert/delete prepare/run pairs and native mutable checkpoint/reopen
+are implemented (S05); concurrent mixed prepare/run pairs remain pending (S06).
 
 ## Build with installed system dependencies
 
@@ -30,7 +31,8 @@ separate and unqualified; it is not the explicit build above.
 ## Input/PQ/GT contracts
 
 - Load the unchanged `benchmark/datasets/<DATASET>.sh` profile. The `.bin` data
-  and query files must already exist; IVF does not convert/download inputs.
+  and query files must exist for query preparation. Mutation preparation uses
+  the shared `ensure_dataset` staging helper; no new downloader/converter is added.
 - `DATA_BIN` must frame exactly `NPTS_FULL` rows and `DIM` coordinates of
   `DATA_TYPE`. Only `[0, NPTS_BASE)` becomes the initial index. Profile splits
   and external source-row IDs are not inferred, changed or remapped.
@@ -102,6 +104,35 @@ Run uses `IVF_NPROBE` (1), `IVF_RERANK_FACTOR` (2), `QUERY_THREADS` (1), profile
 Persisted query breadth is a build setting; varying it needs separately prepared
 bundles. No mutable scheduling/8+8 split is implied by query thread settings.
 
+### Sequential insert/delete (S05)
+
+```bash
+UPDATE_PERCENT=10 bash benchmark/IVF/sift/insert_prepare.sh
+UPDATE_PERCENT=10 bash benchmark/IVF/sift/insert.sh
+UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete_prepare.sh
+UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete.sh
+```
+
+Use the same build/PQ/profile environment as above. Shared split/count helpers
+preserve SPFresh's initial base, insert-tail and delete-base-tail IDs. Optional
+`INSERT_POINTS`/`DELETE_POINTS` override only counts. Default GT is filtered for
+the final live prefix with the unchanged helper; `IVF_GT_FILE` must be matching
+**post-update** GT. Insufficient survivors fail, never pad truth.
+
+Each pair owns a distinct `.../IVF/{insert,delete}/` tree. Prepare caches/restores
+only a real immutable base family. Run updates a new private heap, saves a separate
+mutable checkpoint, then reopens a new private copy for post-update scoring.
+`mutation_result.json` (insert/delete loops) and `result.json` (final query) are
+separate canonical records cross-checked with shared extraction. `IVF_RUN_TAG`
+preserves repeated runs starting from the same base; no old work is reset/deleted.
+One sequential mutation worker is used; `QUERY_THREADS` controls only the later
+query pass, not queries during updates. Native `search_after_update` is also
+explicitly sequential, not S06 mixed scheduling.
+
+CLI examples, file ownership, metrics/budget scopes and verification:
+[s05-cli-and-mutation-harness.md](../../docs/s05-cli-and-mutation-harness.md).
+Checkpoint format/limits: [MUTABLE_INDEX.md](../../docs/MUTABLE_INDEX.md).
+
 ### Cache identity and costs
 
 `eval_cached/<dataset>/IVF/<sha256-key>/` binds exact build settings/profile,
@@ -128,7 +159,9 @@ timing/read/RSS scopes: [s04-cli-execution.md](../../docs/s04-cli-execution.md).
 `ivf_query_harness` covers actual build/run, canonical records/results, cache
 restore/config/source identity changes, no-store behavior, no overwrites, failed
 runs, corrupted caches, symlink refusal, changed GT and the unchanged incremental
-GT helper path. `ivf_trained_helper_integration` is opt-in; it uses unmodified
+GT helper path. It now also tests insert/delete pairs for all dtypes, canonical
+IDs/count overrides, post-checkpoint scoring, underflow, fresh repeats and immutable
+source/base/cache preservation. `ivf_trained_helper_integration` is opt-in; it uses unmodified
 standalone helper sources to train/encode 4096 rows in 13 dimensions with three
 unequal chunks, then checks native encoder/ADC parity and exact script-run results
 for every dtype. Both suites pass with the IVF side instrumented by ASan/UBSan
@@ -137,8 +170,9 @@ and leak detection; standalone helpers/system libraries are **not** instrumented
 Reproduction/observed code parity and numerical tolerances:
 [s04-query-harness-and-trained-pq.md](../../docs/s04-query-harness-and-trained-pq.md).
 S03/S04 remain partial until production training and repeated recall/QPS/latency/
-memory/concurrency budgets are qualified. Mutation/mixed/paired SPFresh benchmark
-segments remain pending. No production-performance result follows from fixtures.
+memory/concurrency budgets are qualified. S05 minimum updates/checkpoints/CLI/script
+integration is implemented; S06 mixed and S07 paired SPFresh benchmark segments
+remain pending. No production-performance result follows from fixtures.
 
 Bounded exact/HNSW training comparisons and repeated query-sweep tooling now pass
 fixtures, including declared budgets, preservation and failure gates:

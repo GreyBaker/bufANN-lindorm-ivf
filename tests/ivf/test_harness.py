@@ -180,6 +180,110 @@ def main():
         run(prepare, env)
         run(query, env)
         assert json.loads((Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/query/result.json").read_text())["recall"] == 100
+        # S05 prepare/run pairs use canonical shared split/ID/GT helpers, then
+        # reopen the NEW mutable checkpoint in a separate query process. Cache
+        # and original working bundles remain immutable, never writable aliases.
+        for workload in ("insert", "delete"):
+            mutation_prepare = repo / f"benchmark/IVF/sift/{workload}_prepare.sh"
+            mutation_run = repo / f"benchmark/IVF/sift/{workload}.sh"
+            env["EVAL_TEMPFILES"] = str(root / f"{workload} work")
+            env["UPDATE_PERCENT"] = "25"
+            run(mutation_prepare, env)
+            mutation_work = Path(env["EVAL_TEMPFILES"]) / f"tiny/IVF/{workload}"
+            ids = mutation_work / f"{workload}_ids.bin"
+            assert ids.read_bytes() == struct.pack("<II", 1, 3 if workload == "insert" else 2)
+            assert json.loads((mutation_work / "prepared.json").read_text())["cache_hit"] is True
+            source_bundle = {p: checksum(p) for p in (mutation_work / "index").iterdir()}
+            cache_bundle = {p: checksum(p) for p in (cache / "index").iterdir()}
+            run(mutation_run, env)
+            update = json.loads((mutation_work / "mutation_result.json").read_text())
+            final = json.loads((mutation_work / "result.json").read_text())
+            assert update["phase"] == workload and update[workload + "_count"] == 1
+            assert update == json.loads((mutation_work / "mutation_metrics.json").read_text())
+            assert update["live_count"] == (4 if workload == "insert" else 2)
+            assert final["recall"] == 100 and final["live_count"] == update["live_count"]
+            assert final == json.loads((mutation_work / "native_result.json").read_text())
+            checkpoint = mutation_work / "checkpoint/tiny"
+            assert Path(str(checkpoint) + ".mlists").is_file() and Path(str(checkpoint) + ".heap.state").is_file()
+            assert not any(p.is_symlink() for p in (mutation_work / "checkpoint").iterdir())
+            scorer = repo / "benchmark/SPFresh/utils.py"
+            truth_path = json.loads((mutation_work / "prepared.json").read_text())["truth"]
+            scored = subprocess.run(["python3", str(scorer), "tie-aware-recall", "--truth", truth_path,
+                "--result", str(mutation_work / "neighbors.bin"), "--recall-at", "1"], text=True, capture_output=True)
+            assert scored.returncode == 0 and "1.000000" in scored.stdout, scored.stderr
+            result_identity = checksum(mutation_work / "result.json")
+            run(mutation_run, env, False); run(mutation_prepare, env, False)
+            assert checksum(mutation_work / "result.json") == result_identity
+            env["IVF_RUN_TAG"] = "repeat"
+            run(mutation_run, env)
+            assert json.loads((mutation_work / "runs/repeat/result.json").read_text())["recall"] == 100
+            env["IVF_RUN_TAG"] = "changed_ids"
+            saved_ids = ids.read_bytes(); ids.write_bytes(struct.pack("<II", 1, 0))
+            assert "SPFresh source-row range" in run(mutation_run, env, False).stderr
+            assert not (mutation_work / "runs/changed_ids").exists()
+            ids.write_bytes(saved_ids)
+            env["IVF_RUN_TAG"] = "changed_source"
+            source_bytes = data.read_bytes(); data.write_bytes(source_bytes[:-1] + bytes([source_bytes[-1] ^ 1]))
+            assert "identity changed" in run(mutation_run, env, False).stderr
+            assert not (mutation_work / "runs/changed_source").exists()
+            data.write_bytes(source_bytes); del env["IVF_RUN_TAG"]
+            assert all(checksum(p) == identity for p, identity in source_bundle.items())
+            assert all(checksum(p) == identity for p, identity in cache_bundle.items())
+        # Override counts never shift BASE_POINTS. A larger percent alone selects
+        # two rows; the insert override pins it to the one available tail row.
+        env["UPDATE_PERCENT"] = "50"; env["INSERT_POINTS"] = "1"
+        env["EVAL_TEMPFILES"] = str(root / "insert overridden")
+        run(repo / "benchmark/IVF/sift/insert_prepare.sh", env)
+        override_work = Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/insert"
+        assert (override_work / "insert_ids.bin").read_bytes() == struct.pack("<II", 1, 3)
+        assert json.loads((override_work / "prepared.json").read_text())["profile"]["base_count"] == 3
+        del env["INSERT_POINTS"]
+        env["DELETE_POINTS"] = "2"; env["EVAL_TEMPFILES"] = str(root / "delete overridden")
+        run(repo / "benchmark/IVF/sift/delete_prepare.sh", env)
+        override_work = Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/delete"
+        assert (override_work / "delete_ids.bin").read_bytes() == struct.pack("<III", 2, 1, 2)
+        run(repo / "benchmark/IVF/sift/delete.sh", env)
+        assert json.loads((override_work / "result.json").read_text())["live_count"] == 1
+        # Deep-K survivor underflow is a hard failure, not fabricated/padded GT.
+        saved_profile = profile.read_text(); profile.write_text(saved_profile.replace("RECALL_AT=1", "RECALL_AT=2"))
+        env["EVAL_TEMPFILES"] = str(root / "underflow delete")
+        run(repo / "benchmark/IVF/sift/delete_prepare.sh", env, False)
+        assert not (Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/delete/prepared.json").exists()
+        profile.write_text(saved_profile); del env["DELETE_POINTS"]; del env["UPDATE_PERCENT"]
+        # Real shell pairs for signed/high-byte inputs; unchanged GT helper/scorer.
+        for dtype, fmt, rows in (
+            ("int8", "b", [(-128, -3, 2), (127, 5, 9), (-4, 8, -9), (-2, 7, -8)]),
+            ("uint8", "B", [(128, 129, 130), (255, 254, 253), (200, 201, 202), (201, 201, 202)])):
+            dataset = "tiny_" + dtype
+            typed_data, typed_query, typed_deep = (root / (dataset + suffix) for suffix in (".bin", ".query", ".gt"))
+            query_rows = [rows[3], rows[2]]
+            typed_data.write_bytes(struct.pack("<II12" + fmt, 4, 3, *(v for row in rows for v in row)))
+            typed_query.write_bytes(struct.pack("<II6" + fmt, 2, 3, *(v for row in query_rows for v in row)))
+            exact = [sorted([(i, sum((a - b) ** 2 for a, b in zip(q, row))) for i, row in enumerate(rows)],
+                            key=lambda hit: (hit[1], hit[0])) for q in query_rows]
+            typed_deep.write_bytes(struct.pack("<II", 2, 4) +
+                b"".join(struct.pack("<I", vid) for row in exact for vid, _ in row) +
+                b"".join(struct.pack("<f", distance) for row in exact for _, distance in row))
+            typed_profile = profiles / (dataset + ".sh")
+            typed_profile.write_text("\n".join([f"DATASET={dataset}", f"DATA_TYPE={dtype}", "METRIC=l2", "DIM=3",
+                "NPTS_FULL=4", "NPTS_BASE=3", "UPDATE_POINTS=1", "DISKANN_R=64", "RECALL_AT=1",
+                "DISKANN_INDEX_0P9B=/deliberately/missing/graph",
+                f"DATA_BIN='{typed_data}'", f"QUERY_BIN='{typed_query}'", f"GT_BIN_KCACHED='{typed_deep}'"]) + "\n")
+            typed_env = env.copy()
+            typed_env.update(DATASET=dataset, UPDATE_PERCENT="25", IVF_RERANK_FACTOR="8", EVAL_TEMPFILES=str(root / dataset))
+            for workload in ("insert", "delete"):
+                run(repo / f"benchmark/IVF/sift/{workload}_prepare.sh", typed_env)
+                run(repo / f"benchmark/IVF/sift/{workload}.sh", typed_env)
+                typed_work = Path(typed_env["EVAL_TEMPFILES"]) / f"{dataset}/IVF/{workload}"
+                assert json.loads((typed_work / "result.json").read_text())["recall"] == 100
+                live = range(4) if workload == "insert" else range(2)
+                expected = [min([(i, sum((a - b) ** 2 for a, b in zip(q, rows[i]))) for i in live],
+                                key=lambda hit: (hit[1], hit[0])) for q in query_rows]
+                assert list(struct.iter_unpack("<If", (typed_work / "neighbors.bin").read_bytes()[8:])) == expected
+                typed_truth = json.loads((typed_work / "prepared.json").read_text())["truth"]
+                scored = subprocess.run(["python3", str(repo / "benchmark/SPFresh/utils.py"), "tie-aware-recall", "--truth", typed_truth,
+                    "--result", str(typed_work / "neighbors.bin"), "--recall-at", "1"], text=True, capture_output=True)
+                assert scored.returncode == 0 and "1.000000" in scored.stdout, scored.stderr
         env["IVF_GT_FILE"] = str(truth)
         # A changed training setting must not silently reuse the old bundle.
         env["EVAL_TEMPFILES"] = str(root / "changed config"); env["IVF_ROUTER_SEED"] = "101"

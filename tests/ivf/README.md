@@ -74,7 +74,7 @@ See [README.md](../../baselines/DiskANN/README.md) installation guides.
 Fresh installed-library verification and full-project build commands are in
 [system-build-and-s02-verification.md](../../docs/system-build-and-s02-verification.md).
 The corrected D01 record uses that fresh evidence, not earlier history. The
-current routing-enabled system build links the real BufANN driver and passes twelve
+current routing-enabled system build links the real BufANN driver and passes fourteen
 suites, including the lists and query-composition tests.
 
 The D01 local-package/discovery workaround and its added math smoke-test target
@@ -109,7 +109,7 @@ implemented/tested at this review boundary; complete IVF execution is still pend
 The default isolated build now adds `ivf_centroid_training` without downloading
 dependencies (3 suites total). Add `-DIVF_BUILD_ROUTING=ON` to enable the
 checksum-pinned, unmodified hnswlib v0.8.0 router and `ivf_centroid_routing`
-(now 6 Linux routing-enabled isolated suites; 11 in the full configuration, 12 with optional trained helpers).
+(now 7 Linux routing-enabled isolated suites; 13 in the full configuration, 14 with optional trained helpers).
 
 ```bash
 cmake -S tests/ivf -B build/ivf-s03-release \
@@ -151,8 +151,8 @@ shard, with conservative serialized adapter pin/copy admission. Tests cover heap
 reopen, duplicates, tiny pools, missing IDs, empty/short results, concurrent
 queries and measured cold/resident heap-page reads (not device IOPS).
 
-Current full-project Release with trained helpers enabled: **12/12 pass**; Linux isolated routing-enabled Release and
-ASan/UBSan with leak detection: **6/6 each**. Full instrumented-backend query and
+Current full-project Release with trained helpers enabled: **14/14 pass**; Linux isolated routing-enabled Release and
+ASan/UBSan with leak detection: **7/7 each**. Full instrumented-backend query and
 adapter suites each pass **1/1** with leak detection. The original BufANN driver
 still builds. Details and commands:
 [s04-lists-query-components.md](../../docs/s04-lists-query-components.md).
@@ -191,6 +191,55 @@ expanded suites pass in full and isolated (diagnostics only) ASan/UBSan runs wit
 leak detection. Tool usage and non-production scope:
 [QUALIFICATION.md](../../benchmark/IVF/QUALIFICATION.md).
 
+## S05 — mutable lists, sessions, checkpoint and mutation execution (implemented)
+
+`MutablePostingLists` now implements contiguous ID/code arrays with exact +16
+growth, stable preallocated ID locators, move-only prepublication reservations,
+swap-with-last deletion and per-list shared/exclusive locks. It provides copied
+locations/list snapshots and bounded ADC scans, not borrowed mutable pointers.
+Successful deleted IDs are not reused; missing deletion is counted/idempotent.
+Growth accounts for concurrent old/new allocations and failures permit retry.
+Immutable CSR conversion preserves base membership and supplied PQ code bytes.
+
+`ivf_mutable_posting_lists` passes in isolated/full Release and ASan/UBSan with
+leak detection. Its contention fixtures also pass **30/30** TSan repetitions with
+per-process ASLR disabled; default TSan startup is incompatible with this WSL
+memory layout. No suppressions or global kernel changes were used.
+The component alone is not native heap/checkpoint integration or S06's 8+8 workload.
+Detailed list contracts/reproduction:
+[MUTABLE_LISTS.md](../../docs/MUTABLE_LISTS.md).
+
+The separate `MutableIndex<T>` API now forks an immutable bundle onto a verified
+private heap, composes frozen routing/existing PQ encoding with prepared-heap/list
+publication, supports logical deletes without committed-ID/slot reuse, and
+revalidates live candidates during mutable reranking. Native all-dtype fixtures,
+including backend growth failure, retries and concurrent mutations/queries, pass
+Release and ASan/UBSan. Separate mutable checkpoint/reopen now preserves arbitrary
+live sets, tombstones, aborted heap slots, list capacities/order and counters,
+with lifecycle quiescence, relocated/new-generation fixtures and rehashed
+structural corruption refusal. Fork/reopen exclusively create a private heap
+and its `.pq.bin` sidecar; saved families are immutable. Native `insert_only`,
+`delete_only` and sequential `search_after_update` now execute; scripts use shared
+canonical split/ID/GT helpers and post-update checkpoint reopen/scoring. CLI and
+shell pair oracles cover all dtypes, signed/high-byte data, no-reuse/idempotent
+deletes, source identity/error/collision refusal, count overrides that preserve
+base membership, insufficient GT survivors and source/base/cache preservation.
+Update-loop and final-query records remain separate; no concurrent mixed mode is
+implied. Native TSan qualification requires a narrowed single-OpenMP-worker run;
+the parallel legacy loader configuration is not qualified. Session ownership,
+budgets, verification commands and limitations:
+[MUTABLE_INDEX.md](../../docs/MUTABLE_INDEX.md).
+CLI/script contracts: [s05-cli-and-mutation-harness.md](../../docs/s05-cli-and-mutation-harness.md).
+
+Final S05 revision: full Release **14/14** (optional trained helpers enabled);
+selected full ASan/UBSan **6/6** (mutable lists/session, immutable query, heap
+adapter, CLI and query/mutation harness) with leak detection. Isolated
+routing-enabled Release/ASan+UBSan **7/7 each**, routing-disabled **3/3**.
+Native TSan repeats **10/10** and all-dtype mutation CLI TSan **1/1**, with
+process-only ASLR disable and `OMP_THREAD_LIMIT=1`; no unrestricted legacy parallel
+OpenMP or system-library qualification is claimed. The original `bufann_driver`
+still builds. These are functional fixtures, not production benchmark evidence.
+
 ## Coverage and limits
 
 `ivf_contracts` covers invalid counts/settings, sample support, candidate ceiling
@@ -209,7 +258,8 @@ against native encoder/ADC and exact script results for every dtype on small
 
 `ivf_cli_contracts` covers all supported dtypes/workload names, JSON validation
 records (without fake metrics), invalid flags/numbers, missing mutation inputs,
-help, refusal to execute an unimplemented workload, and logger output.
+help, refusal of execution-only flags in validation mode/isolated execution,
+invalid or incomplete native requests, and logger output.
 
 ## Next review segments and tests
 
@@ -218,7 +268,7 @@ help, refusal to execute an unimplemented workload, and logger output.
 | S02 (implemented) | Graph-free BufANN heap adapter + streaming vectors | Covered: zero-degree slots, aligned dtype round-trip, stable IDs, clean reopen, failed-build checkpoint refusal (not physical rollback) |
 | S03 (partial) | Exact/HNSW trainer + pinned HNSW router | Component comparisons, synthetic 50K smoke and bounded diagnostic tooling pass; production-scale quality/memory/build qualification remains |
 | S04 (partial) | Persisted native build/open/query + query scripts | Component/bundle/CLI/harness/trained-helper and repeated-sweep fixtures pass; production GT/performance and measured admission qualification remain |
-| S05 | Posting-list mutations + checkpoints | +16 growth, first/middle/last deletion, moved locators, duplicate IDs, visibility and failure rollback, clean reopen |
+| S05 (implemented) | Mutable lists + native heap/query/checkpoint + insert/delete scripts | +16 growth, locators/reservations, prepared publication, live rerank, tombstone/aborted-slot checkpoints, reopen/error/contention and all-dtype mutation CLI/script oracles; no production-performance qualification |
 | S06 | Mixed scheduling + concurrency | Same-list contention, query/delete rerank races, weighted/fixed 8+8 overlap, round live sets, deadlock/race-detector stress |
 | S07 | Paired SPFresh evaluation | Identical traces/GT/CPU controls, uint8 SIFT10M, matched-recall sweeps, repeated measurements and reported deviations |
 

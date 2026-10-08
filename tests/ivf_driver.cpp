@@ -14,9 +14,10 @@ int main(int argc, char** argv) {
             "--pq_prefix", "--workload", "--query_file", "--gt_file", "--recall_at",
             "--query_threads", "--nlist", "--nprobe", "--rerank_factor",
             "--full_data_file", "--insert_ids_file", "--delete_ids_file",
-            "--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file"});
+            "--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file",
+            "--index_format", "--private_heap_path", "--checkpoint_prefix"});
         if (args.help) {
-            std::cout << "IVF driver (--validate_inputs 1: validation only; 0: native search_only in full routing-enabled builds).\n"
+            std::cout << "IVF driver (--validate_inputs 1: validation only; 0: native execution in full routing-enabled builds).\n"
                 "Usage: ivf_driver --validate_inputs 0|1 --data_type float|int8|uint8\n"
                 "  --index_prefix PATH --dim N --nlist N --query_file PATH\n"
                 "  --workload search_only|insert_only|delete_only|search_after_update\n"
@@ -26,6 +27,11 @@ int main(int argc, char** argv) {
                 "Native search: --dim/--nlist are optional assertions; no source PQ prefix needed.\n"
                 "  [--memory_budget_gb F] [--buffer_frames N] [--result_file JSON_PATH]\n"
                 "  [--search_result_file SPFresh_BINARY_PATH]\n";
+            std::cout << "Updates: --private_heap_path NEW_PATH --checkpoint_prefix NEW_PREFIX\n"
+                "  --full_data_file ORIGINAL_FULL_SOURCE --insert_ids_file/--delete_ids_file COUNTED_IDS\n"
+                "  [--index_format immutable|mutable] (default immutable; mutable requires a new private heap)\n"
+                "insert_only/delete_only need no queries. search_after_update deletes then inserts,\n"
+                "checkpoints and queries the final live set; no concurrent mixed scheduling.\n";
             return 0;
         }
         const bool validation = args.validation_mode();
@@ -34,9 +40,10 @@ int main(int argc, char** argv) {
 #endif
         if (args.get("--metric", "l2") != "l2") throw std::invalid_argument("IVF currently supports only metric l2");
 #ifdef IVF_NATIVE_EXECUTION
-        if (!validation) { ivf_cli::execute_search(args); return 0; }
+        if (!validation) { ivf_cli::execute_driver(args); return 0; }
 #endif
-        args.reject_present({"--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file"}, "execution-only setting");
+        args.reject_present({"--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file",
+                             "--index_format", "--private_heap_path", "--checkpoint_prefix"}, "execution-only setting");
         const auto type = parse_data_type(args.get("--data_type", "float"));
         const uint32_t dim = args.u32("--dim");
         if (dim == 0) throw std::invalid_argument("dim must be positive");

@@ -14,6 +14,7 @@
 #include <numeric>
 #include <sstream>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #include <sys/resource.h>
 
@@ -51,7 +52,7 @@ double peak_process_rss_mb() {
 }
 void begin_record(std::ostream& out, const char* phase, DataType type) {
     out << std::setprecision(12) << "{\"baseline\":\"IVF\",\"phase\":\"" << phase
-              << "\",\"data_type\":\"" << data_type_name(type) << "\"";
+              << "\",\"data_type\":\"" << data_type_name(type) << "\",\"metric\":\"l2\"";
 }
 void validate_output_paths(const Arguments& args) {
     for (const auto* key : {"--result_file", "--search_result_file"}) if (args.has(key))
@@ -111,16 +112,143 @@ struct WorkerStats {
     std::exception_ptr failure;
 };
 
-template<typename T>
-void search_typed(const Arguments& args, DataType type) {
+// S05 sequential foreground updates, not S06 scheduling. Full-source identity
+// prevents changing row-ID meaning between build and insertion. Partial failures
+// keep owned files but publish neither a checkpoint nor a success record.
+struct UpdateStats {
+    uint64_t inserted = 0, deleted = 0, missing = 0, bytes = 0;
+    double insert_s = 0, delete_s = 0, checkpoint_s = 0;
+};
+void validate_driver_paths(const Arguments& args, bool updating) {
     validate_output_paths(args);
-    args.reject_present({"--pq_prefix", "--full_data_file", "--insert_ids_file", "--delete_ids_file"},
-                        "not used by native search-only execution");
+    std::vector<std::string> paths;
+    for (auto key : {"--result_file", "--search_result_file"}) if (args.has(key)) paths.push_back(args.require(key));
+    if (args.has("--private_heap_path")) {
+        paths.push_back(args.require("--private_heap_path")); paths.push_back(args.require("--private_heap_path") + ".pq.bin");
+    }
+    if (updating) {
+        const auto prefix = args.require("--checkpoint_prefix");
+        paths.push_back(prefix + ".manifest");
+        for (auto suffix : mutable_component_suffixes) paths.push_back(prefix + suffix);
+        args.require("--private_heap_path");
+    } else args.reject_present({"--checkpoint_prefix"}, "not used by search-only execution");
+    std::vector<std::filesystem::path> normalized;
+    for (const auto& path : paths) {
+        check(!std::filesystem::exists(std::filesystem::symlink_status(path)), "Driver output artifact exists");
+        const auto resolved = std::filesystem::weakly_canonical(std::filesystem::absolute(path));
+        check(std::find(normalized.begin(), normalized.end(), resolved) == normalized.end(), "Driver output paths overlap");
+        normalized.push_back(resolved);
+    }
+}
+template<typename T> std::unique_ptr<MutableIndex<T>> open_mutable(const Arguments& args, uint64_t budget) {
+    const MutableIndexOptions options{args.u32("--buffer_frames", 64), budget};
+    const auto format = args.get("--index_format", "immutable");
+    check(format == "immutable" || format == "mutable", "Unknown index_format");
+    return format == "mutable" ? MutableIndex<T>::reopen(args.require("--index_prefix"), args.require("--private_heap_path"), options) :
+        MutableIndex<T>::fork(args.require("--index_prefix"), args.require("--private_heap_path"), options);
+}
+template<typename T> const IndexManifest& cli_manifest(const NativeIndex<T>& index) { return index.manifest(); }
+template<typename T> const IndexManifest& cli_manifest(const MutableIndex<T>& index) { return index.origin_manifest(); }
+template<typename T> uint64_t cli_retained(const NativeIndex<T>& index) { return index.estimated_open_bytes(); }
+template<typename T> uint64_t cli_retained(const MutableIndex<T>& index) { return index.estimated_retained_bytes(); }
+template<typename T>
+UpdateStats update_index(const Arguments& args, MutableIndex<T>& index, uint64_t budget, uint64_t resident_bytes) {
+    const auto& m = index.origin_manifest();
+    const auto workload = args.require("--workload");
+    const bool insert = workload != "delete_only", erase = workload != "insert_only";
+    args.reject_present({"--pq_prefix"}, "frozen bundle PQ is used for updates");
+    if (!insert) args.reject_present({"--insert_ids_file"}, "not used by delete_only");
+    if (!erase) args.reject_present({"--delete_ids_file"}, "not used by insert_only");
+    const auto source = args.require("--full_data_file");
+    const auto shape = inspect_vectors(source, m.training.data_type, m.training.dim);
+    check(shape.rows == m.source_rows && artifact_digest(source) == m.sources[0], "Update full-source identity mismatch");
+    // Counted-ID parser temporarily uses an unordered_set as well as the vector.
+    // Conservatively budget both ID files before allocating either parser.
+    UpdateStats s; s.bytes = resident_bytes;
+    const auto retained_before = index.estimated_retained_bytes();
+    for (auto key : {"--insert_ids_file", "--delete_ids_file"}) if (args.has(key))
+        add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
+    add(s.bytes, m.training.dim, sizeof(T)); add(s.bytes, index.estimated_mutation_bytes());
+    add(s.bytes, index.estimated_checkpoint_bytes()); add(s.bytes, 1024 * 1024);
+    check(s.bytes <= budget, "CLI composed update exceeds workspace allowance");
+    auto inserts = insert ? load_counted_ids(args.require("--insert_ids_file"), m.source_rows) : std::vector<uint32_t>{};
+    auto deletes = erase ? load_counted_ids(args.require("--delete_ids_file"), m.source_rows) : std::vector<uint32_t>{};
+    for (auto id : inserts) check(id >= m.first_id && id < m.heap.id_capacity &&
+        !index.contains(id), "Insert ID is outside allowed range or already live");
+    for (auto id : deletes) check(id >= m.first_id && id < m.heap.id_capacity, "Delete ID outside allowed range");
+    auto sorted_deletes = deletes; std::sort(sorted_deletes.begin(), sorted_deletes.end());
+    for (auto id : inserts) check(!std::binary_search(sorted_deletes.begin(), sorted_deletes.end(), id), "Insert/delete ID sets overlap");
+    const auto identity = m.sources[0];
+    std::ifstream input(source, std::ios::binary); std::vector<T> row(m.training.dim);
+    auto read_row = [&](uint32_t id) {
+        input.seekg(8 + uint64_t(id) * m.training.dim * sizeof(T));
+        input.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
+        check(bool(input), "Insert source row read failed");
+        for (auto value : row) check(std::isfinite(double(value)), "Nonfinite insert coordinate");
+    };
+    // Validate all requested coordinates before starting mutations, using bounded scratch.
+    for (auto id : inserts) read_row(id);
+    auto start = Clock::now();
+    for (auto id : deletes) { if (index.erase(id)) ++s.deleted; else ++s.missing; }
+    s.delete_s = seconds(start); start = Clock::now();
+    for (auto id : inserts) { read_row(id); index.insert(id, row, {index.estimated_mutation_bytes(), false}); ++s.inserted; }
+    s.insert_s = seconds(start);
+    check(artifact_digest(source) == identity, "Update source changed during execution");
+    // Growth may consume retained list allowance; verify final composed budget too.
+    add(s.bytes, index.estimated_retained_bytes() - retained_before);
+    check(s.bytes <= budget, "CLI post-growth update exceeds workspace allowance");
+    start = Clock::now(); index.checkpoint(args.require("--checkpoint_prefix"), index.estimated_checkpoint_bytes());
+    s.checkpoint_s = seconds(start); return s;
+}
+template<typename T> void emit_update(std::ostream& record, bool& first, const Arguments& args,
+                                    const MutableIndex<T>& index, const UpdateStats& s) {
+    auto emit = [&](const char* key, const auto& value) { bufann_bench::json_kv(record, first, key, value); };
+    emit("insert_count", s.inserted); emit("delete_count", s.deleted); emit("missing_delete_count", s.missing);
+    emit("insert_time_s", s.insert_s); emit("delete_time_s", s.delete_s);
+    emit("insert_qps", bufann_bench::safe_div(s.inserted, s.insert_s)); emit("delete_qps", bufann_bench::safe_div(s.deleted + s.missing, s.delete_s));
+    emit("checkpoint_time_s", s.checkpoint_s); emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
+    emit("live_count", index.size()); emit("retained_heap_records", index.retained_heap_records());
+    emit("estimated_update_workspace_bytes", s.bytes); emit("mutation_workers", 1);
+    emit("scheduler", "sequential_delete_then_insert_no_query_overlap");
+    emit("mutation_timing_scope", "foreground_loops_excludes_open_validation_hash_checkpoint_and_post_update_query");
+    emit("publication", "manifest_last_nonatomic_no_fsync");
+    const auto& m = index.origin_manifest();
+    emit("base_count", m.training.base_count); emit("source_rows", m.source_rows);
+    emit("router_degree", m.routing.degree); emit("construction_breadth", m.routing.construction_breadth);
+    emit("query_breadth", m.routing.query_breadth); emit("insert_breadth", m.routing.insert_breadth); emit("router_seed", m.routing.seed);
+    emit("input_index_format", args.get("--index_format", "immutable"));
+    const auto manifest = artifact_digest(args.require("--index_prefix") + ".manifest");
+    emit("input_manifest_bytes", manifest.bytes); emit("input_manifest_hash_fnv1a", manifest.hash);
+    emit("source_bytes", m.sources[0].bytes); emit("source_hash_fnv1a", m.sources[0].hash);
+    emit("buffer_pool_frames", args.u32("--buffer_frames", 64));
+    emit("cache_policy", "uncontrolled_after_full_source_and_bundle_hash_and_private_copy");
+}
+template<typename T> void mutate_typed(const Arguments& args, DataType type) {
+    args.reject_present({"--query_file", "--gt_file", "--search_result_file", "--query_threads", "--recall_at", "--nprobe", "--rerank_factor"},
+                        "not used by mutation-only execution; query the saved checkpoint separately");
+    validate_driver_paths(args, true);
+    const auto budget = budget_bytes(args.real("--memory_budget_gb", 1)); const auto start = Clock::now();
+    auto index = open_mutable<T>(args, budget); const auto open_time = seconds(start);
+    const auto& m = index->origin_manifest();
+    check(!args.has("--dim") || args.u32("--dim") == m.training.dim, "CLI/manifest dimension mismatch");
+    check(!args.has("--nlist") || args.u32("--nlist") == m.training.nlist, "CLI/manifest nlist mismatch");
+    const auto s = update_index(args, *index, budget, index->estimated_retained_bytes());
+    std::ostringstream record; const auto phase = args.require("--workload") == "insert_only" ? "insert" : "delete";
+    begin_record(record, phase, type); bool first = false;
+    bufann_bench::json_kv(record, first, "workload", phase);
+    bufann_bench::json_kv(record, first, "dim", m.training.dim); bufann_bench::json_kv(record, first, "nlist", m.training.nlist);
+    bufann_bench::json_kv(record, first, "pq_chunks", m.chunks); bufann_bench::json_kv(record, first, "open_time_s", open_time);
+    bufann_bench::json_kv(record, first, "index_prefix", args.require("--index_prefix"));
+    bufann_bench::json_kv(record, first, "memory_budget_bytes", budget);
+    bufann_bench::json_kv(record, first, "peak_process_rss_mb", peak_process_rss_mb());
+    emit_update(record, first, args, *index, s); record << "}"; publish_record(args, record.str());
+}
+
+template<typename T, typename Index>
+void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> index, double open_time) {
+    const bool updating = args.require("--workload") == "search_after_update";
     const auto budget = budget_bytes(args.real("--memory_budget_gb", 1.0));
-    const auto start_open = Clock::now();
-    auto index = NativeIndex<T>::open(args.require("--index_prefix"), {args.u32("--buffer_frames", 64), budget});
-    const auto open_time = seconds(start_open);
-    const auto& manifest = index->manifest();
+    const auto& manifest = cli_manifest(*index);
     const auto dim = manifest.training.dim;
     check(!args.has("--dim") || args.u32("--dim") == dim, "CLI/manifest dimension mismatch");
     check(!args.has("--nlist") || args.u32("--nlist") == manifest.training.nlist, "CLI/manifest nlist mismatch");
@@ -133,8 +261,8 @@ void search_typed(const Arguments& args, DataType type) {
     if (has_truth) truth = inspect_truth(args.require("--gt_file"), queries.rows, config.recall_at);
     const uint32_t workers = std::min(config.query_threads, queries.rows);
     const uint64_t result_count = uint64_t(queries.rows) * config.recall_at;
-    const auto query_bytes = index->estimated_query_bytes(config);
-    uint64_t bytes = index->estimated_open_bytes();
+    auto query_bytes = index->estimated_query_bytes(config);
+    uint64_t bytes = cli_retained(*index);
     add(bytes, uint64_t(queries.rows) * dim, sizeof(T));
     add(bytes, result_count, sizeof(uint32_t) + sizeof(float));
     add(bytes, queries.rows, sizeof(double));
@@ -177,6 +305,18 @@ void search_typed(const Arguments& args, DataType type) {
             gold_row.assign(gold_ids.begin() + offset, gold_ids.begin() + offset + truth.cols);
             std::sort(gold_row.begin(), gold_row.end());
             check(std::adjacent_find(gold_row.begin(), gold_row.end()) == gold_row.end(), "Duplicate GT ID in row");
+        }
+    }
+    UpdateStats updates;
+    if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
+        if (updating) {
+            updates = update_index(args, *index, budget, bytes);
+            // Account for additional retained list capacity after insertion.
+            bytes = std::max(bytes, updates.bytes);
+            const auto post_query_bytes = index->estimated_query_bytes(config);
+            if (post_query_bytes > query_bytes) add(bytes, workers, post_query_bytes - query_bytes);
+            query_bytes = post_query_bytes;
+            check(bytes <= budget, "CLI post-update search exceeds workspace allowance");
         }
     }
     std::vector<uint32_t> ids(result_count, UINT32_MAX);
@@ -261,12 +401,15 @@ void search_typed(const Arguments& args, DataType type) {
     begin_record(record, "query", type);
     bool first = false;
     auto emit = [&](const char* key, const auto& value) { bufann_bench::json_kv(record, first, key, value); };
-    emit("workload", "query"); emit("dim", dim); emit("nlist", manifest.training.nlist);
+    emit("workload", updating ? "search_after_update" : "query"); emit("dim", dim); emit("nlist", manifest.training.nlist);
     emit("index_prefix", args.require("--index_prefix")); emit("query_file", args.require("--query_file"));
-    emit("base_count", manifest.training.base_count); emit("pq_chunks", manifest.chunks);
+    if (!updating) emit("base_count", manifest.training.base_count);
+    emit("pq_chunks", manifest.chunks);
     emit("nprobe", config.nprobe); emit("recall_at", config.recall_at); emit("rerank_factor", config.rerank_factor);
     emit("query_threads", config.query_threads); emit("active_query_threads", workers); emit("query_count", queries.rows);
-    emit("query_breadth", manifest.routing.query_breadth); emit("buffer_pool_frames", args.u32("--buffer_frames", 64));
+    if (!updating) {
+        emit("query_breadth", manifest.routing.query_breadth); emit("buffer_pool_frames", args.u32("--buffer_frames", 64));
+    }
     emit("open_time_s", open_time); emit("query_time_s", query_time);
     emit("query_qps", bufann_bench::safe_div(queries.rows, query_time));
     emit("query_lat_avg_us", avg_latency); emit("query_lat_p50_us", percentile(0.5)); emit("query_lat_p90_us", percentile(0.9));
@@ -278,7 +421,7 @@ void search_typed(const Arguments& args, DataType type) {
     emit("fetch_us_total", total.fetch); emit("rerank_us_total", total.rerank);
     emit("estimated_workspace_bytes", bytes); emit("memory_budget_bytes", budget);
     emit("peak_process_rss_mb", peak_rss);
-    emit("cache_policy", "uncontrolled_after_full_bundle_hash");
+    if (!updating) emit("cache_policy", "uncontrolled_after_full_bundle_hash");
     emit("query_timing_scope", "workers_start_join_and_result_collection_excludes_gt_and_export");
     emit("stage_timing_scope", "summed_per_query_wall_us_not_run_wall_or_cpu");
     emit("latency_percentile_policy", "floor_p_times_n_minus_one");
@@ -289,7 +432,30 @@ void search_typed(const Arguments& args, DataType type) {
         emit("gt_id_policy", "source_row_ids_optional_identity_tags");
     }
     if (args.has("--search_result_file")) emit("search_result_file", args.require("--search_result_file"));
+    if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
+        if (!updating) emit("live_count", index->size());
+        emit("index_format", "mutable");
+        if (updating) emit_update(record, first, args, *index, updates);
+    }
     record << "}"; publish_record(args, record.str());
+}
+template<typename T> void driver_typed(const Arguments& args, DataType type) {
+    const auto workload = args.require("--workload");
+    check(workload == "search_only" || workload == "insert_only" || workload == "delete_only" || workload == "search_after_update", "Unsupported native workload");
+    if (workload == "insert_only" || workload == "delete_only") return mutate_typed<T>(args, type);
+    const bool updating = workload == "search_after_update";
+    validate_driver_paths(args, updating);
+    if (!updating) args.reject_present({"--pq_prefix", "--full_data_file", "--insert_ids_file", "--delete_ids_file"}, "not used by search-only execution");
+    const auto format = args.get("--index_format", "immutable");
+    check(format == "immutable" || format == "mutable", "Unknown index_format");
+    const auto budget = budget_bytes(args.real("--memory_budget_gb", 1)); const auto start = Clock::now();
+    if (updating || format == "mutable") {
+        auto index = open_mutable<T>(args, budget);
+        return search_typed<T>(args, type, std::move(index), seconds(start));
+    }
+    args.reject_present({"--private_heap_path"}, "not used by immutable search");
+    auto index = NativeIndex<T>::open(args.require("--index_prefix"), {args.u32("--buffer_frames", 64), budget});
+    return search_typed<T>(args, type, std::move(index), seconds(start));
 }
 } // namespace
 
@@ -302,12 +468,11 @@ void execute_build(const Arguments& args, const diskann::ivf::BuildConfig& confi
     }
     throw std::invalid_argument("Unsupported dtype");
 }
-void execute_search(const Arguments& args) {
-    check(args.require("--workload") == "search_only", "Mutation execution is not implemented; native execution supports search_only");
+void execute_driver(const Arguments& args) {
     switch (parse_data_type(args.get("--data_type", "float"))) {
-        case DataType::Float: return search_typed<float>(args, DataType::Float);
-        case DataType::Int8: return search_typed<int8_t>(args, DataType::Int8);
-        case DataType::UInt8: return search_typed<uint8_t>(args, DataType::UInt8);
+        case DataType::Float: return driver_typed<float>(args, DataType::Float);
+        case DataType::Int8: return driver_typed<int8_t>(args, DataType::Int8);
+        case DataType::UInt8: return driver_typed<uint8_t>(args, DataType::UInt8);
     }
     throw std::invalid_argument("Unsupported dtype");
 }
