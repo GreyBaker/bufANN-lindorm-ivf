@@ -30,6 +30,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
         target_compile_options(ivf_heap_tests PRIVATE -fno-fast-math)
         add_test(NAME ivf_heap_storage COMMAND ivf_heap_tests
             "${CMAKE_CURRENT_BINARY_DIR}/heap_fixtures")
+        add_executable(ivf_heap_adapter_tests ivf_heap_adapter_tests.cpp)
+        target_link_libraries(ivf_heap_adapter_tests PRIVATE ivf_heap Threads::Threads)
+        target_compile_options(ivf_heap_adapter_tests PRIVATE -fno-fast-math)
+        add_test(NAME ivf_heap_adapter COMMAND ivf_heap_adapter_tests
+            "${CMAKE_CURRENT_BINARY_DIR}/adapter_fixtures")
     endif()
     add_executable(ivf_contract_tests ivf_contract_tests.cpp
         "${IVF_ROOT}/src/logger.cpp" "${IVF_ROOT}/src/ann_exception.cpp")

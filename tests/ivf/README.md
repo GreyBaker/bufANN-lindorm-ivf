@@ -72,8 +72,9 @@ See [README.md](../../baselines/DiskANN/README.md) installation guides.
 
 Fresh installed-library verification and full-project build commands are in
 [system-build-and-s02-verification.md](../../docs/system-build-and-s02-verification.md).
-The corrected D01 record uses that fresh evidence, not earlier history. The current system build
-links the real BufANN driver and passes three suites, including the heap test.
+The corrected D01 record uses that fresh evidence, not earlier history. The
+current system build links the real BufANN driver and passes four suites,
+including the heap prerequisite and adapter/loader tests.
 
 The D01 local-package/discovery workaround and its added math smoke-test target
 were rolled back. Current dependency/build success is established by the new
@@ -88,7 +89,19 @@ guarded padded-coordinate copies into aligned scratch; external tags;
 publication; flush and clean reopen. An unpublished allocation stays invisible,
 but its checkpoint is explicitly rejected by the backend. Streaming loading,
 the IVF storage adapter, allocation rollback, and batched candidate fetches
-are not implemented by this test. S02 remains in progress.
+are not implemented by this prerequisite test.
+
+## S02 adapter and streaming loader
+
+`ivf_heap_adapter_tests` exercises `HeapStorage<T>` with all dtypes, full-file
+and base-prefix loading, stable/sparse IDs, padded aligned reads, immutable
+checkpoints and concurrent read-only reopen. Invalid append arguments have no
+effect. Failed streams/backend mutations poison checkpointing rather than
+claiming allocation rollback. Existing files are not overwritten.
+See [s02-heap-adapter.md](../../docs/s02-heap-adapter.md) for the API, failure,
+snapshot and concurrency limits. The adapter suite passes Debug ASan/UBSan with
+leak detection (1/1); the full Release configuration passes 4/4 suites. S02 is
+implemented/tested at this review boundary; complete IVF execution is still pending.
 
 ## Coverage and limits
 
