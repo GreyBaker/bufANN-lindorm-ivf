@@ -1,0 +1,36 @@
+get_filename_component(IVF_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+include("${CMAKE_CURRENT_LIST_DIR}/IVFContracts.cmake")
+find_package(Threads REQUIRED)
+if(NOT TARGET ivf_centroids)
+    add_library(ivf_centroids STATIC "${IVF_ROOT}/src/bufann/ivf_centroids.cpp")
+    target_link_libraries(ivf_centroids PUBLIC ivf_contracts Threads::Threads)
+    target_compile_features(ivf_centroids PUBLIC cxx_std_20)
+    if(NOT MSVC)
+        target_compile_options(ivf_centroids PRIVATE -fno-fast-math)
+    endif()
+endif()
+
+option(IVF_BUILD_ROUTING "Build centroid HNSW router (fetches pinned hnswlib)" OFF)
+if(IVF_BUILD_ROUTING AND NOT TARGET ivf_router)
+    include(FetchContent)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    FetchContent_Declare(ivf_hnswlib
+        URL https://codeload.github.com/nmslib/hnswlib/tar.gz/refs/tags/v0.8.0
+        URL_HASH SHA256=cf61d7dd8dc9bfba7f4abe0ed26698e90ac9f49a0badb2e1b0f3ba89b72cf3bb)
+    FetchContent_GetProperties(ivf_hnswlib)
+    if(NOT ivf_hnswlib_POPULATED)
+        FetchContent_Populate(ivf_hnswlib)
+    endif()
+    add_library(ivf_router STATIC "${IVF_ROOT}/src/bufann/ivf_router.cpp")
+    target_link_libraries(ivf_router PUBLIC ivf_centroids)
+    target_include_directories(ivf_router SYSTEM PRIVATE "${ivf_hnswlib_SOURCE_DIR}")
+    # v0.8.0's SSE upper-layer lookahead reads past full neighbor arrays.
+    # Use upstream's supported scalar path in ALL builds, not an ASan-only
+    # suppression or a modified dependency. Compiler auto-vectorization remains.
+    target_compile_definitions(ivf_router PRIVATE NO_MANUAL_VECTORIZATION)
+    if(NOT MSVC)
+        target_compile_options(ivf_router PRIVATE -fno-fast-math)
+    endif()
+endif()

@@ -2,6 +2,7 @@
 # Licensed under the MIT license.
 
 include(${PROJECT_SOURCE_DIR}/cmake/IVFContracts.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/IVFCentroids.cmake)
 
 if(MSVC)
 	add_subdirectory(dll)

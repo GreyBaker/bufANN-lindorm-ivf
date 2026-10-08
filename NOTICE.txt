@@ -4,6 +4,14 @@ runtime and benchmark path still depend on. DiskANN itself builds upon NSG.
 This repository keeps the original upstream MIT licensing model and preserves
 the NSG attribution below.
 
+Optional IVF centroid-router dependency
+---------------------------------------
+The IVF router uses unmodified hnswlib v0.8.0, from
+https://github.com/nmslib/hnswlib, under the Apache License 2.0.
+See dependencies/hnswlib.md for the archive pin/build configuration and
+dependencies/hnswlib.LICENSE for the complete upstream license. This optional
+dependency does not change the licenses of existing BufANN/DiskANN sources.
+
 NSG attribution
 ---------------
 
