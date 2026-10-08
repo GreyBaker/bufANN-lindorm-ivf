@@ -462,6 +462,9 @@ class BufferPool {
 
     uint32_t page_size() const { return _page_size; }
     uint32_t num_frames() const { return _num_frames; }
+    // Conservative bound for arbitrary page sets, which may all hash to one
+    // shard. Caller must also ensure no competing outstanding pins.
+    uint32_t min_shard_frames() const { return _num_frames / _num_shards; }
     uint32_t total_pages() const { return _total_pages.load(std::memory_order_acquire); }
     uint32_t pin_count_of(uint32_t page_id) const;
 
@@ -738,6 +741,7 @@ class InPlaceGraphStore {
 
     // Memory breakdown for metrics
     size_t buffer_pool_bytes() const;
+    uint32_t min_buffer_shard_frames() const { return _bp.min_shard_frames(); }
     size_t locator_bytes() const;
     size_t pq_data_bytes() const;
 

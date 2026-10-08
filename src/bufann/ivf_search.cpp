@@ -1,0 +1,127 @@
+#include "bufann/ivf_search.h"
+
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+
+namespace diskann::ivf {
+namespace {
+void check(bool ok, const char* message) {
+    if (!ok) throw std::invalid_argument(message);
+}
+void add_product(uint64_t& bytes, uint64_t count, uint64_t stride) {
+    check(!stride || count <= (UINT64_MAX - bytes) / stride, "IVF query workspace overflow");
+    bytes += count * stride;
+}
+using Clock = std::chrono::steady_clock;
+double elapsed_us(Clock::time_point start) {
+    return std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+}
+} // namespace
+
+template<typename T>
+uint64_t estimate_query_workspace(const CentroidRouter& router, const PostingLists& lists,
+    const PQCodebook<T>& codebook, const HeapStorage<T>& heap, const SearchConfig& config, bool exact_routing) {
+    config.validate(router.nlist());
+    check(codebook.dim() == router.dim() && heap.dim() == router.dim() &&
+          lists.dim() == router.dim() && lists.nlist() == router.nlist() && lists.chunks() == codebook.chunks() &&
+          lists.data_type() == (std::is_same_v<T, float> ? DataType::Float :
+              (std::is_same_v<T, int8_t> ? DataType::Int8 : DataType::UInt8)),
+          "Incompatible IVF query components");
+    check(!heap.failed(), "Cannot query a failed IVF heap build");
+    check(heap.read_only(), "IVF query requires a clean checkpoint/read-only heap");
+    const auto budget = config.candidate_budget(lists.size());
+    check(budget > 0 && budget <= UINT32_MAX, "Invalid IVF query candidate budget");
+    // Retained PQ candidates/exact hits plus scan heap growth, LUT, routing
+    // scratch/visited allowance and one bounded, aligned coordinate batch.
+    const size_t stride = ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t batch = std::min<size_t>(budget, heap.copy_batch_limit());
+    uint64_t bytes = 65536;
+    add_product(bytes, budget, 96);
+    add_product(bytes, codebook.chunks(), 256 * sizeof(float));
+    add_product(bytes, config.nprobe, 32);
+    add_product(bytes, router.dim(), sizeof(T) + sizeof(float));
+    add_product(bytes, router.nlist(), 2);
+    add_product(bytes, exact_routing || config.nprobe == router.nlist() ? router.nlist() :
+        std::min(router.nlist(), std::max(config.nprobe, router.options().query_breadth)), 64);
+    add_product(bytes, batch, stride * sizeof(T) + sizeof(uint32_t) + 1);
+    check(bytes <= SIZE_MAX, "IVF query workspace exceeds size_t");
+    return bytes;
+}
+
+template<typename T>
+QueryResult search(const CentroidRouter& router, const PostingLists& lists,
+                   const PQCodebook<T>& codebook, HeapStorage<T>& heap,
+                   std::span<const T> query, const SearchConfig& config, const QueryLimits& limits) {
+    check(query.size() == router.dim(), "Invalid IVF query dimension");
+    for (T coordinate : query) check(std::isfinite(double(coordinate)), "Nonfinite IVF query");
+    const auto bytes = estimate_query_workspace(router, lists, codebook, heap, config, limits.exact_routing);
+    check(bytes <= limits.workspace_bytes, "IVF query exceeds workspace allowance");
+    const auto budget = config.candidate_budget(lists.size());
+    const size_t stride = ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t batch = std::min<size_t>(budget, heap.copy_batch_limit());
+    QueryResult result;
+    auto start = Clock::now();
+    const auto routed = router.search(query, config.nprobe, limits.exact_routing);
+    for (auto hit : routed) result.selected_lists.push_back(hit.list_id);
+    result.routing_us = elapsed_us(start);
+    start = Clock::now();
+    std::vector<float> distances;
+    codebook.populate_distances(query.data(), distances);
+    result.adc_us = elapsed_us(start);
+    start = Clock::now();
+    auto scanned = lists.scan(result.selected_lists, distances, static_cast<uint32_t>(budget), limits.workspace_bytes);
+    result.scanned_codes = scanned.scanned_codes;
+    result.scan_select_us = elapsed_us(start);
+    if (scanned.candidates.empty()) return result;
+    result.logical_fetch_stages = 1;
+    const size_t allocation_bytes = batch * stride * sizeof(T);
+    std::unique_ptr<void, decltype(&std::free)> scratch(std::aligned_alloc(64, allocation_bytes), &std::free);
+    if (!scratch) throw std::bad_alloc();
+    std::vector<uint32_t> ids;
+    ids.reserve(batch);
+    result.hits.reserve(scanned.candidates.size());
+    for (size_t begin = 0; begin < scanned.candidates.size(); begin += batch) {
+        const size_t count = std::min(batch, scanned.candidates.size() - begin);
+        ids.clear();
+        for (size_t i = 0; i < count; ++i) ids.push_back(scanned.candidates[begin + i].id);
+        start = Clock::now();
+        auto copied = heap.copy_coordinates_batch(ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
+        result.backend_batch_calls += copied.backend_batch_calls;
+        result.heap_pages_read += copied.heap_pages_read;
+        result.fetch_us += elapsed_us(start);
+        start = Clock::now();
+        for (size_t i = 0; i < count; ++i) {
+            check(copied.present[i], "IVF posting references a missing heap ID");
+            const auto* vector = static_cast<const T*>(scratch.get()) + i * stride;
+            double distance = 0;
+            for (uint32_t d = 0; d < router.dim(); ++d) {
+                const double difference = double(query[d]) - double(vector[d]);
+                distance += difference * difference;
+            }
+            check(std::isfinite(distance), "Nonfinite IVF exact distance");
+            result.hits.push_back({ids[i], distance});
+        }
+        result.rerank_us += elapsed_us(start);
+    }
+    result.reranked_vectors = result.hits.size();
+    start = Clock::now();
+    std::sort(result.hits.begin(), result.hits.end(), [](const ExactHit& a, const ExactHit& b) {
+        return a.squared_distance < b.squared_distance ||
+            (a.squared_distance == b.squared_distance && a.id < b.id);
+    });
+    if (result.hits.size() > config.recall_at) result.hits.resize(config.recall_at);
+    result.rerank_us += elapsed_us(start);
+    return result;
+}
+
+template QueryResult search<float>(const CentroidRouter&, const PostingLists&, const PQCodebook<float>&, HeapStorage<float>&, std::span<const float>, const SearchConfig&, const QueryLimits&);
+template QueryResult search<int8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<int8_t>&, HeapStorage<int8_t>&, std::span<const int8_t>, const SearchConfig&, const QueryLimits&);
+template QueryResult search<uint8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<uint8_t>&, HeapStorage<uint8_t>&, std::span<const uint8_t>, const SearchConfig&, const QueryLimits&);
+template uint64_t estimate_query_workspace<float>(const CentroidRouter&, const PostingLists&, const PQCodebook<float>&, const HeapStorage<float>&, const SearchConfig&, bool);
+template uint64_t estimate_query_workspace<int8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<int8_t>&, const HeapStorage<int8_t>&, const SearchConfig&, bool);
+template uint64_t estimate_query_workspace<uint8_t>(const CentroidRouter&, const PostingLists&, const PQCodebook<uint8_t>&, const HeapStorage<uint8_t>&, const SearchConfig&, bool);
+} // namespace diskann::ivf

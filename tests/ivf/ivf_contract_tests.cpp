@@ -145,6 +145,12 @@ void test_io(const fs::path& dir) {
     const auto truth = (dir / "truth.bin").string();
     write_bin<uint32_t>(truth, 2, 2, {0, 1, 2, 3, 0, 0, 0, 0});
     inspect_truth(truth, 2, 2);
+    {
+        std::ofstream out(truth, std::ios::binary | std::ios::app);
+        const uint32_t identity_tags[] = {0, 1, 2, 3};
+        out.write(reinterpret_cast<const char*>(identity_tags), sizeof(identity_tags));
+    }
+    inspect_truth(truth, 2, 2);
     rejects([&] { inspect_truth(truth, 3, 2); }, "wrong GT queries accepted");
     rejects([&] { inspect_truth(truth, 2, 3); }, "shallow GT accepted");
 

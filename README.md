@@ -94,11 +94,20 @@ The mixed-update example assumes a 16-thread server and assigns eight threads to
 
 ## IVF development (in progress)
 
-The single-node Lindorm IVF backend is under development. `ivf_build` and
-`ivf_driver` currently provide input validation only, not index construction or
-search. See [tests/ivf/README.md](tests/ivf/README.md) for review segments, test
-coverage, and dependency-light build commands. Existing BufANN/SPFresh workloads
-remain the comparison baselines.
+The single-node Lindorm IVF backend now supports native build, clean reload and
+query-only execution in full Linux routing-enabled builds. Tested query prepare/run
+scripts and trained-PQ fixture parity are available; production training and
+performance remain unqualified. No DiskANN/Vamana graph conversion is required.
+
+See [benchmark/IVF/README.md](benchmark/IVF/README.md) for explicit system build,
+full-source PQ, dataset/GT, caching and query commands. Dependency-isolated
+`ivf_build`/`ivf_driver` still provide validation only; mutations/mixed workloads
+are not implemented.
+Bounded training comparisons and repeated query sweeps are documented in
+[benchmark/IVF/QUALIFICATION.md](benchmark/IVF/QUALIFICATION.md); fixtures pass,
+but no production dataset is currently configured or qualified.
+[tests/ivf/README.md](tests/ivf/README.md) records review segments and coverage.
+Existing BufANN/SPFresh workloads remain unchanged comparison baselines.
 
 Administrator actions for Linux/WSL libaio and MKL/Intel OpenMP dependencies
 have been used for installing dependencies. 

@@ -3,6 +3,7 @@
 
 include(${PROJECT_SOURCE_DIR}/cmake/IVFContracts.cmake)
 include(${PROJECT_SOURCE_DIR}/cmake/IVFCentroids.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/IVFLists.cmake)
 
 if(MSVC)
 	add_subdirectory(dll)
@@ -20,5 +21,13 @@ else()
     target_link_libraries(ivf_heap PUBLIC ${PROJECT_NAME} ivf_contracts aio)
     # Finite-coordinate validation must survive the parent's -Ofast flags.
     target_compile_options(ivf_heap PRIVATE -fno-fast-math)
+    if(TARGET ivf_lists)
+        add_library(ivf_search STATIC bufann/ivf_search.cpp)
+        target_link_libraries(ivf_search PUBLIC ivf_heap ivf_lists)
+        target_compile_options(ivf_search PRIVATE -fno-fast-math)
+        add_library(ivf_index STATIC bufann/ivf_index.cpp)
+        target_link_libraries(ivf_index PUBLIC ivf_search)
+        target_compile_options(ivf_index PRIVATE -fno-fast-math)
+    endif()
 endif()
 install()

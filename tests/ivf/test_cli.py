@@ -35,6 +35,7 @@ def run(command, succeeds=True):
         record = records[0]
         assert record["baseline"] == "IVF" and record["phase"] == "input_validation"
         assert not any(key in record for key in ("recall", "query_qps", "insert_ops_per_s"))
+        return record
     else:
         assert result.returncode != 0, command
         assert "ERROR:" in result.stderr, result.stderr
@@ -72,6 +73,14 @@ def main():
                   "--dim", "3", "--index_prefix", str(prefix), "--nlist", "1",
                   "--query_file", str(query), "--gt_file", str(truth), "--recall_at", "2"]
         run(build)
+        # Existing PQ artifacts describe the full source, not just its base
+        # prefix. Validation and the native list builder must agree on framing.
+        prefix_build = build.copy()
+        prefix_build[prefix_build.index("--base_count") + 1] = "1"
+        assert run(prefix_build)["rows"] == 1
+        Path(str(prefix) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 1, 2) + bytes(2))
+        run(prefix_build, False)
+        Path(str(prefix) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 2, 2) + bytes(4))
         run(driver + ["--workload", "search_only"])
         for workload in ("insert_only", "delete_only", "search_after_update"):
             run(driver + ["--workload", workload, "--full_data_file", str(data),

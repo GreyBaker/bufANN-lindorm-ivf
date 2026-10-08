@@ -40,6 +40,10 @@ class Arguments {
         if (value.empty()) throw std::invalid_argument("required flag: " + key);
         return value;
     }
+    bool has(const std::string& key) const { return values_.contains(key); }
+    void reject_present(const std::set<std::string>& keys, const char* message) const {
+        for (const auto& key : keys) if (has(key)) throw std::invalid_argument(key + ": " + message);
+    }
 
     uint64_t integer(const std::string& key, uint64_t fallback = 0) const {
         const auto it = values_.find(key);
@@ -70,12 +74,14 @@ class Arguments {
         return value;
     }
 
-    void require_validation_mode() const {
+    bool validation_mode() const {
         const uint32_t mode = u32("--validate_inputs");
         if (mode > 1) throw std::invalid_argument("validate_inputs must be 0 or 1");
-        if (mode != 1) {
-            throw std::runtime_error("IVF execution is not implemented yet; use --validate_inputs 1 for input checks");
-        }
+        return mode == 1;
+    }
+    void require_validation_mode() const {
+        if (!validation_mode()) throw std::runtime_error(
+            "IVF execution requires the full routing-enabled build; use --validate_inputs 1 for input checks");
     }
 
     bool help = false;

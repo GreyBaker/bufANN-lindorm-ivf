@@ -108,8 +108,12 @@ BinMetadata inspect_pq_codes(const std::string& path, uint32_t rows, uint32_t ch
 }
 
 BinMetadata inspect_truth(const std::string& path, uint32_t query_count, uint32_t recall_at) {
-    // GT is header + all uint32 IDs + all float distances, not interleaved.
-    const auto shape = inspect_bin(path, 8);
+    // Canonical GT: IDs then distances, optionally followed by a tags plane.
+    // Execution requires identity tags for IVF's stable source-row ID policy.
+    Reader reader(path);
+    const auto shape = reader.header(0);
+    if (reader.size != reader.block_end(0, shape, 8) && reader.size != reader.block_end(0, shape, 12))
+        invalid(path, "ground truth length mismatch");
     if (shape.rows != query_count || shape.cols < recall_at) invalid(path, "ground truth shape mismatch");
     return shape;
 }
@@ -132,7 +136,7 @@ std::vector<uint32_t> load_counted_ids(const std::string& path, uint32_t id_capa
     return ids;
 }
 
-PQMetadata inspect_pq_pivots(const std::string& path) {
+PQMetadata inspect_pq_pivots(const std::string& path, uint32_t expected_dim) {
     Reader reader(path);
     const auto header = reader.header(0);
     if (header.rows != 5 || header.cols != 1) invalid(path, "expected five-offset PQ pivots format");
@@ -152,6 +156,7 @@ PQMetadata inspect_pq_pivots(const std::string& path) {
         }
     }
     const uint32_t dim = shapes[0].cols;
+    if (expected_dim != 0 && dim != expected_dim) invalid(path, "PQ dimension mismatch");
     if (shapes[0].rows != 256 || shapes[1].rows != dim || shapes[1].cols != 1 ||
         shapes[2].rows != dim || shapes[2].cols != 1 || shapes[3].cols != 1 ||
         shapes[3].rows < 2 || shapes[3].rows - 1 > dim) {

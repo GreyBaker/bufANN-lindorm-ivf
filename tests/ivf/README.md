@@ -8,11 +8,12 @@ Implemented:
 * Packed vector, PQ code, GT-header, counted-ID, and five-offset PQ-pivot validation.
 * `PQCodebook<T>` wraps the existing `FixedChunkPQTable<T>` encoder and ADC LUT.
 * Optional ADC-only PQ loading, without PQ-to-PQ tables or runtime cache writes.
-* Strict `ivf_build` / `ivf_driver` **validation-only** command scaffolds.
+* Strict `ivf_build` / `ivf_driver` input-validation modes (retained).
 
-The tools require `--validate_inputs 1`. They do not build/search an index,
-write heaps, apply updates, or emit benchmark results. `nlist` is explicit in
-the driver until manifest loading is implemented. Metadata validation checks
+Dependency-isolated `ivf_build`/`ivf_driver` require `--validate_inputs 1`; they do not build/search
+an index or emit benchmark results. Full Linux routing-enabled tools now provide
+native build/search execution (see S04 below). In validation mode, `nlist` is
+explicit and source PQ metadata is checked. Metadata validation checks
 vector payload length, not every vector's coordinate values; finite-coordinate
 validation is implemented by the separate S02 loader/S03 trainer components.
 
@@ -73,8 +74,8 @@ See [README.md](../../baselines/DiskANN/README.md) installation guides.
 Fresh installed-library verification and full-project build commands are in
 [system-build-and-s02-verification.md](../../docs/system-build-and-s02-verification.md).
 The corrected D01 record uses that fresh evidence, not earlier history. The
-current routing-enabled system build links the real BufANN driver and passes six
-suites, including the heap prerequisite, adapter/loader, trainer and router tests.
+current routing-enabled system build links the real BufANN driver and passes twelve
+suites, including the lists and query-composition tests.
 
 The D01 local-package/discovery workaround and its added math smoke-test target
 were rolled back. Current dependency/build success is established by the new
@@ -108,7 +109,7 @@ implemented/tested at this review boundary; complete IVF execution is still pend
 The default isolated build now adds `ivf_centroid_training` without downloading
 dependencies (3 suites total). Add `-DIVF_BUILD_ROUTING=ON` to enable the
 checksum-pinned, unmodified hnswlib v0.8.0 router and `ivf_centroid_routing`
-(4 isolated suites; 6 in the full installed-library configuration).
+(now 6 Linux routing-enabled isolated suites; 11 in the full configuration, 12 with optional trained helpers).
 
 ```bash
 cmake -S tests/ivf -B build/ivf-s03-release \
@@ -123,8 +124,9 @@ pending. Router builds always use upstream's `NO_MANUAL_VECTORIZATION` to avoid
 an ASan-confirmed upstream SSE-prefetch out-of-bounds read. No upstream source
 is patched and no sanitizer check is suppressed. hnswlib is Apache-2.0 licensed.
 
-Full-project Release: 6/6 pass; isolated ASan/UBSan with leak detection: 4/4 pass;
-default routing-disabled isolation: 3/3 pass. Details, artifact format, recall
+At the S03 boundary, full-project Release passed 6/6 and isolated ASan/UBSan
+with leak detection passed 4/4. Default routing-disabled isolation passes 3/3.
+Details, artifact format, recall
 fixture, concurrency and reproduction commands are in
 [s03-centroid-training-routing.md](../../docs/s03-centroid-training-routing.md).
 
@@ -132,6 +134,62 @@ fixture, concurrency and reproduction commands are in
 CTest or an IVF benchmark. Its synthetic 100K-row/13D, 50K-centroid training and
 router persistence/reopen pass. Resource allowances, measured time/RSS and limits
 are recorded in the S03 document. It makes no production recall/QPS claim.
+
+## S04 — immutable lists and query composition (partial)
+
+`ivf_posting_lists` tests streamed base-only centroid assignment, unchanged PQ
+code repacking, one membership per stable ID, bounded ADC against a direct-code
+oracle, ties/empty lists, workspace/work refusals and concurrent scans. It is
+available in isolated routing-enabled builds without BufANN/MKL/libaio.
+
+Full-project `ivf_query_composition` uses the real heap/backend with the existing
+PQ adapter: routing, LUT construction, list scanning and **actual libaio batch
+pinning** followed by aligned copies and exact L2 reranking. All-list/full-budget
+queries match a direct-vector oracle for all dtypes; limited-probe results match
+an independent ADC/rerank oracle. Batch capacity respects the smallest pool
+shard, with conservative serialized adapter pin/copy admission. Tests cover heap
+reopen, duplicates, tiny pools, missing IDs, empty/short results, concurrent
+queries and measured cold/resident heap-page reads (not device IOPS).
+
+Current full-project Release with trained helpers enabled: **12/12 pass**; Linux isolated routing-enabled Release and
+ASan/UBSan with leak detection: **6/6 each**. Full instrumented-backend query and
+adapter suites each pass **1/1** with leak detection. The original BufANN driver
+still builds. Details and commands:
+[s04-lists-query-components.md](../../docs/s04-lists-query-components.md).
+
+List persistence and manifest-bound native build/open/query bundles now pass
+fixture tests, including relocated reopen without original inputs and rehashed
+structural mismatches. Details:
+[s04-index-bundles.md](../../docs/s04-index-bundles.md).
+Full Linux routing-enabled tools now support native builds and `search_only`
+execution with `--validate_inputs 0` (or omitted); isolated tools still refuse
+execution. Validation-only records remain metric-free, and mutations remain
+refused in execution mode. `ivf_cli_execution` verifies exact results, SPFresh
+interleaved result files and unchanged tie-aware GT scorer parity for all dtypes,
+concurrency, short results, collisions and invalid input/budget paths. Full
+instrumented CLI and query suites each pass 1/1 with ASan/UBSan and leak detection.
+Usage, truthful timing/read/RSS scopes and limits:
+[s04-cli-execution.md](../../docs/s04-cli-execution.md).
+Query prepare/run scripts and fixture trained-helper parity now pass;
+see [benchmark/IVF/README.md](../../benchmark/IVF/README.md) and
+[s04-query-harness-and-trained-pq.md](../../docs/s04-query-harness-and-trained-pq.md).
+The trained helper test is opt-in through `IVF_PQ_PIVOT_HELPER` and
+`IVF_PQ_CODES_HELPER`; baseline sources are compiled unchanged by a separate
+installed-library wrapper. New harness and trained-helper suites each pass 1/1
+with the IVF side instrumented and leak detection. Optional canonical GT tags
+must equal source-row IDs; nonidentity mappings are refused, never rewritten.
+Production GT/performance qualification remains pending. The immutable
+CSR component is not S05's mutable list lifecycle; no benchmark result is claimed.
+
+Linux routing-enabled builds also include `ivf_training_diagnostics`: actual
+bounded exact/HNSW comparisons in independent processes, identical sampled-ID
+artifacts, exact evaluation SSE and truthful RSS/work counters. Its CTest suite
+covers every dtype and input/estimate/work/collision/timeout/post-run gate failures.
+The expanded query harness tests repeated native sweeps with preserved trials,
+separate discarded warmups, affinity and declared recall/RSS gates. Both new/
+expanded suites pass in full and isolated (diagnostics only) ASan/UBSan runs with
+leak detection. Tool usage and non-production scope:
+[QUALIFICATION.md](../../benchmark/IVF/QUALIFICATION.md).
 
 ## Coverage and limits
 
@@ -144,8 +202,10 @@ PQ tests cover float/int8/uint8, signed and high uint8 coordinates, nonzero
 global centering, a nonidentity dimension permutation, unequal chunk lengths,
 encoder/LUT parity with the existing loader, a reconstruction oracle, retained
 legacy PQ-to-PQ behavior, and eight concurrent readers with separate scratch.
-They test synthetic pivots, not a trained SIFT index or the standalone PQ
-builder's assignment implementation; those integration checks remain pending.
+Those contract tests use synthetic pivots. The separate optional
+`ivf_trained_helper_integration` now tests the actual standalone trainer/assignment
+against native encoder/ADC and exact script results for every dtype on small
+4096-row/13D fixtures; no trained production SIFT index is qualified.
 
 `ivf_cli_contracts` covers all supported dtypes/workload names, JSON validation
 records (without fake metrics), invalid flags/numbers, missing mutation inputs,
@@ -156,8 +216,8 @@ help, refusal to execute an unimplemented workload, and logger output.
 | Segment | Scope | Tests required before claiming completion |
 |---|---|---|
 | S02 (implemented) | Graph-free BufANN heap adapter + streaming vectors | Covered: zero-degree slots, aligned dtype round-trip, stable IDs, clean reopen, failed-build checkpoint refusal (not physical rollback) |
-| S03 (partial) | Exact/HNSW trainer + pinned HNSW router | Component comparisons and synthetic 50K smoke pass; production-scale quality/memory/build qualification remains |
-| S04 | Lists + query-only IVF + query scripts | One-list membership per ID, actual PQ build-helper parity, all-list/full-budget exact oracle, batch/page boundaries, canonical metrics and GT scoring |
+| S03 (partial) | Exact/HNSW trainer + pinned HNSW router | Component comparisons, synthetic 50K smoke and bounded diagnostic tooling pass; production-scale quality/memory/build qualification remains |
+| S04 (partial) | Persisted native build/open/query + query scripts | Component/bundle/CLI/harness/trained-helper and repeated-sweep fixtures pass; production GT/performance and measured admission qualification remain |
 | S05 | Posting-list mutations + checkpoints | +16 growth, first/middle/last deletion, moved locators, duplicate IDs, visibility and failure rollback, clean reopen |
 | S06 | Mixed scheduling + concurrency | Same-list contention, query/delete rerank races, weighted/fixed 8+8 overlap, round live sets, deadlock/race-detector stress |
 | S07 | Paired SPFresh evaluation | Identical traces/GT/CPU controls, uint8 SIFT10M, matched-recall sweeps, repeated measurements and reported deviations |

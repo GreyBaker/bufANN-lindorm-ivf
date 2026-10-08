@@ -1,7 +1,10 @@
 #include "bufann/ivf_heap.h"
 
 #include <bit>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -208,6 +211,7 @@ bool HeapStorage<T>::copy_coordinates(uint32_t id, std::span<T> output) {
     check(output.size() >= aligned_dim() && output.data() != nullptr &&
           reinterpret_cast<uintptr_t>(output.data()) % 64 == 0,
           "IVF coordinate output must be padded and 64-byte aligned");
+    std::lock_guard<std::mutex> lock(_copy_mutex);
     if (!contains(id)) return false;
     inplace::NodeRID rid;
     auto frame = _store.pin_page_for_node(id, inplace::READ, &rid);
@@ -218,6 +222,50 @@ bool HeapStorage<T>::copy_coordinates(uint32_t id, std::span<T> output) {
           "IVF coordinate slot mismatch");
     std::memcpy(output.data(), node.coords_bytes(), size_t(aligned_dim()) * sizeof(T));
     return true;
+}
+
+template<typename T>
+uint32_t HeapStorage<T>::copy_batch_limit() const {
+    const auto shard_frames = _store.min_buffer_shard_frames();
+    return std::min(inplace::BufferPool::kPinBatchMax, std::max(1u, shard_frames - 1));
+}
+
+template<typename T>
+BatchCopyResult HeapStorage<T>::copy_coordinates_batch(std::span<const uint32_t> ids,
+                                                       std::span<T> output, size_t stride) {
+    check(stride >= aligned_dim() && stride <= SIZE_MAX / sizeof(T) && stride * sizeof(T) % 64 == 0,
+          "IVF batch coordinate stride must be padded and 64-byte aligned");
+    check(ids.size() <= SIZE_MAX / stride && output.size() >= ids.size() * stride &&
+          (ids.empty() || (output.data() != nullptr && reinterpret_cast<uintptr_t>(output.data()) % 64 == 0)),
+          "Invalid IVF batch coordinate output");
+    BatchCopyResult result;
+    result.present.resize(ids.size(), 0);
+    std::lock_guard<std::mutex> lock(_copy_mutex);
+    const auto reads_before = inplace::thread_physical_reads_count();
+    // All requested pages could map to one shard. Keep one spare per shard
+    // when possible; one-frame shards necessarily use single-page batches.
+    const size_t limit = copy_batch_limit();
+    for (size_t begin = 0; begin < ids.size(); begin += limit) {
+        const size_t count = std::min(limit, ids.size() - begin);
+        std::array<inplace::PinnedFrame, inplace::BufferPool::kPinBatchMax> frames;
+        std::array<inplace::NodeRID, inplace::BufferPool::kPinBatchMax> rids;
+        _store.pin_pages_for_nodes_batch(ids.data() + begin, count, inplace::READ, frames.data(), rids.data());
+        ++result.backend_batch_calls;
+        for (size_t i = 0; i < count; ++i) {
+            if (!contains(ids[begin + i])) continue;
+            check(frames[i].valid(), "IVF batch coordinate page unavailable");
+            // One guard at a time: duplicate IDs/pages must not recursively
+            // acquire the same shared mutex. RAII frames release every pin.
+            auto guard = frames[i].read_guard();
+            auto node = guard.read_node(rids[i]);
+            check(node.valid() && node.node_id() == ids[begin + i] && node.degree() == 0,
+                  "IVF batch coordinate slot mismatch");
+            std::memcpy(output.data() + (begin + i) * stride, node.coords_bytes(), size_t(aligned_dim()) * sizeof(T));
+            result.present[begin + i] = 1;
+        }
+    }
+    result.heap_pages_read = inplace::thread_physical_reads_count() - reads_before;
+    return result;
 }
 
 template<typename T>

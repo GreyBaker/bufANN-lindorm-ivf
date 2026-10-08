@@ -3,6 +3,7 @@ get_filename_component(IVF_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 if(NOT TARGET ivf_contracts)
     add_library(ivf_contracts STATIC
         "${IVF_ROOT}/src/bufann/ivf_config.cpp"
+        "${IVF_ROOT}/src/bufann/ivf_artifacts.cpp"
         "${IVF_ROOT}/src/bufann/ivf_io.cpp")
     target_include_directories(ivf_contracts PUBLIC "${IVF_ROOT}/include")
     target_compile_features(ivf_contracts PUBLIC cxx_std_20)

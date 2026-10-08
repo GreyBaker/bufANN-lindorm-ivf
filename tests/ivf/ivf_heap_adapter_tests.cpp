@@ -77,6 +77,31 @@ void exercise(const std::filesystem::path& root) {
         }
     };
     verify(*heap, 0, 1);
+    auto verify_batch = [](HeapStorage<T>& storage) {
+        constexpr size_t stride = 64 / sizeof(T);
+        alignas(64) std::array<T, 337 * stride> coordinates;
+        coordinates.fill(T(42));
+        std::array<uint32_t, 337> ids;
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = i % 11 == 0 ? UINT32_MAX : 5 + ((i * 31) % 160);
+        const auto result = storage.copy_coordinates_batch(ids, coordinates, stride);
+        require(result.backend_batch_calls == (ids.size() + storage.copy_batch_limit() - 1) / storage.copy_batch_limit(),
+                "incorrect backend batch count");
+        for (size_t i = 0; i < ids.size(); ++i) {
+            require(result.present[i] == (ids[i] != UINT32_MAX), "batch presence mismatch");
+            if (ids[i] == UINT32_MAX) require(coordinates[i * stride] == T(42), "missing batch row modified");
+            else {
+                for (uint32_t d = 0; d < 13; ++d)
+                    require(coordinates[i * stride + d] == coordinate<T>(ids[i] - 5, d), "batch coordinate mismatch");
+                for (uint32_t d = 13; d < storage.aligned_dim(); ++d)
+                    require(coordinates[i * stride + d] == T{}, "batch padding mismatch");
+            }
+        }
+        require(storage.copy_coordinates_batch({}, {}, stride).backend_batch_calls == 0, "empty batch pinned");
+        rejects([&] { storage.copy_coordinates_batch(ids, std::span<T>(coordinates).subspan(1), stride); });
+        rejects([&] { storage.copy_coordinates_batch(ids, coordinates, 13); });
+        rejects([&] { storage.copy_coordinates_batch(ids, coordinates, SIZE_MAX); });
+    };
+    verify_batch(*heap); // Tiny pool: batches must split instead of exhausting it.
     std::array<T, 13> row{};
     rejects([&] { heap->append(5, row); }); // Duplicate, before allocation.
     rejects([&] { heap->append(200, row); });
@@ -98,13 +123,13 @@ void exercise(const std::filesystem::path& root) {
     rejects([&] { heap->append(0, row); }); // Immutable checkpoint generation.
     heap.reset();
     auto reader_options = options;
-    reader_options.buffer_frames = 8; // Four readers can hold simultaneous pins.
+    reader_options.buffer_frames = 64; // Multi-page batches with per-shard slack.
     auto reopened = HeapStorage<T>::reopen(reader_options, heap_path, snapshot);
     std::array<std::exception_ptr, 4> errors{};
     std::vector<std::thread> readers;
     for (uint32_t thread = 0; thread < 4; ++thread)
         readers.emplace_back([&, thread] {
-            try { verify(*reopened, thread, 4); }
+            try { verify(*reopened, thread, 4); verify_batch(*reopened); }
             catch (...) { errors[thread] = std::current_exception(); }
         });
     for (auto& reader : readers) reader.join();

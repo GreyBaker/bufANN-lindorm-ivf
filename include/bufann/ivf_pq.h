@@ -14,10 +14,13 @@ namespace diskann::ivf {
 template <typename T>
 class PQCodebook {
   public:
-    explicit PQCodebook(const std::string& pivots_path, uint32_t expected_dim)
-        : metadata_(inspect_pq_pivots(pivots_path)),
+    explicit PQCodebook(const std::string& pivots_path, uint32_t expected_dim, uint32_t expected_chunks = 0)
+        : metadata_(expected_dim > 0 ? inspect_pq_pivots(pivots_path, expected_dim) :
+                    throw std::invalid_argument("PQ dimension must be positive")),
           table_(std::make_unique<FixedChunkPQTable<T>>()) {
         if (metadata_.dim != expected_dim) throw std::invalid_argument("PQ dimension mismatch");
+        if (expected_chunks != 0 && metadata_.chunks != expected_chunks)
+            throw std::invalid_argument("PQ chunk count mismatch");
         table_->load_pq_centroid_bin(pivots_path.c_str(), metadata_.chunks, 0, false);
     }
 
