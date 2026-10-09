@@ -20,14 +20,27 @@ Configuration writes individually reviewable unified diffs to
    search/pruning/reciprocal connection. At each layer select the nearest
    eligible pre-refresh neighbor as the entry (ordinary global descent fallback
    if none). This does not run upstream `updatePoint`'s extra two-hop neighbor
-   refresh loop or W10's frozen refinement. Node levels/labels stay fixed.
+    refresh loop or post-build frozen refinement. Node levels/labels stay fixed.
 
 Namespace separation is build plumbing. Default search retains upstream queues,
 stopping rules, pruning and visited pools. Frozen refinement and zero-in-degree
 measurement live in `src/bufann/ivf_patched_graph.cpp`. No native graph,
 multi-pass repair or alternative graph algorithm is included. The training-only
 refresh adapter snapshots all old neighbor lists before any coordinate/edge edit;
-assignment workers must be joined before refresh. W10's default traversal and
-frozen artifacts remain unchanged.
+assignment workers must be joined before refresh. The query router's default
+traversal and frozen artifacts remain unchanged.
 
-See `docs/s08-native-routing.md` for interpretation and reproduction commands.
+Training LV/LV+ uses the same patched traversal over a transient projected
+centroid array. Coordinate refresh/reinsertion always uses the graph's original
+full-coordinate distance space; PCA is refit and its distance kernel reconfigured
+only after assignment workers join. Initial refinement is separate from later
+old-neighbor refreshes. There is no extra refinement/repair loop per iteration.
+
+For build, router flags and artifacts see the
+[IVF harness guide](../../benchmark/IVF/README.md#optimized-centroid-routing).
+For centroid-only diagnostics and fixture commands see
+[qualification tools](../../benchmark/IVF/QUALIFICATION.md#fixed-router-diagnostics).
+`cmake/IVFCentroids.cmake` runs `apply.py` during routing-enabled configuration;
+the fetched archive and generated headers/diffs stay in the build tree, not the
+source checkout. The upstream pin and license are recorded in
+[hnswlib.md](../hnswlib.md).

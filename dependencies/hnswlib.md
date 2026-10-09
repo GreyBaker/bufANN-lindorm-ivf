@@ -17,7 +17,7 @@ An ASan test found a four-byte out-of-bounds neighbor-ID lookahead in
 `hnswalg.h:277-278`, when an upper-layer neighbor array is full; the stock SSE
 path allocates only one spare byte. A shared prefetch-bounds patch now guards
 these lookaheads, including existing-ID reinsertion. Release retains hnswlib's
-SIMD distance kernels. The optimized copy adds W10 patches; see
+SIMD distance kernels. The optimized copy adds traversal/refresh patches; see
 [hnswlib-patches/README.md](hnswlib-patches/README.md). No production performance
 equivalence or speedup is claimed without measurements.
 

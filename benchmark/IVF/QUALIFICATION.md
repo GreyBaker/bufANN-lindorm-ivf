@@ -1,17 +1,11 @@
 # Training comparisons and repeated query sweeps
 
 These Linux/WSL tools collect reproducible evidence on **caller-supplied** inputs.
-They do not declare production acceptance. No production input is currently
-configured on this machine: SIFT1M/SIFT10M profiles resolve to missing placeholder
-roots and WSL has no dataset/PQ overrides. No dataset download, resampling, profile
-edit or production benchmark was performed for this segment.
-
-**Current boundary:** S08 adds fixed-router ablations through
-`ivf_router_diagnostics` and `router_sweep.py`; see
-`docs/s08-native-routing.md`. These are not SPFresh comparisons. Production
-qualification and S07/SPFresh comparison remain deferred. The verification
-counts at the end of this older S03/S04 note are historical; current S08 evidence
-is in `docs/implementation-progress.md`.
+They do not declare production acceptance or launch a paired SPFresh comparison.
+Configure your dataset/PQ/GT paths and installed dependencies as described in
+[README.md](README.md). The tools do not download datasets or infer a production
+profile. Keep reserved final queries out of calibration, tuning and diagnostic
+selection; use a declared tuning set or synthetic fixtures instead.
 
 ## Bounded exact-vs-HNSW training comparison
 
@@ -34,12 +28,15 @@ python3 benchmark/IVF/qualify.py train \
   --evaluation-work-limit 300000 --timeout 1800
 ```
 
-The unchanged deterministic base-only reservoir, random initialization, ordered
-means and empty recovery are shared by both modes. HNSW uses the current rebuilt
-index each pass and `insert_breadth` for training assignments. Each mode runs in
+The deterministic base-only reservoir, selected initialization, ordered means
+and empty recovery are shared by both modes. Default `hnsw` is an alias for
+`ann-rebuild`, which builds a full-coordinate index each pass. Training breadth
+uses `--training-breadth`, falling back to legacy `--insert-breadth` when omitted;
+it is independent of final index routing settings. Each mode runs in
 a **fresh process**, so its lifetime peak RSS is independent of the other mode.
 The output preserves `plan.json`, exact/HNSW logs, each mode's float centroid
-matrix and uint32 sampled-ID matrix (both ordinary two-uint32-header `.bin` files).
+matrix, sampled IDs, assignments and occupancy (ordinary two-uint32-header `.bin`
+files; centroid values are float and the other matrices are uint32).
 Cryptographic sample-ID hashes must match before a comparison summary is written.
 Source and diagnostic-executable identities are checked before/after each mode.
 
@@ -51,17 +48,65 @@ production assignment quality. The HNSW trainer's approximate assigned SSE is
 reported separately, never compared as if it were an exact reference objective.
 Training objective histories, sample occupancy extrema/empties/recovery counts,
 assignment-search/index-build counts and conservative estimated workspace are
-recorded. Graph distance computations are unavailable, not fabricated.
+recorded. Assignment graph-distance computations are available for reused patched
+graphs, but unavailable for the vanilla rebuilt control; known/unknown flags must
+be respected. Construction/reinsertion work is not included in that counter.
+
+### Trainer ablations, including LV/LV+
+
+| Mode | Assignment policy |
+|---|---|
+| `exact` | Scalar double-L2 enumeration over all centroids |
+| `hnsw` / `ann-rebuild` | Rebuilt full-coordinate HNSW, breadth-sized candidate rescoring |
+| `ann-reuse` / `ann-reuse-seeded` | Reused full-coordinate graph, legacy breadth-sized rescoring, optional previous-assignment seed |
+| `ann-reuse-count` / `ann-reuse-seeded-count` | Reused full-coordinate graph returning nearest-one under its float metric; assigned double objective counted separately |
+| `lv` / `lv-plus` | Paper-aligned reused/refined graph with 95%-variance PCA assignment and bounded full-coordinate rerank; LV+ adds only previous-assignment seeding |
+
+For LV/LV+, require `--init random_partition`. Both options share one initial
+bottom refinement/isolated-node reinsertion, full-coordinate old-neighbor refresh,
+and PCA refit/reprojection before every joined assignment phase. The default
+`--training-rerank-factor 3` returns at most three candidates for nearest-one
+assignment, independently of search breadth; `--training-refine-breadth 128`
+controls initial training refinement. These settings are applied only to LV/LV+
+in a multi-mode comparison and are recorded in its plan/native records.
+
+To extend the example above, choose a **new** output path and add:
+
+```bash
+--modes exact,ann-rebuild,ann-reuse,ann-reuse-seeded,ann-reuse-count,ann-reuse-seeded-count,lv,lv-plus \
+--init random_partition --training-breadth 64 \
+--training-rerank-factor 3 --training-refine-breadth 128
+```
+
+This block is additional arguments, not a standalone shell command. At larger
+scale omit `exact` if its declared work budget is infeasible. Bounded exact
+evaluation of ANN centroids still runs, but is **not an exact-trained reference**;
+the summary leaves corresponding ratios null rather than inventing one.
+Compare the candidate-count correction on full search separately from optimized
+search, and keep every setting except seeding identical between LV and LV+.
+Use separate output paths/processes for repeated training measurements.
+
+All graph construction/refresh/refinement and PCA fitting/projection costs are
+included in native training time. Per-pass setup fields are subsets of graph
+time; assignment worker fields sum worker seconds, not wall time. Returned
+candidates, full-rerank distances and objective distances are separate counters.
+Inspect occupancy, exact-evaluated SSE/agreement and unrepaired connectivity
+alongside timings. Fixed-pass termination, hnswlib substitution and unspecified
+moving-PCA/refinement schedules remain disclosed limits to paper reproduction;
+neither the mode name nor a small fixture establishes the paper's speedup.
 
 Exact training requires `sample_count * (iterations + 1) * nlist` distances.
 Oversized exact/reference work is refused before launching either mode. These
 limits count vector distances/searches, **not** individual coordinate operations
 or elapsed CPU time; dimensions still affect cost. A smaller `nlist`/sample is an
 explicit bounded comparison, **not** evidence about the 50K production setting.
-Native memory-estimate guards reserve evaluation scratch conservatively; this
-does not enforce a hard process RSS limit.
+`--routing-work-limit` separately bounds each refinement/PCA setup, including
+coordinate/solver work; declare a larger allowance for larger/high-dimensional
+studies rather than bypassing failures. Native memory-estimate guards reserve
+evaluation scratch conservatively; this does not enforce a hard process RSS limit.
 
-`--max-sse-ratio` optionally gates HNSW/exact evaluation SSE. Freeze a justified
+`--max-sse-ratio` optionally gates every selected mode's evaluation SSE relative
+to the selected `exact` trainer, which must be present. Freeze a justified
 threshold before measuring; none is implied by the design or this example.
 If both objectives are zero, ratio is 1; if only exact is zero, ratio is null
 and any supplied ratio gate fails. No bound is claimed to hold for all datasets.
@@ -69,6 +114,40 @@ and any supplied ratio gate fails. No bound is claimed to hold for all datasets.
 to MiB), including evaluation/export, not a trainer-only interval or allocator cap.
 `training_time_s` is the native trainer interval; `evaluation_time_s` is separate;
 `process_wall_s` includes the entire diagnostic child, excluding Python hashing.
+
+## Fixed-router diagnostics
+
+`ivf_router_diagnostics` measures nearest-centroid recall against bounded exact
+centroid enumeration on an existing router family; it does not build or refit
+centroids/PCA. `router_sweep.py` compares `exact`, `hnswlib`, `patched-full`,
+`refined`, `pca`, and `pca-refined`, with supplied breadth/probe grids and repeats.
+Prepare a bundle with `IVF_OPTIMIZED_MODES=1` to include all required artifacts.
+
+Example from the repository root (ensure each probe count fits the index):
+
+```bash
+python3 benchmark/IVF/router_sweep.py \
+  --diagnostic "$IVF_BUILD_DIR/tests/ivf_router_diagnostics" \
+  --index-prefix /path/to/index/prefix --query-file /path/to/tuning-query.bin \
+  --data-type float --output /new/path/router-ablation --scope tuning \
+  --nprobes 1,10,32 --breadths 32,64,128 --recall-targets 0.90,0.95,0.99 \
+  --query-rows 100 --query-threads 1 --router-rerank-factor 3 \
+  --memory-budget-gb 4 --evaluation-work-limit 100000000 \
+  --repeats 3 --timeout-s 1800
+```
+
+Exact evaluation needs `query_rows * nlist` distances within the allowance.
+Records include centroid recall, query/descriptor identities, projection/graph/
+rerank time, graph-distance availability, projected dimension/variance,
+connectivity and lifetime RSS. Timed worker search includes centroid-match
+scoring; exact GT, load and identity checks are outside it. One mode-query warmup
+and prior validation/evaluation warm caches; no cold-cache claim is made.
+
+The summary averages repeats before choosing the fastest observed breadth per
+mode that reaches each declared **minimum** centroid-recall target. This is not
+identical-recall interpolation, exhaustive tuning or end-to-end ANN recall/QPS.
+Bottom reachability and zero in-degree do not prove strong connectivity.
+Save raw records and failures and report settings that miss a target.
 
 ## Repeated query sweeps on a prepared bundle
 
@@ -123,9 +202,12 @@ recall baseline selection or automatic production acceptance.
 Native timing/read scopes remain unchanged; `process_wall_s` additionally records
 the whole query script including hashes/open/GT/scoring/export, not just queries.
 Orchestrator rehashes and result hashes incur additional untimed I/O. Cache policy
-is uncontrolled. Pairing with SPFresh/baselines and mixed-update tests is pending.
+is uncontrolled. Pairing with SPFresh/baselines requires a separately declared
+comparable protocol; these sweeps do not perform that comparison. Mixed workloads
+use the separate prepare/run pairs described in
+[README.md](README.md#concurrent-mixed-rounds).
 
-## Completion, timeout and fixture verification
+## Completion and timeout
 
 Output plans precede work; `summary.json` is written **last**, only after every
 required child/identity check. Process failures/timeouts leave partial evidence
@@ -135,17 +217,57 @@ gate retain a summary with `gates_passed: false` and exit nonzero. No rollback,
 atomic/fsync publication or resume guarantee is added. All summaries explicitly
 set `production_qualified: false`; external reviewer acceptance is still required.
 
-`ivf_training_diagnostics` CTest covers actual exact/HNSW comparisons for all
+## Functional verification
+
+Dependency-isolated checks do not require the native heap's MKL/libaio/BufANN
+dependencies. From the repository root:
+
+```bash
+cmake -S tests/ivf -B build/ivf-contracts -DCMAKE_BUILD_TYPE=Release \
+  -DIVF_BUILD_ROUTING=ON
+cmake --build build/ivf-contracts -j4
+ctest --test-dir build/ivf-contracts --output-on-failure
+```
+
+Routing-enabled configuration fetches the checksum-pinned hnswlib archive into
+the build tree. Isolated `ivf_build`/`ivf_driver` still validate only; native heap
+build/query/calibration CLI checks require a full Linux build. Enable its test
+targets by adding `-DIVF_BUILD_CONTRACT_TESTS=ON` to the build command in
+[README.md](README.md#build-with-installed-system-dependencies), then build/run
+the focused trainer/calibration/CLI tests:
+
+```bash
+cmake --build "$IVF_BUILD_DIR" --target ivf_ann_training_tests ivf_build ivf_driver \
+  ivf_cost_model ivf_training_diagnostics -j4
+ctest --test-dir "$IVF_BUILD_DIR" --output-on-failure \
+  -R '^(ivf_ann_training|ivf_training_diagnostics|ivf_ann_training_cli|ivf_cost_model_cli|ivf_cli_execution)$'
+```
+
+Ensure the installed MKL/Intel OpenMP libraries are discoverable at runtime; use
+your installation's loader configuration or `LD_LIBRARY_PATH`. Declare
+`OMP_NUM_THREADS`/`MKL_NUM_THREADS` when retaining performance evidence.
+
+`ivf_training_diagnostics` CTest covers actual trainer comparisons for all
 dtypes, identical base-only sampling (including a nonfinite reserved float tail),
-exact SSE/counters/artifacts, CPU pinning, work/memory refusal, collisions,
-timeout and post-run RSS failure. `ivf_query_harness` additionally covers repeated
+exact SSE/counters/artifacts, LV/LV+ candidate/PCA settings, CPU pinning, work/memory
+refusal, collisions, timeout and post-run RSS failure. `ivf_query_harness` additionally covers repeated
 native sweeps, warmup exclusion, canonical extraction, preserved output/results,
 native setting validation, collisions, changed GT, failed trials and RSS gates.
-These are small fixtures, not meaningful QPS/latency/RSS measurements.
+`ivf_ann_training` checks joined-worker determinism, returned-candidate oracles,
+moving PCA dimensions, tiny/degenerate/empty recovery and bounded work failures.
+`ivf_ann_training_cli` checks typed build/reopen and immutable/mutable producer
+identity. `ivf_cost_model_cli` checks base-only calibration, independent GT/radius/
+count oracles, declared sample minima 32/20/1, historical-report compatibility,
+frozen-report/setting provenance and destination/source preservation.
 
-Latest verification including the S05 mutable-list component: full Release **13/13** with optional trained helpers (12
-without); Linux routing-enabled isolated Release/ASan+UBSan **7/7** each;
-routing-disabled isolation **3/3**. Full instrumented diagnostic and expanded
-harness suites each pass **1/1** with leak detection. External system/helper
-binaries are not instrumented; no complete full sanitizer-roster claim is made.
-Production S03/S04 quality/time/RSS/recall/performance/admission remain pending.
+Optional `ivf_trained_helper_integration` requires both existing standalone PQ
+helpers, supplied at configuration through `IVF_PQ_PIVOT_HELPER` and
+`IVF_PQ_CODES_HELPER`. Other full-build component/harness tests require their
+corresponding executables to be built before running CTest. Consult
+`ctest --test-dir "$IVF_BUILD_DIR" -N` for the configured roster.
+
+These are small fixtures, not meaningful QPS/latency/RSS measurements. Retain
+your own configure/build/test logs and compiler/runtime/source identities.
+Scoped sanitizer results do not cover uninstrumented external libraries/helpers
+or imply full-system race qualification. Production quality/performance,
+sampling-sensitivity and prediction-validation studies remain separate gates.

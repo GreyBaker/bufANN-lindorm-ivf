@@ -92,32 +92,28 @@ NTHREADS=16 MERGE_THREADS=8 bash benchmark/BufANN/sift/update.sh
 
 The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
 
-## IVF development (in progress)
+## Single-node IVF backend
 
-The single-node Lindorm IVF backend now supports native build, clean reload and
-query-only execution in full Linux routing-enabled builds. Tested query prepare/run
-scripts and trained-PQ fixture parity are available; production training and
-performance remain unqualified. No DiskANN/Vamana graph conversion is required.
+The Lindorm-inspired IVF backend supports native build/reload, queries,
+sequential inserts/deletes, and concurrent weighted or fixed 8+8 mixed rounds
+in full Linux routing-enabled builds. It uses centroid routing and existing
+global PQ8 codes; no DiskANN/Vamana graph conversion is required.
 
-See [benchmark/IVF/README.md](benchmark/IVF/README.md) for explicit system build,
-full-source PQ, dataset/GT, caching and query commands. Dependency-isolated
-`ivf_build`/`ivf_driver` still provide validation only. Full routing-enabled builds
-also execute sequential inserts/deletes and weighted/fixed 8+8 mixed rounds with
-checkpoint/reopen and quiescent post-round scoring.
-Bounded training comparisons and repeated query sweeps are documented in
-[benchmark/IVF/QUALIFICATION.md](benchmark/IVF/QUALIFICATION.md); fixtures pass,
-but no production dataset is currently configured or qualified.
-[tests/ivf/README.md](tests/ivf/README.md) records review segments and coverage.
-Existing BufANN/SPFresh workloads remain unchanged comparison baselines.
+See [benchmark/IVF/README.md](benchmark/IVF/README.md) for dependencies, input/PQ/GT
+contracts, trainer/router selection, calibration, caching and workload commands.
+The training options include full-coordinate ANN controls and paper-aligned
+LV/LV+ optimized assignment; LV+ adds previous-assignment seeding to LV.
+[benchmark/IVF/QUALIFICATION.md](benchmark/IVF/QUALIFICATION.md) describes bounded
+training comparisons, fixed-router diagnostics, repeated query sweeps and tests.
+Dependency-isolated `ivf_build`/`ivf_driver` validate inputs but do not execute
+native heap workloads.
 
-S05 mutable posting-list/locator components and native heap/query/checkpoint
-sessions pass focused concurrency and sanitizer fixtures; [component scope](docs/MUTABLE_LISTS.md)
-and [native checkpoint API/limits](docs/MUTABLE_INDEX.md). Arbitrary live sets,
-tombstones and aborted heap records survive quiescent checkpoint/reopen onto
-new private files. Insert/delete scripts preserve SPFresh's canonical ranges/GT
-and score after reopening; [CLI/script scope](docs/s05-cli-and-mutation-harness.md).
-S06 mixed scheduling/round scripts are implemented with separately recorded
-concurrent timing/overlap and post-barrier recall; [scope](docs/s06-mixed-workloads.md).
+Mutation checkpoints require a quiescent boundary and reopen on new private
+files. They are not crash-durable transactions: no coordinated WAL, fsync/atomic
+commit or physical slot reclamation is provided. Mixed-query timing is separate
+from post-round recall scoring. Scripts preserve the existing source-row IDs,
+dataset splits and scoring contracts; BufANN/SPFresh remain separate baselines.
 
-Administrator actions for Linux/WSL libaio and MKL/Intel OpenMP dependencies
-have been used for installing dependencies. 
+Functional fixtures are not production qualification or evidence of paper
+speedups. Configure your own inputs and dependencies, declare training/resource
+budgets, and reserve final queries until calibration/tuning are complete.
