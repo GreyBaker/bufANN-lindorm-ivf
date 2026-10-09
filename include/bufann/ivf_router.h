@@ -106,4 +106,8 @@ class CentroidRouter {
 // sample SSE; total graph distance evaluations are unavailable.
 CentroidTraining train_centroids_hnsw(const std::string& path, const BuildConfig& config,
     const RouterOptions& options = {}, const TrainerLimits& limits = {});
+// Select exact/rebuilt/reuse/reuse-seeded training. Training graphs are never
+// persisted or shared with the final frozen query/PCA routers.
+CentroidTraining train_centroids_ann(const std::string& path, const BuildConfig& config,
+    const RouterOptions& options = {}, const TrainerLimits& limits = {});
 } // namespace diskann::ivf

@@ -453,12 +453,63 @@ CentroidTraining train_centroids_hnsw(const std::string& path, const BuildConfig
     workspace += workers * per_worker;
     struct RouterAssignment final : detail::AssignmentIndex {
         explicit RouterAssignment(std::unique_ptr<CentroidRouter> graph) : router(std::move(graph)) {}
-        uint32_t assign(std::span<const float> vector) const override { return router->assign(vector); }
+        uint32_t assign(std::span<const float> vector, uint32_t, uint64_t&) const override { return router->assign(vector); }
         std::unique_ptr<CentroidRouter> router;
     };
     const detail::AssignmentFactory factory = [&](std::span<const float> centroids) {
         return std::make_unique<RouterAssignment>(CentroidRouter::build(config.dim, centroids, options));
     };
     return detail::train_centroids_impl(path, config, limits, &factory, workspace);
+}
+
+CentroidTraining train_centroids_ann(const std::string& path, const BuildConfig& config,
+                                    const RouterOptions& options, const TrainerLimits& limits) {
+    config.validate();
+    if (config.trainer_mode == TrainerMode::Exact) return train_centroids(path, config, limits);
+    auto training_options = options;
+    training_options.native_modes = false; training_options.mode = RouterMode::Hnswlib;
+    training_options.insert_breadth = config.training_breadth;
+    if (config.trainer_mode == TrainerMode::AnnRebuild)
+        return train_centroids_hnsw(path, config, training_options, limits);
+    uint64_t workspace = CentroidRouter::estimate_build_bytes(config.dim, config.nlist, training_options);
+    const uint64_t snapshot = uint64_t(config.nlist) * (uint64_t(options.degree)*16 + 256);
+    const uint64_t workers = std::min(config.training_count(), config.build_threads);
+    const uint64_t per_worker = 2ull*config.nlist + 64ull*std::min(config.nlist, config.training_breadth) + 4096;
+    check(snapshot <= UINT64_MAX-workspace, "Training snapshot estimate overflow"); workspace += snapshot;
+    check(workers <= (UINT64_MAX-workspace)/per_worker, "Training worker estimate overflow"); workspace += workers*per_worker;
+    struct ReusableAssignment final : detail::AssignmentIndex {
+        std::unique_ptr<PatchedCentroidGraph> graph;
+        uint32_t breadth, count, dimension;
+        std::span<const float> coordinates;
+        ReusableAssignment(uint32_t dim, std::span<const float> centroids, const RouterOptions& options, uint32_t ef)
+            : graph(PatchedCentroidGraph::build(dim, centroids,
+                {options.degree, options.construction_breadth, options.seed, options.memory_budget_bytes, options.native_work_limit})),
+              breadth(ef), count(uint32_t(centroids.size()/dim)), dimension(dim), coordinates(centroids) {}
+        uint32_t assign(std::span<const float> vector, uint32_t previous, uint64_t& work) const override {
+            const auto entries = previous < count ? std::span<const uint32_t>(&previous, 1) : std::span<const uint32_t>();
+            uint64_t distances = 0;
+            auto hits = graph->search(vector, std::min(count, breadth), breadth, entries, {}, 0, &distances, true);
+            work += distances;
+            // Same oversampling/double rescoring as the unchanged rebuilt
+            // control. Do not count omitted rescoring as graph-reuse speedup.
+            double best = std::numeric_limits<double>::infinity(); uint32_t label = UINT32_MAX;
+            for (auto hit : hits) {
+                double distance = 0;
+                for (uint32_t d = 0; d < dimension; ++d) {
+                    const double delta = double(vector[d])-coordinates[size_t(hit.id)*dimension+d];
+                    distance += delta*delta;
+                }
+                if (distance < best || (distance == best && hit.id < label)) { best = distance; label = hit.id; }
+            }
+            check(label < count, "Training ANN returned no centroid"); return label;
+        }
+        void refresh(std::span<const float> centroids) override { graph->refresh(centroids); coordinates = centroids; }
+        uint32_t unreachable() const override { return graph->diagnostics().unreachable_after; }
+    };
+    const detail::AssignmentFactory factory = [&](std::span<const float> centroids) {
+        return std::make_unique<ReusableAssignment>(config.dim, centroids, training_options, config.training_breadth);
+    };
+    return detail::train_centroids_impl(path, config, limits, &factory, workspace, true,
+        config.trainer_mode == TrainerMode::AnnReuseSeeded);
 }
 } // namespace diskann::ivf

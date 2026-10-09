@@ -25,7 +25,10 @@ class PatchedCentroidGraph {
     ~PatchedCentroidGraph();
     std::vector<PatchedGraphHit> search(std::span<const float> query, uint32_t count, uint32_t breadth,
         std::span<const uint32_t> entries = {}, std::span<const float> projected = {}, uint32_t projected_dim = 0,
-        uint64_t* computations = nullptr) const;
+        uint64_t* computations = nullptr, bool seeded = false) const;
+    // Training-only, quiescent: snapshot old neighbors, replace EVERY vector,
+    // then one serial ordinary reinsertion per stable ID. No W10 refinement.
+    void refresh(std::span<const float> vectors);
     void refine(uint32_t breadth);
     void configure_projection(uint32_t dim); // Quiescent setup before any readers.
     void save(const std::string& path) const;

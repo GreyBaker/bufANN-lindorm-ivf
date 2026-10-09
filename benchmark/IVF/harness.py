@@ -28,8 +28,15 @@ def bundle_suffixes(prefix, mutable=False):
             "missing/symlink/oversized IVF manifest")
     version = manifest.read_text().split(maxsplit=1)[0]
     family = "IVFMUTABLE" if mutable else "IVFINDEX"
-    require(version in (family + "1", family + "2"), "unsupported IVF bundle version")
-    return (MUTABLE_SUFFIXES if mutable else SUFFIXES) + (NATIVE_SUFFIXES if version.endswith("2") else ())
+    require(version in (family + "1", family + "2") or (not mutable and version == "IVFINDEX3"),
+            "unsupported IVF bundle version")
+    native = version.endswith("2")
+    if version == "IVFINDEX3":
+        fields = [line.split() for line in manifest.read_text().splitlines() if line.startswith("optimized_modes ")]
+        require(len(fields) == 1 and fields[0] in (["optimized_modes", "0"], ["optimized_modes", "1"]),
+                "invalid version-3 optimized-mode flag")
+        native = fields[0][1] == "1"
+    return (MUTABLE_SUFFIXES if mutable else SUFFIXES) + (NATIVE_SUFFIXES if native else ())
 
 
 def query_router_flags():
@@ -118,6 +125,7 @@ def build_settings():
                 "memory_budget_gb": "1", "page_size": "4096", "buffer_frames": "64", "router_degree": "16",
                  "construction_breadth": "200", "query_breadth": "128", "insert_breadth": "64", "router_seed": "100"}
     defaults.update(optimized_modes="0", refine_ef="128", pca_variance="0.95", routing_work_limit="1000000000")
+    defaults.update(trainer_mode="ann-reuse-seeded", init="random_partition", training_breadth="64")
     result = {key: os.environ.get("IVF_" + key.upper(), value) for key, value in defaults.items()}
     # Query-only mode/factor overrides do not alter the build/cache identity.
     result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "hnswlib")

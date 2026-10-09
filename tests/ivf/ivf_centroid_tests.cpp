@@ -127,7 +127,7 @@ template<typename T> void exercise(const std::filesystem::path& path, diskann::i
     // partially written assignments. The internal injection seam is test-only.
     struct BrokenIndex : detail::AssignmentIndex {
         explicit BrokenIndex(bool invalid_id) : invalid(invalid_id) {}
-        uint32_t assign(std::span<const float>) const override {
+        uint32_t assign(std::span<const float>, uint32_t, uint64_t&) const override {
             if (invalid) return UINT32_MAX;
             throw std::runtime_error("injected worker failure");
         }

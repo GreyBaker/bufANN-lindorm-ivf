@@ -71,7 +71,8 @@ CentroidTraining train_centroids(const std::string& path, const BuildConfig& con
 }
 
 CentroidTraining detail::train_centroids_impl(const std::string& path, const BuildConfig& config,
-    const TrainerLimits& limits, const AssignmentFactory* factory, uint64_t index_workspace_bytes) {
+    const TrainerLimits& limits, const AssignmentFactory* factory, uint64_t index_workspace_bytes,
+    bool reuse, bool seeded) {
     static_assert(std::endian::native == std::endian::little && sizeof(float) == 4);
     config.validate();
     check(limits.block_rows > 0 && limits.max_distance_evaluations > 0 && limits.max_assignment_searches > 0,
@@ -101,6 +102,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
     add(result.estimated_bytes, mul(config.nlist, sizeof(uint32_t)));
     add(result.estimated_bytes, mul(config.dim, element_size(config.data_type)));
     add(result.estimated_bytes, mul(config.max_reps, sizeof(double)));
+    add(result.estimated_bytes, mul(uint64_t(config.max_reps) + 1, sizeof(TrainingPass)));
     add(result.estimated_bytes, mul(workers, 8ull * 1024 * 1024 + 4096));
     add(result.estimated_bytes, index_workspace_bytes);
     check(result.estimated_bytes <= std::numeric_limits<size_t>::max() &&
@@ -119,35 +121,72 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
     std::iota(order.begin(), order.end(), 0);
     std::mt19937_64 rng(config.seed ^ 0x9e3779b97f4a7c15ull);
     result.centroids.resize(static_cast<size_t>(centroid_cells));
-    for (uint32_t c = 0; c < config.nlist; ++c) {
-        std::swap(order[c], order[c + bounded(rng, uint64_t(count) - c)]);
-        std::copy_n(samples.data() + size_t(order[c]) * config.dim, config.dim,
-                    result.centroids.data() + size_t(c) * config.dim);
+    if (config.init == CentroidInit::Sample) {
+        for (uint32_t c = 0; c < config.nlist; ++c) {
+            std::swap(order[c], order[c + bounded(rng, uint64_t(count) - c)]);
+            std::copy_n(samples.data() + size_t(order[c]) * config.dim, config.dim,
+                        result.centroids.data() + size_t(c) * config.dim);
+        }
+    } else {
+        // Seeded balanced random partitions: shuffle rows, distribute round-robin.
+        // Every initial partition is nonempty, including nlist == sample count.
+        for (uint32_t r = 0; r < count; ++r)
+            std::swap(order[r], order[r + bounded(rng, uint64_t(count) - r)]);
     }
-    std::vector<uint32_t> assignment(count);
+    std::vector<uint32_t> assignment(count, UINT32_MAX);
     std::vector<double> distances(count);
     std::vector<double> sums(static_cast<size_t>(centroid_cells));
     std::vector<float> next(static_cast<size_t>(centroid_cells));
     result.occupancy.resize(config.nlist);
     result.objective_history.reserve(config.max_reps);
+    result.passes.reserve(size_t(config.max_reps) + 1);
+    if (config.init == CentroidInit::RandomPartition) {
+        for (uint32_t r = 0; r < count; ++r) {
+            const uint32_t c = r % config.nlist;
+            ++result.occupancy[c];
+            for (uint32_t d = 0; d < config.dim; ++d)
+                sums[size_t(c) * config.dim + d] += samples[size_t(order[r]) * config.dim + d];
+        }
+        for (uint32_t c = 0; c < config.nlist; ++c)
+            for (uint32_t d = 0; d < config.dim; ++d)
+                result.centroids[size_t(c) * config.dim + d] = float(sums[size_t(c) * config.dim + d] / result.occupancy[c]);
+    }
+    std::unique_ptr<AssignmentIndex> index;
     auto assign = [&] {
-        auto index = factory ? (*factory)(result.centroids) : nullptr;
+        result.passes.emplace_back(); auto& pass = result.passes.back();
+        auto phase = std::chrono::steady_clock::now();
+        if (factory) {
+            if (reuse && index) {
+                index->refresh(result.centroids);
+                ++result.assignment_index_refreshes;
+                result.reinserted_centroids += config.nlist;
+            } else {
+                // Release the old graph before allocating its replacement.
+                index.reset(); index = (*factory)(result.centroids);
+                ++result.assignment_index_builds;
+            }
+        }
         check(!factory || bool(index), "Assignment factory returned no index");
-        if (index) ++result.assignment_index_builds;
+        pass.graph_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - phase).count();
+        phase = std::chrono::steady_clock::now();
         std::atomic<uint64_t> cursor{0};
+        std::atomic<uint64_t> graph_work{0}, seed_count{0}, fallback_count{0};
         std::exception_ptr error;
         std::mutex error_mutex;
         auto work = [&] {
             try {
+                uint64_t local_work = 0, local_seeded = 0, local_fallback = 0;
                 for (;;) {
                     const uint64_t begin = cursor.fetch_add(limits.block_rows);
-                    if (begin >= count) return;
+                    if (begin >= count) break;
                     const uint64_t end = std::min<uint64_t>(count, begin + limits.block_rows);
                     for (uint64_t r = begin; r < end; ++r) {
                         double best = std::numeric_limits<double>::infinity();
                         uint32_t label = 0;
                         if (index) {
-                            label = index->assign(std::span<const float>(samples).subspan(r * config.dim, config.dim));
+                            const uint32_t previous = seeded ? assignment[r] : UINT32_MAX;
+                            if (seeded) { if (previous < config.nlist) ++local_seeded; else ++local_fallback; }
+                            label = index->assign(std::span<const float>(samples).subspan(r * config.dim, config.dim), previous, local_work);
                             check(label < config.nlist, "Assignment index returned an invalid centroid ID");
                         }
                         const uint32_t first = index ? label : 0;
@@ -165,6 +204,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
                         distances[r] = best;
                     }
                 }
+                graph_work.fetch_add(local_work); seed_count.fetch_add(local_seeded); fallback_count.fetch_add(local_fallback);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 if (!error) error = std::current_exception();
@@ -177,9 +217,13 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
             work(); // Destruction joins before error/result inspection.
         }
         if (error) std::rethrow_exception(error);
+        pass.assignment_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - phase).count();
+        result.graph_distance_evaluations += graph_work.load();
+        result.seeded_searches += seed_count.load(); result.seed_fallbacks += fallback_count.load();
     };
     for (uint32_t iteration = 0; iteration < config.max_reps; ++iteration) {
         assign();
+        const auto mean_start = std::chrono::steady_clock::now();
         std::fill(sums.begin(), sums.end(), 0);
         std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
         double objective = 0;
@@ -191,6 +235,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
                 sums[size_t(c) * config.dim + d] += samples[size_t(r) * config.dim + d];
         }
         result.objective_history.push_back(objective);
+        result.passes.back().assigned_sse = objective;
         const bool empty = std::find(result.occupancy.begin(), result.occupancy.end(), 0) !=
                            result.occupancy.end();
         if (empty) {
@@ -213,6 +258,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
             }
         }
         result.centroids.swap(next);
+        result.passes.back().mean_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - mean_start).count();
     }
     assign(); // Occupancy and objective must describe the returned centroids.
     std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
@@ -220,6 +266,11 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
         ++result.occupancy[assignment[r]];
         result.final_objective += distances[r];
     }
+    result.passes.back().assigned_sse = result.final_objective;
+    result.empty_sample_clusters = uint32_t(std::count(result.occupancy.begin(), result.occupancy.end(), 0));
+    result.largest_sample_cluster = *std::max_element(result.occupancy.begin(), result.occupancy.end());
+    if (index) result.final_unreachable = index->unreachable();
+    result.assignments = std::move(assignment);
     result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     return result;
 }

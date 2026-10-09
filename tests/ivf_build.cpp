@@ -16,7 +16,7 @@ int main(int argc, char** argv) {
             "--id_capacity", "--page_size", "--buffer_frames", "--router_degree",
             "--construction_breadth", "--query_breadth", "--insert_breadth", "--router_seed", "--result_file",
             "--optimized_modes", "--router_mode", "--refine_ef", "--pca_variance",
-            "--router_rerank_factor", "--routing_work_limit"});
+            "--router_rerank_factor", "--routing_work_limit", "--trainer_mode", "--init", "--training_breadth"});
         if (args.help) {
             std::cout << "IVF build (--validate_inputs 1: validation only; 0: native execution in full routing-enabled builds).\n"
                 "Usage: ivf_build --validate_inputs 0|1 --data_type float|int8|uint8\n"
@@ -31,6 +31,10 @@ int main(int argc, char** argv) {
                 "  --router_mode is the frozen base/insert assignment default, not a query-only ablation.\n"
                 "  [--refine_ef N] [--pca_variance F]\n"
                 "  [--router_rerank_factor F] [--routing_work_limit N] (PCA/refinement work allowance)\n";
+            std::cout << "Training: [--trainer_mode exact|ann-rebuild|ann-reuse|ann-reuse-seeded]\n"
+                "  [--init sample|random_partition] [--training_breadth N]\n"
+                "  Defaults: ann-reuse-seeded, random_partition, breadth 64.\n"
+                "  Training breadth is independent of frozen query/insert router breadth.\n";
             return 0;
         }
         const bool validation = args.validation_mode();
@@ -51,6 +55,9 @@ int main(int argc, char** argv) {
         config.build_threads = args.u32("--build_threads", 1);
         config.seed = args.integer("--seed");
         config.memory_budget_gb = args.real("--memory_budget_gb", 1.0);
+        config.trainer_mode = parse_trainer_mode(args.get("--trainer_mode", "ann-reuse-seeded"));
+        config.init = parse_centroid_init(args.get("--init", "random_partition"));
+        config.training_breadth = args.u32("--training_breadth", 64);
         config.validate();
         const auto vectors = inspect_vectors(args.require("--data_file"), config.data_type, config.dim);
         if (config.base_count > vectors.rows) throw std::invalid_argument("base_count exceeds vector file rows");

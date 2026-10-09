@@ -2,6 +2,7 @@
 #include <ivf_patched/hnswlib.h>
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <stdexcept>
 
 namespace diskann::ivf {
@@ -57,7 +58,7 @@ void PatchedCentroidGraph::measure() {
     stats_.unreachable_after = count_ - uint32_t(queue.size());
 }
 std::vector<PatchedGraphHit> PatchedCentroidGraph::search(std::span<const float> query, uint32_t count, uint32_t breadth,
-    std::span<const uint32_t> entries, std::span<const float> projected, uint32_t projected_dim, uint64_t* computations) const {
+    std::span<const uint32_t> entries, std::span<const float> projected, uint32_t projected_dim, uint64_t* computations, bool seeded) const {
     check(count && count <= count_ && breadth && breadth <= INT32_MAX && entries.size() <= count_, "Invalid patched graph search");
     check(projected.empty() ? query.size() == dim_ : projected_dim && query.size() == projected_dim && projected.size() == uint64_t(count_)*projected_dim,
         "Invalid projected traversal shape");
@@ -71,13 +72,39 @@ std::vector<PatchedGraphHit> PatchedCentroidGraph::search(std::span<const float>
     }
     // k supplies per-call ef without mutating the shared graph's ef_.
     auto hits = impl_->graph->searchKnnIVF(query.data(), std::min(count_, std::max(count, breadth)), nullptr, &traversal,
-        std::vector<uint32_t>(entries.begin(), entries.end()));
+        std::vector<uint32_t>(entries.begin(), entries.end()), seeded);
     if (computations) *computations = work;
     std::vector<PatchedGraphHit> result;
     while (!hits.empty()) { result.push_back({uint32_t(hits.top().second), hits.top().first}); hits.pop(); }
     std::sort(result.begin(), result.end(), [](auto a, auto b) { return a.distance < b.distance || (a.distance == b.distance && a.id < b.id); });
     if (result.size() > count) result.resize(count);
     return result;
+}
+void PatchedCentroidGraph::refresh(std::span<const float> vectors) {
+    check(!impl_->projection && vectors.size() == uint64_t(count_)*dim_, "Invalid training coordinate refresh");
+    for (float value : vectors) check(std::isfinite(value), "Nonfinite training centroid");
+    auto& g = *impl_->graph;
+    // This allowance is separately included in the trainer's preflight estimate.
+    const uint64_t allowance = uint64_t(count_) * (uint64_t(options_.degree)*16 + 256);
+    uint64_t bytes = uint64_t(count_)*sizeof(std::vector<uint32_t>);
+    std::vector<std::vector<uint32_t>> old(count_);
+    for (uint32_t id = 0; id < count_; ++id) {
+        auto& entries = old[id];
+        size_t size = 0;
+        for (int level = 0; level <= g.element_levels_[id]; ++level)
+            size += g.getListCount(g.get_linklist_at_level(id, level));
+        check(bytes <= allowance && size*sizeof(uint32_t) <= allowance-bytes, "Training neighbor snapshot exceeds allowance");
+        bytes += size*sizeof(uint32_t); entries.reserve(size);
+        for (int level = 0; level <= g.element_levels_[id]; ++level) {
+            auto* links = g.get_linklist_at_level(id, level);
+            auto* ids = reinterpret_cast<uint32_t*>(links + 1);
+            entries.insert(entries.end(), ids, ids + g.getListCount(links));
+        }
+    }
+    // No traversal sees a mixture of old/new centroid coordinates.
+    for (uint32_t id = 0; id < count_; ++id) g.replaceVectorIVF(id, vectors.data() + size_t(id)*dim_);
+    for (uint32_t id = 0; id < count_; ++id) g.reinsertFromIVF(id, old[id]);
+    measure();
 }
 void PatchedCentroidGraph::refine(uint32_t breadth) {
     check(breadth > 0 && breadth <= INT32_MAX, "Invalid refinement breadth");

@@ -1,4 +1,4 @@
-# Native IVF query and mutation harness (S04–S08)
+# Native IVF query and mutation harness (S04–S09)
 
 Linux/WSL query-only scripts are implemented and tested with synthetic and
 standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
@@ -209,3 +209,36 @@ No production-performance result follows from fixtures.
 Bounded exact/HNSW training comparisons and repeated query-sweep tooling now pass
 fixtures, including declared budgets, preservation and failure gates:
 [QUALIFICATION.md](QUALIFICATION.md). These collect evidence, not acceptance.
+## S09 training selection
+
+New native CLI and prepare/harness builds default to
+`ann-reuse-seeded`, `random_partition`, training breadth 64. Set
+`IVF_TRAINER_MODE=exact|ann-rebuild|ann-reuse|ann-reuse-seeded`,
+`IVF_INIT=sample|random_partition`, `IVF_TRAINING_BREADTH=N`, or the matching
+`ivf_build --trainer_mode --init --training_breadth` flags. These settings enter
+build/cache identity; query router overrides do not change them. Programmatic
+`BuildConfig` retains legacy `ann-rebuild`/`sample` defaults for existing callers.
+Training breadth is independent of frozen base/insert routing breadth. Exact
+training remains scalar and work-bounded; no GEMM or predictive cost model is
+required. ANN training operates on full coordinates; PCA/refinement is fitted
+only once for the final frozen query router.
+
+`IVFINDEX3` persists trainer mode, initialization and training breadth, with an
+explicit optimized-mode flag. Existing v1/v2 bundles reopen with their actual
+legacy rebuilt/sample/insert-breadth identity; mutable checkpoints preserve their
+origin version/settings. New builds expose per-pass graph/assignment/mean timing,
+assigned SSE, occupancy summaries, refresh and seeding counts. Graph-distance
+counts cover assignment traversal only, not graph construction/reinsertion, and
+are unavailable for the vanilla rebuilt control. Assigned SSE is not exact
+nearest-centroid SSE for approximate training.
+
+For bounded ablations, `qualify.py train` accepts
+`--modes exact,ann-rebuild,ann-reuse,ann-reuse-seeded --init random_partition
+--training-breadth 64`. All modes use the same sample/init/seed/pass cap. At large
+scale omit `exact` to avoid a full exact training run; bounded exact evaluation
+still runs on the declared evaluation rows. The summary explicitly reports an
+absent exact-trained reference, rather than inventing an SSE ratio. Diagnostic
+artifacts include `.sample_ids.bin`, `.centroids.bin`, `.assignments.bin` (one
+centroid per sample slot) and `.occupancy.bin`, and exact evaluation reports
+tie-aware nearest-centroid assignment agreement on the sampled evaluation rows.
+This is a training-sample check, not holdout or final-query scoring.

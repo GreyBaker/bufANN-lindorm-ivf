@@ -109,9 +109,14 @@ def train(args):
     require(0 < args.base_count <= args.full_count <= 0x7FFFFFFF, "invalid source/base row count")
     require(0 < args.sample_rate <= 1 and args.nlist <= math.ceil(args.base_count * args.sample_rate), "invalid training sample/nlist")
     count = math.ceil(args.base_count * args.sample_rate)
+    modes = args.modes.split(",")
+    require(modes and len(modes) == len(set(modes)) and set(modes) <=
+            {"exact", "hnsw", "ann-rebuild", "ann-reuse", "ann-reuse-seeded"}, "invalid trainer modes")
+    require(args.max_sse_ratio is None or "exact" in modes, "SSE ratio gate requires an exact-trained reference")
     searches = count * (args.iterations + 1)
     require(searches <= args.assignment_work_limit, "training exceeds declared assignment search limit")
-    require(searches * args.nlist <= args.exact_work_limit, "exact training exceeds declared work limit; choose a smaller comparison")
+    if "exact" in modes:
+        require(searches * args.nlist <= args.exact_work_limit, "exact training exceeds declared work limit; choose a smaller comparison")
     require(min(count, args.evaluation_rows) * args.nlist <= args.evaluation_work_limit, "evaluation exceeds declared work limit")
     require(args.max_sse_ratio is None or args.max_sse_ratio >= 1, "SSE ratio gate must be >= 1")
     require(0 <= args.seed <= 0xFFFFFFFFFFFFFFFF and 0 <= args.router_seed <= 0xFFFFFFFF, "invalid training/router seed")
@@ -121,18 +126,19 @@ def train(args):
         "exact_work_limit": args.exact_work_limit, "assignment_work_limit": args.assignment_work_limit,
         "evaluation_work_limit": args.evaluation_work_limit, "evaluation_rows": args.evaluation_rows,
         "router_degree": args.router_degree, "construction_breadth": args.construction_breadth,
-        "insert_breadth": args.insert_breadth, "router_seed": args.router_seed}
+        "insert_breadth": args.insert_breadth, "router_seed": args.router_seed, "init": args.init,
+        "training_breadth": args.training_breadth if args.training_breadth is not None else args.insert_breadth}
     plan = {"version": 1, "kind": "ivf_training_comparison", "settings": settings,
         "source_identity": digest(data), "trainer_identity": digest(trainer), "orchestrator_identity": digest(__file__),
         "affinity": affinity(args.cpus), "runtime_environment": runtime_environment(), "timeout_s_per_mode": args.timeout,
         "process_wall_scope": "entire_diagnostic_child_including_evaluation_export_excludes_python_hashes",
         "gates": {"max_sse_ratio": args.max_sse_ratio, "max_peak_rss_mb": args.max_peak_rss_mb},
-        "scope": "same_base_only_training_sample_not_holdout_or_production_acceptance"}
+        "scope": "same_base_only_training_sample_not_holdout_or_production_acceptance", "modes": modes}
     output.mkdir(parents=True)  # existing destinations, including partial runs, refused
     write_json(output / "plan.json", plan)
     records = {}
     artifacts = {}
-    for mode in ("exact", "hnsw"):
+    for mode in modes:
         prefix = output / mode
         command = [str(trainer)] + flags(settings) + ["--mode", mode, "--output_prefix", str(prefix)]
         wall = execute(command, output / f"{mode}.log", args.timeout, args.cpus)
@@ -142,20 +148,27 @@ def train(args):
         aggregate([record], ("exact_evaluation_sse", "training_time_s", "peak_process_rss_mb"))
         record["process_wall_s"] = wall
         records[mode] = record
-        artifacts[mode] = {suffix: digest(Path(str(prefix) + suffix)) for suffix in (".sample_ids.bin", ".centroids.bin")}
+        artifacts[mode] = {suffix: digest(Path(str(prefix) + suffix)) for suffix in
+                          (".sample_ids.bin", ".centroids.bin", ".assignments.bin", ".occupancy.bin")}
         require(digest(data) == plan["source_identity"] and digest(trainer) == plan["trainer_identity"],
                 "source/trainer changed during comparison")
-    require(artifacts["exact"][".sample_ids.bin"] == artifacts["hnsw"][".sample_ids.bin"], "training sample IDs differ")
-    require(records["exact"]["evaluation_rows"] == records["hnsw"]["evaluation_rows"], "evaluation samples differ")
-    exact, approximate = (records[mode]["exact_evaluation_sse"] for mode in ("exact", "hnsw"))
-    require(exact >= 0 and approximate >= 0, "negative SSE")
-    ratio = approximate / exact if exact else (1.0 if approximate == 0 else None)
-    passed = (args.max_sse_ratio is None or (ratio is not None and ratio <= args.max_sse_ratio)) and (
+    require(len({artifacts[mode][".sample_ids.bin"]["sha256"] for mode in modes}) == 1, "training sample IDs differ")
+    require(len({records[mode]["evaluation_rows"] for mode in modes}) == 1, "evaluation samples differ")
+    exact = records["exact"]["exact_evaluation_sse"] if "exact" in records else None
+    ratios = {}
+    for mode in modes:
+        value = records[mode]["exact_evaluation_sse"]
+        require(value >= 0, "negative SSE")
+        ratios[mode] = None if exact is None else (value/exact if exact else (1.0 if value == 0 else None))
+    ratio = ratios.get("hnsw")
+    passed = (args.max_sse_ratio is None or all(value is not None and value <= args.max_sse_ratio for value in ratios.values())) and (
         args.max_peak_rss_mb is None or max(r["peak_process_rss_mb"] for r in records.values()) <= args.max_peak_rss_mb)
     write_json(output / "summary.json", {"kind": plan["kind"], "completed": True, "gates_passed": passed,
         "plan_identity": digest(output / "plan.json"), "records": records, "artifacts": artifacts,
-        "hnsw_over_exact_evaluation_sse_ratio": ratio, "evaluation_sse_delta": approximate - exact,
-        "zero_reference_policy": "ratio_1_for_both_zero_null_for_nonzero_hnsw", "production_qualified": False})
+        "hnsw_over_exact_evaluation_sse_ratio": ratio,
+        "evaluation_sse_delta": records["hnsw"]["exact_evaluation_sse"]-exact if exact is not None and "hnsw" in records else None,
+        "exact_trained_reference_available": exact is not None, "evaluation_sse_over_exact_by_mode": ratios,
+        "zero_reference_policy": "ratio_1_for_both_zero_null_for_nonzero_approximate_or_absent_reference", "production_qualified": False})
     require(passed, f"declared training gates failed; inspect {output / 'summary.json'}")
     print(f"Training comparison complete: {output / 'summary.json'}")
 
@@ -274,6 +287,9 @@ def main():
             p.add_argument("--router-degree", type=positive, default=16)
             p.add_argument("--construction-breadth", type=positive, default=200)
             p.add_argument("--insert-breadth", type=positive, default=64)
+            p.add_argument("--training-breadth", type=positive, help="independent training assignment breadth (defaults to legacy insert-breadth)")
+            p.add_argument("--init", choices=("sample", "random_partition"), default="sample")
+            p.add_argument("--modes", default="exact,hnsw", help="comma-separated exact,hnsw,ann-rebuild,ann-reuse,ann-reuse-seeded; omit exact for large-scale ANN-only runs")
             p.add_argument("--max-sse-ratio", type=finite, help="optional HNSW/exact exact-evaluation SSE gate")
         else:
             p.add_argument("--work-dir", type=Path, required=True)

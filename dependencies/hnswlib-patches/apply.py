@@ -118,6 +118,66 @@ for family in ("ivf_vanilla", "ivf_patched"):
     }
     void updatePoint(const void *dataPoint""")
         record("04-quiescent-edits.patch", original, text)
+        original = text
+        # 05: S09 training only. True seeded searches bypass global upper descent;
+        # default W10 queries retain patch 03's behavior. Reuse replaces all
+        # coordinates first, then uses the nearest eligible old neighbor as each
+        # layer's entry into ordinary update connection/pruning.
+        text = once(text, "const IVFTraversal* traversal = nullptr, const std::vector<tableint>& entries = {}) const {",
+                    "const IVFTraversal* traversal = nullptr, const std::vector<tableint>& entries = {}, bool seeded = false) const {")
+        begin = text.index("    searchKnnIVF(")
+        end = text.index("    searchStopConditionClosest(", begin)
+        region = text[begin:end]
+        region = once(region, "        tableint currObj = enterpoint_node_;", """        tableint currObj = enterpoint_node_;
+        if (seeded && !entries.empty()) {
+            if (entries.front() >= cur_element_count) throw std::runtime_error("Invalid IVF seed");
+            currObj = entries.front();
+        }""")
+        region = region.replace("ivfDistance(query_data, enterpoint_node_, traversal)", "ivfDistance(query_data, currObj, traversal)")
+        region = once(region, "for (int level = maxlevel_; level > 0; level--)",
+                      "for (int level = (seeded && !entries.empty()) ? 0 : maxlevel_; level > 0; level--)")
+        text = text[:begin] + region + text[end:]
+        text = once(text, "        int maxLevel) {", "        int maxLevel, const std::vector<tableint>* oldEntries = nullptr) {")
+        text = once(text, """        tableint currObj = entryPointInternalId;
+        if (dataPointLevel < maxLevel) {""", """        tableint currObj = entryPointInternalId;
+        bool suppliedEntry = false;
+        if (oldEntries) {
+            dist_t best = std::numeric_limits<dist_t>::max();
+            for (tableint entry : *oldEntries) {
+                if (entry >= cur_element_count || entry == dataPointInternalId)
+                    throw std::runtime_error("Invalid IVF reinsertion entry");
+                if (element_levels_[entry] < dataPointLevel) continue;
+                dist_t distance = fstdistfunc_(dataPoint, getDataByInternalId(entry), dist_func_param_);
+                if (!suppliedEntry || distance < best) { best = distance; currObj = entry; suppliedEntry = true; }
+            }
+        }
+        if (dataPointLevel < maxLevel && !suppliedEntry) {""")
+        anchor = """        for (int level = dataPointLevel; level >= 0; level--) {
+            std::priority_queue"""
+        text = once(text, anchor, """        for (int level = dataPointLevel; level >= 0; level--) {
+            if (oldEntries) {
+                dist_t best = std::numeric_limits<dist_t>::max();
+                for (tableint entry : *oldEntries) {
+                    if (entry >= cur_element_count || entry == dataPointInternalId)
+                        throw std::runtime_error("Invalid IVF reinsertion entry");
+                    if (element_levels_[entry] < level) continue;
+                    dist_t distance = fstdistfunc_(dataPoint, getDataByInternalId(entry), dist_func_param_);
+                    if (distance < best) { best = distance; currObj = entry; }
+                }
+            }
+            std::priority_queue""")
+        text = once(text, "    void updatePoint(const void *dataPoint", """    void replaceVectorIVF(tableint id, const void* vector) {
+        if (id >= cur_element_count) throw std::runtime_error("Invalid IVF vector replacement");
+        memcpy(getDataByInternalId(id), vector, data_size_);
+    }
+    void reinsertFromIVF(tableint id, const std::vector<tableint>& oldEntries) {
+        if (id >= cur_element_count) throw std::runtime_error("Invalid IVF training reinsertion");
+        if (cur_element_count == 1) return;
+        repairConnectionsForUpdate(getDataByInternalId(id), enterpoint_node_, id,
+            element_levels_[id], maxlevel_, &oldEntries);
+    }
+    void updatePoint(const void *dataPoint""")
+        record("05-ann-training-reuse.patch", original, text)
     path.write_text(text)
     if family == "ivf_patched":
         for header in directory.glob("*.h"):

@@ -1,6 +1,7 @@
 #include "ivf_cli_execution.h"
 #include "bufann/ivf_index.h"
 #include "ivf_mixed_workload.h"
+#include "ivf_training_json.h"
 #include <omp.h>
 #include <mkl_service.h>
 
@@ -93,9 +94,10 @@ void build_typed(const Arguments& args, const BuildConfig& config, const BinMeta
     routing.pca_variance = args.real("--pca_variance", .95); routing.router_rerank_factor = args.real("--router_rerank_factor", 3);
     routing.native_work_limit = args.integer("--routing_work_limit", 1000000000);
     const auto start = Clock::now();
+    TrainingStats training_stats;
     NativeIndex<T>::build(args.require("--index_prefix"), args.require("--data_file"),
         args.require("--pq_prefix") + "_pq_pivots.bin", args.require("--pq_prefix") + "_pq_compressed.bin",
-        config, heap, routing);
+        config, heap, routing, 0, &training_stats);
     auto router = CentroidRouter::load(args.require("--index_prefix"), budget);
     const auto elapsed = seconds(start);
     const auto peak_rss = peak_process_rss_mb();
@@ -123,7 +125,9 @@ void build_typed(const Arguments& args, const BuildConfig& config, const BinMeta
         emit("patched_zero_indegree", router->zero_indegree(false)); emit("refined_zero_indegree", router->zero_indegree(true));
     }
     emit("build_time_s", elapsed); emit("peak_process_rss_mb", peak_rss);
-    emit("memory_budget_bytes", budget); emit("training_assignment", "hnsw_rebuilt_each_pass");
+    emit("memory_budget_bytes", budget); emit("training_assignment", trainer_mode_name(config.trainer_mode));
+    emit("training_sample_count", config.training_count());
+    training_settings(record, first, config); training_metrics(record, first, training_stats);
     emit("pq_policy", "global_nonresidual_pq8_external_unverified");
     emit("publication", "manifest_last_nonatomic_no_fsync");
     record << "}"; publish_record(args, record.str());
@@ -328,7 +332,7 @@ template<typename T> void emit_update(std::ostream& record, bool& first, const A
     emit("publication", "manifest_last_nonatomic_no_fsync");
     const auto& m = index.origin_manifest();
     emit("base_count", m.training.base_count); emit("source_rows", m.source_rows);
-    emit("assignment_router_mode", router_mode_name(m.routing.mode)); emit("trainer_mode", "hnsw-rebuilt-control");
+    emit("assignment_router_mode", router_mode_name(m.routing.mode)); training_settings(record, first, m.training);
     emit("router_degree", m.routing.degree); emit("construction_breadth", m.routing.construction_breadth);
     emit("query_breadth", m.routing.query_breadth); emit("insert_breadth", m.routing.insert_breadth); emit("router_seed", m.routing.seed);
     emit("input_index_format", args.get("--index_format", "immutable"));
@@ -535,7 +539,11 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     emit("pq_chunks", manifest.chunks);
     emit("nprobe", config.nprobe); emit("recall_at", config.recall_at); emit("rerank_factor", config.rerank_factor);
     emit("router_mode", router_mode_name(routing.mode)); emit("router_rerank_factor", routing.rerank_factor); emit("router_breadth", routing.breadth);
-    if (!updating) { emit("assignment_router_mode", router_mode_name(manifest.routing.mode)); emit("trainer_mode", "hnsw-rebuilt-control"); }
+    // Combined update/query records get these fields from mutation metadata.
+    if (!updating) {
+        emit("assignment_router_mode", router_mode_name(manifest.routing.mode));
+        training_settings(record, first, manifest.training);
+    }
     emit("optimized_modes_built", manifest.routing.native_modes); emit("pca_retained_dim", index->router().projected_dim());
     emit("pca_variance_target", manifest.routing.pca_variance); emit("pca_retained_variance", index->router().retained_variance());
     emit("pca_degenerate", index->router().pca_degenerate()); emit("refine_ef", manifest.routing.refine_breadth);

@@ -6,6 +6,35 @@
 
 namespace diskann::ivf {
 
+TrainerMode parse_trainer_mode(const std::string& name) {
+    if (name == "exact") return TrainerMode::Exact;
+    if (name == "ann-rebuild") return TrainerMode::AnnRebuild;
+    if (name == "ann-reuse") return TrainerMode::AnnReuse;
+    if (name == "ann-reuse-seeded") return TrainerMode::AnnReuseSeeded;
+    throw std::invalid_argument("trainer_mode must be exact, ann-rebuild, ann-reuse, or ann-reuse-seeded");
+}
+const char* trainer_mode_name(TrainerMode mode) {
+    switch (mode) {
+        case TrainerMode::Exact: return "exact";
+        case TrainerMode::AnnRebuild: return "ann-rebuild";
+        case TrainerMode::AnnReuse: return "ann-reuse";
+        case TrainerMode::AnnReuseSeeded: return "ann-reuse-seeded";
+    }
+    throw std::invalid_argument("Invalid centroid trainer mode");
+}
+CentroidInit parse_centroid_init(const std::string& name) {
+    if (name == "sample") return CentroidInit::Sample;
+    if (name == "random_partition") return CentroidInit::RandomPartition;
+    throw std::invalid_argument("init must be sample or random_partition");
+}
+const char* centroid_init_name(CentroidInit init) {
+    switch (init) {
+        case CentroidInit::Sample: return "sample";
+        case CentroidInit::RandomPartition: return "random_partition";
+    }
+    throw std::invalid_argument("Invalid centroid initialization");
+}
+
 DataType parse_data_type(const std::string& name) {
     if (name == "float") return DataType::Float;
     if (name == "int8") return DataType::Int8;
@@ -40,6 +69,9 @@ uint32_t BuildConfig::training_count() const {
 
 void BuildConfig::validate() const {
     element_size(data_type);
+    trainer_mode_name(trainer_mode); centroid_init_name(init);
+    if (!training_breadth || training_breadth > INT32_MAX)
+        throw std::invalid_argument("training_breadth must be in [1, INT32_MAX]");
     if (dim == 0 || base_count == 0 || nlist == 0) {
         throw std::invalid_argument("dim, base_count, and nlist must be positive");
     }

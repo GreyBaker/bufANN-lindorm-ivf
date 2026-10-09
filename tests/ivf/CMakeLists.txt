@@ -61,6 +61,15 @@ if(IVF_BUILD_CONTRACT_TESTS)
     add_test(NAME ivf_centroid_training COMMAND ivf_centroid_tests
         "${CMAKE_CURRENT_BINARY_DIR}/centroid_fixtures")
     if(TARGET ivf_router)
+        add_executable(ivf_ann_training_tests ivf_ann_training_tests.cpp)
+        target_link_libraries(ivf_ann_training_tests PRIVATE ivf_router Threads::Threads)
+        get_target_property(IVF_PATCHED_INCLUDE ivf_router INCLUDE_DIRECTORIES)
+        target_include_directories(ivf_ann_training_tests SYSTEM PRIVATE ${IVF_PATCHED_INCLUDE})
+        if(NOT MSVC)
+            target_compile_options(ivf_ann_training_tests PRIVATE -fno-fast-math)
+        endif()
+        add_test(NAME ivf_ann_training COMMAND ivf_ann_training_tests "${CMAKE_CURRENT_BINARY_DIR}/ann_training_fixtures")
+        set_tests_properties(ivf_ann_training PROPERTIES TIMEOUT 180)
         add_executable(ivf_patched_router_tests ivf_patched_router_tests.cpp)
         target_link_libraries(ivf_patched_router_tests PRIVATE ivf_router Threads::Threads)
         if(NOT MSVC)
@@ -150,6 +159,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
         target_compile_options(ivf_pq_helper_parity PRIVATE -fno-fast-math)
     endif()
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_ann_training_cli COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_s09_cli.py"
+            --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+            --scratch "${CMAKE_CURRENT_BINARY_DIR}/s09_cli_fixtures")
+        set_tests_properties(ivf_ann_training_cli PROPERTIES TIMEOUT 180)
         add_test(NAME ivf_patched_cli_smoke COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_s08_cli.py"
             --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>

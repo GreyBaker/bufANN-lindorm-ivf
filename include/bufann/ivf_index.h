@@ -13,6 +13,7 @@ inline constexpr std::array<const char*, 10> mutable_component_suffixes{
 inline constexpr std::array<const char*, 3> native_router_suffixes{".patched.hnsw", ".refined.hnsw", ".pca"};
 
 struct IndexManifest {
+    uint32_t format_version = 3; // Preserve legacy producer framing in mutable origin checkpoints.
     std::string router_backend = "hnswlib-0.8.0-prefetch1";
     BuildConfig training;
     RouterOptions routing;
@@ -24,8 +25,8 @@ struct IndexManifest {
     // training provenance/code-to-vector parity is NOT independently verified.
     std::array<ArtifactDigest, 3> sources{}; // vectors, pivots, codes
     std::array<ArtifactDigest, 8> components{};
-    std::array<ArtifactDigest, 3> native_components{}; // Version 2 only; legacy framing unchanged.
-    uint32_t pca_retained_dim = 0; // Version 2; actual fitted projection, digest-bound below.
+    std::array<ArtifactDigest, 3> native_components{}; // Optimized-mode bundles, version 2/3.
+    uint32_t pca_retained_dim = 0; // Actual fitted projection, digest-bound below.
 };
 struct IndexOpenOptions {
     uint32_t buffer_frames = 64;
@@ -42,7 +43,8 @@ class NativeIndex {
     static void build(const std::string& prefix, const std::string& vectors,
                       const std::string& pivots, const std::string& codes,
                       const BuildConfig& training, const HeapOptions& heap,
-                      const RouterOptions& routing = {}, uint32_t first_id = 0);
+                      const RouterOptions& routing = {}, uint32_t first_id = 0,
+                      TrainingStats* training_stats = nullptr);
     static std::unique_ptr<NativeIndex> open(const std::string& prefix,
                                             const IndexOpenOptions& options = {});
     const IndexManifest& manifest() const { return _manifest; }

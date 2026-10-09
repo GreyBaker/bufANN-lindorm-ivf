@@ -60,6 +60,31 @@ def main():
             assert abs(exact["exact_evaluation_sse"] - exact["final_assignment_sample_sse"]) < 1e-9
             assert len(exact["objective_history"]) == 2
             assert exact["estimated_training_and_eval_bytes"] <= exact["memory_budget_bytes"]
+            ablation = command.copy()
+            ablation[ablation.index("--output") + 1] = root/(dtype+" reuse ablation")
+            # No arbitrary quality threshold: these are measured ablations.
+            del ablation[ablation.index("--max-sse-ratio"):ablation.index("--max-sse-ratio")+2]
+            ablation += ["--modes", "exact,ann-rebuild,ann-reuse,ann-reuse-seeded", "--init", "random_partition", "--training-breadth", 12]
+            run(ablation)
+            measured = json.loads((Path(ablation[ablation.index("--output")+1])/"summary.json").read_text())
+            assert measured["exact_trained_reference_available"] and measured["gates_passed"]
+            for mode, record in measured["records"].items():
+                assert record["trainer_mode"] == mode and record["trainer_init"] == "random_partition"
+                assert len(record["training_passes"]) == 3 and record["training_passes"][-1]["final_assignment"]
+                assert record["training_passes"][-1]["mean_time_s"] == 0
+                assert 0 <= record["evaluation_assignment_agreement"] <= 1
+                if mode.startswith("ann-reuse"):
+                    assert record["training_graph_builds"] == 1 and record["training_graph_refreshes"] == 2
+                    assert record["training_reinserted_centroids"] == 6
+                if mode == "ann-reuse-seeded":
+                    assert record["training_seeded_searches"] == 24 and record["training_seed_fallbacks"] == 12
+            ann_only = ablation.copy()
+            ann_only[ann_only.index("--output")+1] = root/(dtype+" ann only")
+            ann_only[ann_only.index("--modes")+1] = "ann-rebuild,ann-reuse,ann-reuse-seeded"
+            ann_only[ann_only.index("--exact-work-limit")+1] = 1
+            run(ann_only)
+            only = json.loads((Path(ann_only[ann_only.index("--output")+1])/"summary.json").read_text())
+            assert not only["exact_trained_reference_available"] and all(v is None for v in only["evaluation_sse_over_exact_by_mode"].values())
             run(command, False)  # completed destination cannot be overwritten
             if dtype != "float":
                 continue
