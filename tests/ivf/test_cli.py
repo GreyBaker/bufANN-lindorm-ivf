@@ -84,7 +84,7 @@ def main():
         run(driver + ["--workload", "search_only"])
         for flag, value in (("--index_format", "mutable"), ("--private_heap_path", "new.heap"), ("--checkpoint_prefix", "new")):
             run(driver + ["--workload", "search_only", flag, value], False)
-        for workload in ("insert_only", "delete_only", "search_after_update"):
+        for workload in ("insert_only", "delete_only", "search_after_update", "mixed"):
             run(driver + ["--workload", workload, "--full_data_file", str(data),
                           "--insert_ids_file", str(ids), "--delete_ids_file", str(ids)])
         run(build + ["--nlist", "2"], False)  # duplicate, not last-value-wins
@@ -99,6 +99,8 @@ def main():
         run(driver + ["--workload", "search_only", "--rerank_factor", "0.5"], False)
         run(driver + ["--workload", "search_only", "--rerank_factor", "1e100"], False)
         run(driver + ["--workload", "search_after_update"], False)
+        for flag, value in (("--scheduler", "fixed_8_8"), ("--query_count", "8"), ("--pool_threads", "16"), ("--query_ratio", "80"), ("--scheduler_seed", "1")):
+            run(driver + ["--workload", "mixed", flag, value], False)
         run(driver + ["--workload", "bogus"], False)
         run([args.build, "--data_file", str(data)], False)
         run([args.driver, "--index_prefix", str(prefix)], False)

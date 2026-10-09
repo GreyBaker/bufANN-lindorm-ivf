@@ -1,4 +1,5 @@
 #include "bufann/ivf_index.h"
+#include "../ivf_mixed_workload.h"
 
 #include <algorithm>
 #include <atomic>
@@ -177,6 +178,54 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     const auto row = [&](uint32_t r) { return std::span<const T>(data.data() + size_t(r) * dim, dim); };
     const auto query = row(60);
     const SearchConfig config{4, 5, 32, 2};
+    // S06: real frozen IVF composition under both schedulers, three matching
+    // round barriers/checkpoint reopens. All inserts target the SAME centroid,
+    // overlapping its +16 growth/swap deletion and rerank with eight queries.
+    for (bool fixed : {false, true}) {
+        const auto label = fixed ? "fixed" : "weighted";
+        auto mixed = MutableIndex<T>::fork(prefix, (root / (std::string(label) + " mixed.heap")).string(), {2});
+        for (uint32_t round = 0; round < 3; ++round) {
+            ivf_cli::MixedPlan plan{fixed, 16, 8, 8, 64};
+            std::barrier overlap_gate(16); std::atomic<uint32_t> first_mutations{0};
+            auto mutation_gate = [&] { if (fixed && first_mutations.fetch_add(1) < 8) overlap_gate.arrive_and_wait(); };
+            const auto stats = ivf_cli::run_mixed_round(plan, {
+                [&](uint64_t i) { mutation_gate(); mixed->insert(first + base + round * 8 + uint32_t(i), row(0)); },
+                [&](uint64_t i) { mutation_gate(); require(mixed->erase(first + round * 8 + uint32_t(i)), "mixed delete lost a base ID"); },
+                [&](uint64_t i) {
+                    if (fixed && i < 8) overlap_gate.arrive_and_wait();
+                    for (auto hit : mixed->query(query, config).hits) {
+                        double squared = 0; const auto coordinates = row(hit.id >= first + base ? 0 : hit.id - first);
+                        for (uint32_t d = 0; d < dim; ++d) { const double delta = double(query[d]) - double(coordinates[d]); squared += delta * delta; }
+                        require(hit.squared_distance == squared, "mixed query returned mismatched/stale coordinates");
+                    }
+                }});
+            if (fixed) require(stats.overlapping_queries >= 8 && stats.peak_queries == 8 && stats.peak_mutations == 8,
+                               "fixed native fixture failed dedicated 8+8 overlap");
+            std::vector<uint8_t> seen(capacity, 0); uint32_t entries = 0;
+            for (uint32_t c = 0; c < training.nlist; ++c) {
+                const auto copied = mixed->copy_list(c);
+                for (auto id : copied.ids) { require(id < capacity && !seen[id] && mixed->contains(id), "mixed round list/locator membership mismatch"); seen[id] = 1; ++entries; }
+            }
+            std::vector<ExactHit> expected;
+            for (uint32_t id = first; id < capacity; ++id) {
+                const bool live = (id >= first + (round + 1) * 8 && id < first + base) ||
+                                  (id >= first + base && id < first + base + (round + 1) * 8);
+                require(bool(seen[id]) == live && mixed->contains(id) == live, "mixed round live set differs from schedule");
+                if (live) {
+                    double squared = 0; const auto coordinates = row(id >= first + base ? 0 : id - first);
+                    for (uint32_t d = 0; d < dim; ++d) { const double delta = double(query[d]) - double(coordinates[d]); squared += delta * delta; }
+                    expected.push_back({id, squared});
+                }
+            }
+            std::sort(expected.begin(), expected.end(), nearer); expected.resize(config.recall_at);
+            require(entries == base && mixed->size() == base && mixed->query(query, config).hits == expected, "mixed barrier exact oracle/count failure");
+            const auto saved = (root / (std::string(label) + " round " + std::to_string(round))).string();
+            mixed->checkpoint(saved);
+            mixed = MutableIndex<T>::reopen(saved, saved + ".private.heap", {2});
+            require(mixed->query(query, config).hits == expected, "mixed round checkpoint reopen changed results");
+        }
+        rejects([&] { mixed->insert(first, row(0)); });
+    }
     std::vector<uint8_t> live(rows, 0); std::fill_n(live.begin(), base, 1);
     auto distance = [&](uint32_t id) {
         double total = 0;

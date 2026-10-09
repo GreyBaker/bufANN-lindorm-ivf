@@ -1,11 +1,12 @@
-# Native IVF query and mutation harness (S04/S05)
+# Native IVF query and mutation harness (S04–S06)
 
 Linux/WSL query-only scripts are implemented and tested with synthetic and
 standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
 production SIFT training, recall/QPS or memory qualification. No vector-level
 graph, Vamana conversion, distributed service or SPFresh source change is required.
 Sequential insert/delete prepare/run pairs and native mutable checkpoint/reopen
-are implemented (S05); concurrent mixed prepare/run pairs remain pending (S06).
+are implemented (S05); concurrent weighted/fixed 8+8 mixed prepare/run pairs are
+implemented (S06). Production and paired SPFresh qualification remain pending.
 
 ## Build with installed system dependencies
 
@@ -133,6 +134,30 @@ CLI examples, file ownership, metrics/budget scopes and verification:
 [s05-cli-and-mutation-harness.md](../../docs/s05-cli-and-mutation-harness.md).
 Checkpoint format/limits: [MUTABLE_INDEX.md](../../docs/MUTABLE_INDEX.md).
 
+### Concurrent mixed rounds (S06)
+
+```bash
+UPDATE_PERCENT=10 UPDATE_BATCH=10000 bash benchmark/IVF/sift/update_prepare.sh
+UPDATE_PERCENT=10 UPDATE_BATCH=10000 IVF_SCHEDULER=weighted NTHREADS=16 \
+  QUERY_RATIO=80 QUERY_THREADS=4 bash benchmark/IVF/sift/update.sh
+UPDATE_PERCENT=10 UPDATE_BATCH=10000 IVF_SCHEDULER=fixed_8_8 NTHREADS=16 \
+  IVF_RUN_TAG=fixed QUERY_THREADS=4 bash benchmark/IVF/sift/update.sh
+```
+
+Caps/counts/round GT use the unchanged SPFresh/shared layout helpers, including
+equal insert/delete caps for paired scripts. Weighted mode reuses the shared
+remaining-operation scheduler; fixed mode has eight dedicated mutation and eight
+query workers, not graph-maintenance threads. `QUERY_THREADS` controls only
+post-round scoring. `QUERY_POINTS` uses the shared total/per-round policy; otherwise
+`QUERY_RATIO` defaults to 80. Every round joins, validates/checkpoints and scores
+against its matching GT; the next process reopens onto a new private heap.
+Concurrent query timing/overlap is separate from post-barrier recall. Root
+`result.json` is the final round record; `summary.json` retains all round records
+and always disclaims production qualification. Earlier work is never reset.
+
+Native `--workload mixed` and full ownership/scheduling/metric/verification scope:
+[s06-mixed-workloads.md](../../docs/s06-mixed-workloads.md).
+
 ### Cache identity and costs
 
 `eval_cached/<dataset>/IVF/<sha256-key>/` binds exact build settings/profile,
@@ -171,8 +196,9 @@ Reproduction/observed code parity and numerical tolerances:
 [s04-query-harness-and-trained-pq.md](../../docs/s04-query-harness-and-trained-pq.md).
 S03/S04 remain partial until production training and repeated recall/QPS/latency/
 memory/concurrency budgets are qualified. S05 minimum updates/checkpoints/CLI/script
-integration is implemented; S06 mixed and S07 paired SPFresh benchmark segments
-remain pending. No production-performance result follows from fixtures.
+integration is implemented; S06 weighted/fixed mixed rounds now pass functional
+fixtures. S07 paired SPFresh/production benchmark segments remain pending.
+No production-performance result follows from fixtures.
 
 Bounded exact/HNSW training comparisons and repeated query-sweep tooling now pass
 fixtures, including declared budgets, preservation and failure gates:

@@ -45,6 +45,10 @@ endif()
 option(IVF_BUILD_CONTRACT_TESTS "Build IVF input and PQ contract tests" ON)
 if(IVF_BUILD_CONTRACT_TESTS)
     enable_testing()
+    add_executable(ivf_mixed_scheduler_tests ivf_mixed_scheduler_tests.cpp)
+    target_link_libraries(ivf_mixed_scheduler_tests PRIVATE Threads::Threads)
+    add_test(NAME ivf_mixed_scheduler COMMAND ivf_mixed_scheduler_tests)
+    set_tests_properties(ivf_mixed_scheduler PROPERTIES TIMEOUT 30)
     add_executable(ivf_centroid_tests ivf_centroid_tests.cpp)
     target_link_libraries(ivf_centroid_tests PRIVATE ivf_centroids)
     if(NOT MSVC)
@@ -142,6 +146,10 @@ if(IVF_BUILD_CONTRACT_TESTS)
         add_test(NAME ivf_query_harness COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_harness.py"
             --build-dir "${CMAKE_BINARY_DIR}" --scratch "${CMAKE_CURRENT_BINARY_DIR}/harness_fixtures")
+        add_test(NAME ivf_mixed_execution COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_mixed.py"
+            --build-dir "${CMAKE_BINARY_DIR}" --scratch "${CMAKE_CURRENT_BINARY_DIR}/mixed_fixtures")
+        set_tests_properties(ivf_mixed_execution PROPERTIES TIMEOUT 300)
         add_test(NAME ivf_cli_execution COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_execution.py"
             --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>

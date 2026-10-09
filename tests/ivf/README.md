@@ -240,6 +240,37 @@ process-only ASLR disable and `OMP_THREAD_LIMIT=1`; no unrestricted legacy paral
 OpenMP or system-library qualification is claimed. The original `bufann_driver`
 still builds. These are functional fixtures, not production benchmark evidence.
 
+## S06 — concurrent mixed rounds
+
+`ivf_mixed_scheduler` tests weighted dense dispatch, uneven stream exhaustion,
+joined callback failures and deterministic simultaneous 8+8 callback admission.
+Startup-gate regressions check release/abort before and racing with eight waiters;
+the wait predicate is mutex-protected even when later worker creation fails.
+It also runs in dependency-isolated builds; isolated TSan passes **30/30**
+repetitions with process-only ASLR disable, no OpenMP limit or suppressions.
+The shared weighted pool's only change is joining already-created workers on
+thread launch failure; ordinary dispatch semantics are preserved.
+
+Native all-dtype session fixtures now run three weighted/fixed rounds with
+same-centroid insert growth/swap deletion, concurrent rerank coordinate checks,
+quiescent list/membership/exact-oracle validation and checkpoint/reopen after each
+round. Dedicated-role fixture gates prove eight mutation/eight query callbacks
+are simultaneously admitted; production code uses no such fixture barrier.
+`ivf_mixed_execution` runs real two-round shell/CLI fixtures for all dtypes,
+canonical range/GT helper parity, independent SPFresh scoring, checkpoint chaining,
+source/base preservation and invalid count/budget/allocation/input/output refusals.
+It now also induces a fixture-local shared-extractor mismatch after a valid native
+round and requires retained round/checkpoint evidence but no next round or final
+summary. Canonical extraction/byte checks happen inside round orchestration before
+subsequent admission/final publication, not in a shell loop after a success summary.
+
+Concurrent queries are weakly consistent and never scored against final GT.
+Post-round recall is measured after all foreground workers join and checkpoint
+validation completes. Weighted role counts share one pool; fixed mode is truly
+eight mutation/eight query workers, not a graph-maintenance allocation.
+See [s06-mixed-workloads.md](../../docs/s06-mixed-workloads.md) for commands,
+memory/timing/overlap scopes and final verification records.
+
 ## Coverage and limits
 
 `ivf_contracts` covers invalid counts/settings, sample support, candidate ceiling
@@ -269,7 +300,7 @@ invalid or incomplete native requests, and logger output.
 | S03 (partial) | Exact/HNSW trainer + pinned HNSW router | Component comparisons, synthetic 50K smoke and bounded diagnostic tooling pass; production-scale quality/memory/build qualification remains |
 | S04 (partial) | Persisted native build/open/query + query scripts | Component/bundle/CLI/harness/trained-helper and repeated-sweep fixtures pass; production GT/performance and measured admission qualification remain |
 | S05 (implemented) | Mutable lists + native heap/query/checkpoint + insert/delete scripts | +16 growth, locators/reservations, prepared publication, live rerank, tombstone/aborted-slot checkpoints, reopen/error/contention and all-dtype mutation CLI/script oracles; no production-performance qualification |
-| S06 | Mixed scheduling + concurrency | Same-list contention, query/delete rerank races, weighted/fixed 8+8 overlap, round live sets, deadlock/race-detector stress |
+| S06 (functional gates complete) | Mixed scheduling + round scripts | Weighted/fixed 8+8 dispatch, same-centroid growth/swap deletion/rerank, round membership/oracles and checkpoint/GT/script parity; Release/ASan/UBSan and scoped TSan pass, including final metric-description rechecks |
 | S07 | Paired SPFresh evaluation | Identical traces/GT/CPU controls, uint8 SIFT10M, matched-recall sweeps, repeated measurements and reported deviations |
 
 Progress and design changes are recorded in `docs/implementation-progress.md`;

@@ -131,8 +131,12 @@ class WeightedUpdatePool {
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
-    for (uint32_t w = 0; w < num_threads; w++) {
-      threads.emplace_back(worker, w);
+    try {
+      for (uint32_t w = 0; w < num_threads; w++) threads.emplace_back(worker, w);
+    } catch (...) {
+      // Do not terminate while unwinding joinable workers after launch failure.
+      for (auto &th : threads) th.join();
+      throw;
     }
     for (auto &th : threads) {
       th.join();

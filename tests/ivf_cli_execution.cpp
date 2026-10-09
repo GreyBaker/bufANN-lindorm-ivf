@@ -1,5 +1,8 @@
 #include "ivf_cli_execution.h"
 #include "bufann/ivf_index.h"
+#include "ivf_mixed_workload.h"
+#include <omp.h>
+#include <mkl_service.h>
 
 #include <algorithm>
 #include <array>
@@ -10,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -119,6 +123,70 @@ struct UpdateStats {
     uint64_t inserted = 0, deleted = 0, missing = 0, bytes = 0;
     double insert_s = 0, delete_s = 0, checkpoint_s = 0;
 };
+template<typename T>
+UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index, uint64_t budget, uint64_t resident_bytes,
+                        std::span<const T> queries, const SearchConfig& config, MixedStats& mixed) {
+    const auto& m = index.origin_manifest();
+    args.reject_present({"--pq_prefix"}, "mixed updates use frozen bundle PQ");
+    const auto source = args.require("--full_data_file");
+    check(inspect_vectors(source, m.training.data_type, m.training.dim).rows == m.source_rows &&
+          artifact_digest(source) == m.sources[0], "Mixed full-source identity mismatch");
+    const auto scheduler = args.get("--scheduler", "weighted");
+    check(scheduler == "weighted" || scheduler == "fixed_8_8", "Unknown mixed scheduler");
+    const auto ratio = args.u32("--query_ratio", 80);
+    check(ratio > 0 && ratio < 100, "Mixed query_ratio must be in [1,99]");
+    MixedPlan plan; plan.fixed_8_8 = scheduler == "fixed_8_8";
+    plan.pool_threads = args.u32("--pool_threads", 16); plan.seed = args.integer("--scheduler_seed", plan.seed);
+    UpdateStats s; s.bytes = resident_bytes;
+    for (auto key : {"--insert_ids_file", "--delete_ids_file"}) add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
+    check(s.bytes <= budget, "CLI mixed ID parsing exceeds allowance");
+    const auto inserts = load_counted_ids(args.require("--insert_ids_file"), m.source_rows);
+    const auto deletes = load_counted_ids(args.require("--delete_ids_file"), m.source_rows);
+    plan.inserts = inserts.size(); plan.deletes = deletes.size();
+    // Validate bounds BEFORE calling the legacy count helper's multiplication.
+    check(plan.inserts + plan.deletes <= UINT64_MAX / 99, "Mixed query-count overflow");
+    plan.queries = args.integer("--query_count", ann_bench::mixed_update_query_count(inserts.size(), deletes.size(), ratio));
+    plan.validate();
+    auto sorted = deletes; std::sort(sorted.begin(), sorted.end());
+    for (auto id : inserts) check(id >= m.first_id && id < m.heap.id_capacity && !index.contains(id) &&
+        !std::binary_search(sorted.begin(), sorted.end(), id), "Invalid/live/overlapping mixed insert ID");
+    for (auto id : deletes) check(id >= m.first_id && id < m.heap.id_capacity && index.contains(id), "Mixed deletion must refer to a live ID");
+    const auto initial_live = index.size(); const auto retained_before = index.estimated_retained_bytes();
+    const auto query_bytes = index.estimated_query_bytes(config), mutation_bytes = index.estimated_mutation_bytes();
+    add(s.bytes, plan.inserts * m.training.dim, sizeof(T)); add(s.bytes, plan.queries, 2 * sizeof(double));
+    uint64_t worker_bytes = 8ull * 1024 * 1024; add(worker_bytes, query_bytes); add(worker_bytes, mutation_bytes);
+    add(s.bytes, plan.pool_threads, worker_bytes);
+    add(s.bytes, index.estimated_checkpoint_bytes()); add(s.bytes, 1024 * 1024);
+    check(s.bytes <= budget, "CLI composed mixed workload exceeds allowance");
+    std::vector<T> coordinates(size_t(plan.inserts) * m.training.dim);
+    std::ifstream input(source, std::ios::binary);
+    for (size_t i = 0; i < inserts.size(); ++i) {
+        input.seekg(8 + uint64_t(inserts[i]) * m.training.dim * sizeof(T));
+        input.read(reinterpret_cast<char*>(coordinates.data() + i * m.training.dim), size_t(m.training.dim) * sizeof(T));
+        check(bool(input), "Mixed source row read failed");
+    }
+    for (auto v : coordinates) check(std::isfinite(double(v)), "Nonfinite mixed insert coordinate");
+    const auto query_rows = queries.size() / m.training.dim;
+    check(query_rows != 0, "Mixed queries require a nonempty source");
+    std::atomic<uint64_t> missing{0};
+    const auto runtime_threads = uint32_t(std::distance(std::filesystem::directory_iterator("/proc/self/task"), std::filesystem::directory_iterator{}));
+    mixed = run_mixed_round(plan, {
+        [&](uint64_t i) { index.insert(inserts[size_t(i)], {coordinates.data() + size_t(i) * m.training.dim, m.training.dim}, {mutation_bytes, false}); },
+        [&](uint64_t i) { if (!index.erase(deletes[size_t(i)])) ++missing; },
+        [&](uint64_t i) { (void)index.query(queries.subspan(size_t(i % query_rows) * m.training.dim, m.training.dim), config, {query_bytes, false}); }});
+    mixed.runtime_threads_before_launch = runtime_threads;
+    check(missing == 0 && index.size() == uint64_t(initial_live) + plan.inserts - plan.deletes, "Mixed round count/live set mismatch");
+    for (auto id : inserts) check(index.contains(id), "Completed mixed insert missing at barrier");
+    for (auto id : deletes) check(!index.contains(id), "Completed mixed delete live at barrier");
+    check(artifact_digest(source) == m.sources[0], "Mixed source changed during execution");
+    s.inserted = mixed.completed[0]; s.deleted = mixed.completed[1];
+    s.insert_s = s.delete_s = mixed.wall_s; // Rates use full mixed foreground wall, not summed callback time.
+    add(s.bytes, index.estimated_retained_bytes() - retained_before);
+    check(s.bytes <= budget, "CLI post-growth mixed workload exceeds allowance");
+    const auto start = Clock::now();
+    index.checkpoint(args.require("--checkpoint_prefix"), index.estimated_checkpoint_bytes());
+    s.checkpoint_s = seconds(start); return s;
+}
 void validate_driver_paths(const Arguments& args, bool updating) {
     validate_output_paths(args);
     std::vector<std::string> paths;
@@ -201,16 +269,40 @@ UpdateStats update_index(const Arguments& args, MutableIndex<T>& index, uint64_t
     s.checkpoint_s = seconds(start); return s;
 }
 template<typename T> void emit_update(std::ostream& record, bool& first, const Arguments& args,
-                                    const MutableIndex<T>& index, const UpdateStats& s) {
+                                    const MutableIndex<T>& index, const UpdateStats& s, const MixedStats* mixed = nullptr) {
     auto emit = [&](const char* key, const auto& value) { bufann_bench::json_kv(record, first, key, value); };
     emit("insert_count", s.inserted); emit("delete_count", s.deleted); emit("missing_delete_count", s.missing);
     emit("insert_time_s", s.insert_s); emit("delete_time_s", s.delete_s);
     emit("insert_qps", bufann_bench::safe_div(s.inserted, s.insert_s)); emit("delete_qps", bufann_bench::safe_div(s.deleted + s.missing, s.delete_s));
     emit("checkpoint_time_s", s.checkpoint_s); emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
     emit("live_count", index.size()); emit("retained_heap_records", index.retained_heap_records());
-    emit("estimated_update_workspace_bytes", s.bytes); emit("mutation_workers", 1);
-    emit("scheduler", "sequential_delete_then_insert_no_query_overlap");
-    emit("mutation_timing_scope", "foreground_loops_excludes_open_validation_hash_checkpoint_and_post_update_query");
+    emit("estimated_update_workspace_bytes", s.bytes);
+    if (!mixed) {
+        emit("mutation_workers", 1); emit("scheduler", "sequential_delete_then_insert_no_query_overlap");
+        emit("mutation_timing_scope", "foreground_loops_excludes_open_validation_hash_checkpoint_and_post_update_query");
+    } else {
+        const auto fixed = args.get("--scheduler", "weighted") == "fixed_8_8";
+        const auto threads = args.u32("--pool_threads", 16);
+        emit("scheduler", fixed ? "fixed_8_8" : "weighted_remaining_ops"); emit("foreground_workers", threads);
+        emit("mutation_workers", fixed ? 8u : threads); emit("concurrent_query_workers", fixed ? 8u : threads);
+        emit("worker_allocation", fixed ? "dedicated_8_mutation_8_query" : "shared_pool_not_additive");
+        emit("scheduler_seed", args.integer("--scheduler_seed", ann_bench::WeightedUpdatePool::kDefaultSeed));
+        emit("query_ratio", args.u32("--query_ratio", 80)); emit("mixed_wall_s", mixed->wall_s);
+        emit("concurrent_query_count_policy", args.has("--query_count") ? "explicit_finite_count" : "floor_ratio_times_updates_over_100_minus_ratio");
+        emit("concurrent_query_count", mixed->completed[2]); emit("concurrent_query_qps", bufann_bench::safe_div(mixed->completed[2], mixed->wall_s));
+        emit("overlapping_query_count", mixed->overlapping_queries); emit("peak_active_mutations", mixed->peak_mutations); emit("peak_active_queries", mixed->peak_queries);
+        emit("insert_callback_us_total", mixed->callback_us[0]); emit("delete_callback_us_total", mixed->callback_us[1]);
+        emit("concurrent_query_callback_us_total", mixed->callback_us[2]);
+        auto latencies = mixed->query_latency_us; std::sort(latencies.begin(), latencies.end());
+        emit("concurrent_query_lat_avg_us", std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size());
+        emit("concurrent_query_lat_p99_us", latencies[size_t(0.99 * (latencies.size() - 1))]);
+        emit("mutation_timing_scope", "full_mixed_foreground_wall_includes_launch_join_excludes_setup_checkpoint_post_round_query");
+        emit("concurrent_recall_policy", "not_scored_weakly_consistent_queries");
+        emit("overlap_scope", "admitted_operation_intervals_including_monitor_native_lock_io_and_retirement_not_cpu_simultaneity");
+        emit("post_round_barrier", "all_foreground_workers_joined_checkpoint_validated_before_scoring");
+        emit("backend_bg_flush_workers", 0); emit("openmp_threads", 1); emit("mkl_threads", 1);
+        emit("runtime_threads_before_mixed_launch", mixed->runtime_threads_before_launch);
+    }
     emit("publication", "manifest_last_nonatomic_no_fsync");
     const auto& m = index.origin_manifest();
     emit("base_count", m.training.base_count); emit("source_rows", m.source_rows);
@@ -246,7 +338,8 @@ template<typename T> void mutate_typed(const Arguments& args, DataType type) {
 
 template<typename T, typename Index>
 void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> index, double open_time) {
-    const bool updating = args.require("--workload") == "search_after_update";
+    const bool is_mixed = args.require("--workload") == "mixed";
+    const bool updating = args.require("--workload") == "search_after_update" || is_mixed;
     const auto budget = budget_bytes(args.real("--memory_budget_gb", 1.0));
     const auto& manifest = cli_manifest(*index);
     const auto dim = manifest.training.dim;
@@ -307,10 +400,10 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
             check(std::adjacent_find(gold_row.begin(), gold_row.end()) == gold_row.end(), "Duplicate GT ID in row");
         }
     }
-    UpdateStats updates;
+    UpdateStats updates; MixedStats mixed;
     if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
         if (updating) {
-            updates = update_index(args, *index, budget, bytes);
+            updates = is_mixed ? mixed_index(args, *index, budget, bytes, std::span<const T>(coordinates), config, mixed) : update_index(args, *index, budget, bytes);
             // Account for additional retained list capacity after insertion.
             bytes = std::max(bytes, updates.bytes);
             const auto post_query_bytes = index->estimated_query_bytes(config);
@@ -401,7 +494,7 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     begin_record(record, "query", type);
     bool first = false;
     auto emit = [&](const char* key, const auto& value) { bufann_bench::json_kv(record, first, key, value); };
-    emit("workload", updating ? "search_after_update" : "query"); emit("dim", dim); emit("nlist", manifest.training.nlist);
+    emit("workload", is_mixed ? "mixed" : (updating ? "search_after_update" : "query")); emit("dim", dim); emit("nlist", manifest.training.nlist);
     emit("index_prefix", args.require("--index_prefix")); emit("query_file", args.require("--query_file"));
     if (!updating) emit("base_count", manifest.training.base_count);
     emit("pq_chunks", manifest.chunks);
@@ -435,15 +528,18 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
         if (!updating) emit("live_count", index->size());
         emit("index_format", "mutable");
-        if (updating) emit_update(record, first, args, *index, updates);
+        if (updating) emit_update(record, first, args, *index, updates, is_mixed ? &mixed : nullptr);
     }
     record << "}"; publish_record(args, record.str());
 }
 template<typename T> void driver_typed(const Arguments& args, DataType type) {
     const auto workload = args.require("--workload");
-    check(workload == "search_only" || workload == "insert_only" || workload == "delete_only" || workload == "search_after_update", "Unsupported native workload");
+    const bool mixed = workload == "mixed";
+    check(workload == "search_only" || workload == "insert_only" || workload == "delete_only" || workload == "search_after_update" || mixed, "Unsupported native workload");
+    if (!mixed) args.reject_present({"--scheduler", "--pool_threads", "--query_ratio", "--query_count", "--scheduler_seed"}, "mixed-only setting");
+    else { omp_set_num_threads(1); mkl_set_num_threads(1); }
     if (workload == "insert_only" || workload == "delete_only") return mutate_typed<T>(args, type);
-    const bool updating = workload == "search_after_update";
+    const bool updating = workload == "search_after_update" || mixed;
     validate_driver_paths(args, updating);
     if (!updating) args.reject_present({"--pq_prefix", "--full_data_file", "--insert_ids_file", "--delete_ids_file"}, "not used by search-only execution");
     const auto format = args.get("--index_format", "immutable");
