@@ -70,9 +70,9 @@ int main(int argc, char** argv) {
             "--nlist", "--sample_rate", "--max_reps", "--seed", "--build_threads", "--memory_budget_gb",
             "--mode", "--exact_work_limit", "--assignment_work_limit", "--evaluation_work_limit",
             "--evaluation_rows", "--router_degree", "--construction_breadth", "--insert_breadth",
-            "--router_seed", "--output_prefix", "--init", "--training_breadth"});
+            "--router_seed", "--output_prefix", "--init", "--training_breadth", "--training_rerank_factor", "--training_refine_breadth", "--routing_work_limit"});
         if (args.help) {
-            std::cout << "Bounded trainer diagnostics: --mode exact|hnsw|ann-rebuild|ann-reuse|ann-reuse-seeded\n"
+            std::cout << "Bounded trainer diagnostics: --mode exact|hnsw|ann-rebuild|ann-reuse|ann-reuse-seeded|ann-reuse-count|ann-reuse-seeded-count|lv|lv-plus\n"
                 "  --init sample|random_partition --training_breadth N; use benchmark/IVF/qualify.py train --help\n";
             return 0;
         }
@@ -87,6 +87,8 @@ int main(int argc, char** argv) {
         config.trainer_mode = parse_trainer_mode(mode == "hnsw" ? "ann-rebuild" : mode);
         config.init = parse_centroid_init(args.get("--init", "sample"));
         config.training_breadth = args.u32("--training_breadth", args.u32("--insert_breadth", 64));
+        config.training_rerank_factor = args.real("--training_rerank_factor", 3);
+        config.training_refine_breadth = args.u32("--training_refine_breadth", 128);
         config.validate();
         const auto shape = inspect_vectors(path, config.data_type, config.dim);
         check(config.base_count <= shape.rows, "Training base prefix exceeds source rows");
@@ -111,6 +113,7 @@ int main(int argc, char** argv) {
         limits.max_distance_evaluations = args.integer("--exact_work_limit");
         limits.max_assignment_searches = args.integer("--assignment_work_limit");
         RouterOptions routing;
+        routing.native_work_limit = args.integer("--routing_work_limit",1000000000);
         routing.degree = args.u32("--router_degree", 16);
         routing.construction_breadth = args.u32("--construction_breadth", 200);
         routing.insert_breadth = args.u32("--insert_breadth", 64);

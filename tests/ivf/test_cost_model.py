@@ -103,6 +103,47 @@ def main():
                     assert qc["sample_codes"] == count and qc["scaled_codes"] == count * 160 / 128
                     assert qc["t2_us"] == qc["scaled_codes"] * report["per_code_us"]
             assert before == {p: harness.digest(p) for p in before}
+            assert report["version"] == 2 and report["min_sample_per_centroid"] == 32
+            assert report["candidate_eligibility_policy"] == "declared_project_minimum_not_paper_requirement"
+            # Historical v1 keeps its implicit cutoff; new reports declare policy.
+            legacy = copy.deepcopy(report); legacy["version"] = 1
+            legacy.pop("min_sample_per_centroid"); legacy.pop("candidate_eligibility_policy")
+            legacy_path = root / (dtype + "_legacy_report.json"); legacy_path.write_text(json.dumps(legacy))
+            assert harness.read_cost_model_report(legacy_path)["selected_nlist"] == report["selected_nlist"]
+            sparse = command.copy(); sparse_root = root / (dtype + "_sparse")
+            sparse[sparse.index("--output") + 1] = sparse_root
+            sparse[sparse.index("--nlist-grid") + 1] = "5,6,7"
+            sparse += ["--min-sample-per-centroid", "20", "--trainer-mode", "lv-plus", "--training-refine-breadth", "16"]
+            run(sparse)
+            sparse_report = harness.read_cost_model_report(sparse_root / "report.json")
+            assert sparse_report["min_sample_per_centroid"] == 20
+            assert [c["eligible"] for c in sparse_report["candidates"]] == [True, True, False]
+            assert all(c["below_legacy_32_adequacy"] for c in sparse_report["candidates"])
+            assert sparse_report["candidates"][-1]["drop_reason"] == "sample_count_per_cluster_below_declared_minimum"
+            assert sparse_report["trainer_mode"] == "lv-plus" and sparse_report["training_refine_breadth"] == 16
+            if dtype == "float":
+                structural = command.copy(); structural_root = root / "structural_minimum"
+                structural[structural.index("--output") + 1] = structural_root
+                structural[structural.index("--sample-count") + 1] = "8"
+                structural[structural.index("--nlist-grid") + 1] = "8,9"
+                run(structural + ["--min-sample-per-centroid", "1"])
+                boundary = harness.read_cost_model_report(structural_root / "report.json")
+                assert boundary["selected_nlist"] == 8 and [c["eligible"] for c in boundary["candidates"]] == [True, False]
+            for minimum in (0, -1):
+                bad_policy = command.copy(); refused = root / (dtype + "_policy_" + str(minimum))
+                bad_policy[bad_policy.index("--output") + 1] = refused
+                run(bad_policy + ["--min-sample-per-centroid", str(minimum)], False)
+                assert not (refused / "native").exists()
+            for mutation in ("minimum", "eligibility", "missing_policy"):
+                invalid_policy = copy.deepcopy(sparse_report)
+                if mutation == "minimum": invalid_policy["min_sample_per_centroid"] = 32
+                elif mutation == "eligibility": invalid_policy["candidates"][-1]["eligible"] = True
+                else: invalid_policy.pop("candidate_eligibility_policy")
+                invalid_path = root / (dtype + "_invalid_" + mutation + ".json")
+                invalid_path.write_text(json.dumps(invalid_policy))
+                try: harness.read_cost_model_report(invalid_path)
+                except ValueError: pass
+                else: raise AssertionError("Accepted inconsistent sample adequacy policy")
             frozen = harness.digest(output / "report.json")
             run(command, False)  # Existing destinations must never be overwritten.
             assert harness.digest(output / "report.json") == frozen
@@ -144,6 +185,10 @@ def main():
                 try: harness.nlist_selection(profile, mismatch, sources)
                 except ValueError: pass
                 else: raise AssertionError("Accepted mismatched training breadth")
+                mismatch = dict(settings, training_rerank_factor="5")
+                try: harness.nlist_selection(profile, mismatch, sources)
+                except ValueError: pass
+                else: raise AssertionError("Accepted mismatched training candidate policy")
                 os.environ["IVF_NLIST"] = "999"
                 try: harness.build_settings()
                 except ValueError: pass

@@ -38,11 +38,15 @@ uint64_t budget_bytes(const BuildConfig& config) {
     return static_cast<uint64_t>(bytes);
 }
 void validate(const IndexManifest& m) {
-    check(m.format_version >= 1 && m.format_version <= 3 &&
-          (m.format_version == 3 || m.routing.native_modes == (m.format_version == 2)), "Invalid IVF manifest family");
-    check(m.format_version == 3 || (m.training.trainer_mode == TrainerMode::AnnRebuild &&
+    check(m.format_version >= 1 && m.format_version <= 4 &&
+          (m.format_version >= 3 || m.routing.native_modes == (m.format_version == 2)), "Invalid IVF manifest family");
+    check(m.format_version >= 3 || (m.training.trainer_mode == TrainerMode::AnnRebuild &&
           m.training.init == CentroidInit::Sample && m.training.training_breadth == m.routing.insert_breadth),
-          "Legacy manifest cannot encode new trainer settings");
+           "Legacy manifest cannot encode new trainer settings");
+    check(m.format_version == 4 || (!trainer_count_candidates(m.training.trainer_mode) &&
+          m.training.training_rerank_factor == 3 && m.training.training_refine_breadth == 128),
+          "Legacy manifest cannot encode count-based training policy");
+    check(m.format_version != 4 || trainer_count_candidates(m.training.trainer_mode), "Version-4 trainer policy mismatch");
     check(m.router_backend == "hnswlib-0.8.0-prefetch1" || (!m.routing.native_modes && m.router_backend == "hnswlib-0.8.0-nomv"), "Invalid IVF router producer identity");
     m.training.validate();
     check(m.source_rows >= m.training.base_count && m.first_id < m.heap.id_capacity &&
@@ -84,7 +88,7 @@ IndexManifest read_manifest_file(const std::string& path) {
     check(std::filesystem::file_size(path) <= 16384, "IVF manifest exceeds framing limit");
     std::ifstream in(path, std::ios::binary); in.imbue(std::locale::classic());
     std::string version; in >> version;
-    check(version == "IVFINDEX1" || version == "IVFINDEX2" || version == "IVFINDEX3", "Unsupported IVF index version");
+    check(version == "IVFINDEX1" || version == "IVFINDEX2" || version == "IVFINDEX3" || version == "IVFINDEX4", "Unsupported IVF index version");
     word(in, "l2"); word(in, "global_nonresidual_pq8_external_unverified");
     std::string backend; in >> backend;
     check(backend == "hnswlib-0.8.0-prefetch1" || (version == "IVFINDEX1" && backend == "hnswlib-0.8.0-nomv"), "IVF backend mismatch");
@@ -101,10 +105,16 @@ IndexManifest read_manifest_file(const std::string& path) {
     in >> m.training.sample_rate; m.training.max_reps = integer<uint32_t>(in);
     m.training.seed = integer<uint64_t>(in); m.training.build_threads = integer<uint32_t>(in);
     in >> m.training.memory_budget_gb; check(bool(in), "Invalid IVF training metadata");
-    if (m.format_version == 3) {
+    if (m.format_version >= 3) {
         word(in, "trainer"); std::string mode, init; in >> mode >> init;
         m.training.trainer_mode = parse_trainer_mode(mode); m.training.init = parse_centroid_init(init);
         m.training.training_breadth = integer<uint32_t>(in);
+    }
+    if (m.format_version == 4) {
+        word(in, "training_search");
+        in >> m.training.training_rerank_factor; check(bool(in), "Invalid training rerank factor");
+        m.training.training_refine_breadth = integer<uint32_t>(in);
+        word(in, trainer_optimized_search(m.training.trainer_mode) ? "pca95_refit_each_pass_initial_refinement" : "full_count_based");
     }
     word(in, "routing");
     m.routing.degree = integer<uint32_t>(in); m.routing.construction_breadth = integer<uint32_t>(in);
@@ -112,7 +122,7 @@ IndexManifest read_manifest_file(const std::string& path) {
     m.routing.seed = integer<uint32_t>(in); m.routing.memory_budget_bytes = integer<uint64_t>(in);
     if (m.format_version < 3) m.training.training_breadth = m.routing.insert_breadth;
     bool native = version == "IVFINDEX2";
-    if (m.format_version == 3) {
+    if (m.format_version >= 3) {
         word(in, "optimized_modes"); auto value = integer<uint32_t>(in);
         check(value <= 1, "Invalid optimized modes flag"); native = value != 0;
     }
@@ -146,12 +156,15 @@ void write_manifest_file(const std::string& path, const IndexManifest& m) {
         << m.heap.id_capacity << ' ' << m.heap.page_size << ' ' << m.heap.buffer_frames << '\n'
         << "training " << m.training.sample_rate << ' ' << m.training.max_reps << ' ' << m.training.seed << ' '
         << m.training.build_threads << ' ' << m.training.memory_budget_gb << '\n';
-    if (m.format_version == 3) out << "trainer " << trainer_mode_name(m.training.trainer_mode) << ' '
+    if (m.format_version >= 3) out << "trainer " << trainer_mode_name(m.training.trainer_mode) << ' '
         << centroid_init_name(m.training.init) << ' ' << m.training.training_breadth << '\n';
+    if (m.format_version == 4) out << "training_search " << m.training.training_rerank_factor << ' '
+        << m.training.training_refine_breadth << ' '
+        << (trainer_optimized_search(m.training.trainer_mode) ? "pca95_refit_each_pass_initial_refinement" : "full_count_based") << '\n';
     out << "routing " << m.routing.degree << ' ' << m.routing.construction_breadth << ' '
         << m.routing.query_breadth << ' ' << m.routing.insert_breadth << ' ' << m.routing.seed << ' '
         << m.routing.memory_budget_bytes << '\n';
-    if (m.format_version == 3) out << "optimized_modes " << m.routing.native_modes << '\n';
+    if (m.format_version >= 3) out << "optimized_modes " << m.routing.native_modes << '\n';
     if (m.routing.native_modes) out << "native_routing " << router_mode_name(m.routing.mode) << ' ' << m.routing.refine_breadth << ' '
         << m.routing.refine_reverse_edges << ' ' << m.routing.pca_variance << ' ' << m.routing.router_rerank_factor << ' '
         << m.routing.native_work_limit << ' ' << m.pca_retained_dim << '\n';
@@ -229,6 +242,7 @@ void NativeIndex<T>::build(const std::string& prefix, const std::string& vectors
     check(!prefix.empty(), "Empty IVF index prefix"); training.validate();
     check(training.data_type == type<T>(), "IVF index build dtype mismatch");
     IndexManifest m; m.training = training; m.heap = heap; m.routing = routing; m.first_id = first_id;
+    if (trainer_count_candidates(training.trainer_mode)) m.format_version = 4;
     m.source_rows = inspect_vectors(vectors, training.data_type, training.dim).rows;
     const auto pq = inspect_pq_pivots(pivots, training.dim);
     m.chunks = pq.chunks; inspect_pq_codes(codes, m.source_rows, m.chunks);

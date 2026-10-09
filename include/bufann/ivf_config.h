@@ -7,10 +7,14 @@
 namespace diskann::ivf {
 
 enum class DataType { Float, Int8, UInt8 };
-enum class TrainerMode { Exact, AnnRebuild, AnnReuse, AnnReuseSeeded };
+enum class TrainerMode { Exact, AnnRebuild, AnnReuse, AnnReuseSeeded, AnnReuseCount, AnnReuseSeededCount, LV, LVPlus };
 enum class CentroidInit { Sample, RandomPartition };
 TrainerMode parse_trainer_mode(const std::string& name);
 const char* trainer_mode_name(TrainerMode mode);
+bool trainer_reuses_graph(TrainerMode mode);
+bool trainer_seeds_assignment(TrainerMode mode);
+bool trainer_optimized_search(TrainerMode mode);
+bool trainer_count_candidates(TrainerMode mode);
 CentroidInit parse_centroid_init(const std::string& name);
 const char* centroid_init_name(CentroidInit init);
 
@@ -33,6 +37,9 @@ struct BuildConfig {
     TrainerMode trainer_mode = TrainerMode::AnnRebuild;
     CentroidInit init = CentroidInit::Sample;
     uint32_t training_breadth = 64;
+    // Independent of final query/insert router settings. Only LV/LV+ use these.
+    double training_rerank_factor = 3;
+    uint32_t training_refine_breadth = 128;
 
     uint32_t training_count() const;
     void validate() const;

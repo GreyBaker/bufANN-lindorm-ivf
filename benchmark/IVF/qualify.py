@@ -111,8 +111,10 @@ def train(args):
     count = math.ceil(args.base_count * args.sample_rate)
     modes = args.modes.split(",")
     require(modes and len(modes) == len(set(modes)) and set(modes) <=
-            {"exact", "hnsw", "ann-rebuild", "ann-reuse", "ann-reuse-seeded"}, "invalid trainer modes")
+            {"exact", "hnsw", "ann-rebuild", "ann-reuse", "ann-reuse-seeded", "ann-reuse-count", "ann-reuse-seeded-count", "lv", "lv-plus"}, "invalid trainer modes")
     require(args.max_sse_ratio is None or "exact" in modes, "SSE ratio gate requires an exact-trained reference")
+    require(not set(modes) & {"lv", "lv-plus"} or args.init == "random_partition", "LV/LV+ requires random_partition")
+    require(args.training_rerank_factor >= 1, "training rerank factor must be >=1")
     searches = count * (args.iterations + 1)
     require(searches <= args.assignment_work_limit, "training exceeds declared assignment search limit")
     if "exact" in modes:
@@ -127,8 +129,11 @@ def train(args):
         "evaluation_work_limit": args.evaluation_work_limit, "evaluation_rows": args.evaluation_rows,
         "router_degree": args.router_degree, "construction_breadth": args.construction_breadth,
         "insert_breadth": args.insert_breadth, "router_seed": args.router_seed, "init": args.init,
-        "training_breadth": args.training_breadth if args.training_breadth is not None else args.insert_breadth}
+        "training_breadth": args.training_breadth if args.training_breadth is not None else args.insert_breadth,
+        "routing_work_limit": args.routing_work_limit}
     plan = {"version": 1, "kind": "ivf_training_comparison", "settings": settings,
+        "optimized_training_settings": {"training_rerank_factor": args.training_rerank_factor,
+            "training_refine_breadth": args.training_refine_breadth, "search_policy": "pca95_refit_each_pass_initial_refinement"},
         "source_identity": digest(data), "trainer_identity": digest(trainer), "orchestrator_identity": digest(__file__),
         "affinity": affinity(args.cpus), "runtime_environment": runtime_environment(), "timeout_s_per_mode": args.timeout,
         "process_wall_scope": "entire_diagnostic_child_including_evaluation_export_excludes_python_hashes",
@@ -141,6 +146,8 @@ def train(args):
     for mode in modes:
         prefix = output / mode
         command = [str(trainer)] + flags(settings) + ["--mode", mode, "--output_prefix", str(prefix)]
+        if mode in ("lv", "lv-plus"):
+            command += flags({"training_rerank_factor": args.training_rerank_factor, "training_refine_breadth": args.training_refine_breadth})
         wall = execute(command, output / f"{mode}.log", args.timeout, args.cpus)
         record = record_from_log(output / f"{mode}.log")
         require(record["mode"] == mode and record["sample_count"] == count and record["base_count"] == args.base_count,
@@ -289,7 +296,10 @@ def main():
             p.add_argument("--insert-breadth", type=positive, default=64)
             p.add_argument("--training-breadth", type=positive, help="independent training assignment breadth (defaults to legacy insert-breadth)")
             p.add_argument("--init", choices=("sample", "random_partition"), default="sample")
-            p.add_argument("--modes", default="exact,hnsw", help="comma-separated exact,hnsw,ann-rebuild,ann-reuse,ann-reuse-seeded; omit exact for large-scale ANN-only runs")
+            p.add_argument("--modes", default="exact,hnsw", help="comma-separated exact,hnsw,ann-rebuild,ann-reuse,ann-reuse-seeded,ann-reuse-count,ann-reuse-seeded-count,lv,lv-plus")
+            p.add_argument("--training-rerank-factor", type=finite, default=3)
+            p.add_argument("--training-refine-breadth", type=positive, default=128)
+            p.add_argument("--routing-work-limit", type=positive, default=1000000000, help="per-setup refinement/PCA work allowance")
             p.add_argument("--max-sse-ratio", type=finite, help="optional HNSW/exact exact-evaluation SSE gate")
         else:
             p.add_argument("--work-dir", type=Path, required=True)

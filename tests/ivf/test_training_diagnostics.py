@@ -64,7 +64,9 @@ def main():
             ablation[ablation.index("--output") + 1] = root/(dtype+" reuse ablation")
             # No arbitrary quality threshold: these are measured ablations.
             del ablation[ablation.index("--max-sse-ratio"):ablation.index("--max-sse-ratio")+2]
-            ablation += ["--modes", "exact,ann-rebuild,ann-reuse,ann-reuse-seeded", "--init", "random_partition", "--training-breadth", 12]
+            ablation += ["--modes", "exact,ann-rebuild,ann-reuse,ann-reuse-seeded,ann-reuse-count,ann-reuse-seeded-count,lv,lv-plus",
+                "--init", "random_partition", "--training-breadth", 12,
+                "--training-rerank-factor", 2.25, "--training-refine-breadth", 16]
             run(ablation)
             measured = json.loads((Path(ablation[ablation.index("--output")+1])/"summary.json").read_text())
             assert measured["exact_trained_reference_available"] and measured["gates_passed"]
@@ -73,11 +75,17 @@ def main():
                 assert len(record["training_passes"]) == 3 and record["training_passes"][-1]["final_assignment"]
                 assert record["training_passes"][-1]["mean_time_s"] == 0
                 assert 0 <= record["evaluation_assignment_agreement"] <= 1
-                if mode.startswith("ann-reuse"):
+                if mode.startswith("ann-reuse") or mode in ("lv", "lv-plus"):
                     assert record["training_graph_builds"] == 1 and record["training_graph_refreshes"] == 2
                     assert record["training_reinserted_centroids"] == 6
-                if mode == "ann-reuse-seeded":
+                if mode in ("ann-reuse-seeded", "ann-reuse-seeded-count", "lv-plus"):
                     assert record["training_seeded_searches"] == 24 and record["training_seed_fallbacks"] == 12
+                if mode in ("lv", "lv-plus"):
+                    assert record["training_rerank_factor"] == 2.25 and record["training_refine_breadth"] == 16
+                    assert record["training_search_policy"] == "pca95_refit_each_pass_initial_refinement"
+                    assert all(p["candidate_count"] == 3 and p["pca_fit_projection_time_s"] > 0 for p in record["training_passes"])
+                if mode in ("ann-reuse-count", "ann-reuse-seeded-count"):
+                    assert record["training_candidate_rerank_distances"] == 0 and record["training_returned_candidates"] == 36
             ann_only = ablation.copy()
             ann_only[ann_only.index("--output")+1] = root/(dtype+" ann only")
             ann_only[ann_only.index("--modes")+1] = "ann-rebuild,ann-reuse,ann-reuse-seeded"

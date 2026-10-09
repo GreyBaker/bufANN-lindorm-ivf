@@ -83,12 +83,14 @@ int main(int argc,char** argv) {
             "--training_breadth","--router_mode","--optimized_modes","--router_degree","--construction_breadth",
             "--query_breadth","--insert_breadth","--router_seed","--refine_ef","--pca_variance",
             "--router_rerank_factor","--routing_work_limit","--profile_codes","--profile_repeats",
-            "--routing_repeats","--rerank_factor","--work_limit"});
+            "--routing_repeats","--rerank_factor","--work_limit","--min_sample_per_centroid",
+            "--training_rerank_factor","--training_refine_breadth"});
         if (args.help) {
             std::cout<<"Paper T1+T2 calibration: ivf_cost_model --data_file BASE_SOURCE --pq_prefix PREFIX\n"
                 "  --data_type float|int8|uint8 --dim N --base_count N --sample_count M\n"
                 "  --nlist_grid 1024,10000 --output_dir NEW_DIRECTORY [--synthetic_queries 100]\n"
                 "  [--topk 10 --target_recall .90 --profile_codes 100000 --work_limit 1000000000]\n"
+                "  [--min_sample_per_centroid 32] Declared project policy, not a paper requirement; minimum 1.\n"
                 "  No official query/GT arguments. Fetch/rerank excluded. Use benchmark/IVF/cost_model.py.\n";
             return 0;
         }
@@ -98,6 +100,8 @@ int main(int argc,char** argv) {
         const auto qcount=args.u32("--synthetic_queries",100), topk=args.u32("--topk",10);
         const auto profile_rows=args.u32("--profile_codes",100000), profile_repeats=args.u32("--profile_repeats",3);
         const auto routing_repeats=args.u32("--routing_repeats",3);
+        const auto minimum=args.u32("--min_sample_per_centroid",32);
+        check(minimum && minimum<=INT32_MAX, "Invalid declared sample adequacy minimum");
         const auto seed=args.integer("--seed"), work=args.integer("--work_limit",1000000000);
         const double recall=args.real("--target_recall",.90), memory=args.real("--memory_budget_gb",1);
         check(memory>0 && memory< double(UINT64_MAX)/(1024.0*1024*1024), "Invalid memory estimate budget");
@@ -112,13 +116,15 @@ int main(int argc,char** argv) {
         auto candidates=grid(args.require("--nlist_grid"));
         check(uint64_t(qcount)*candidates.size()<=16384, "Calibration query/candidate report exceeds bounded size");
         uint64_t evaluations=mul(m,qcount), centroid_work=0;
-        for (auto n:candidates) if (uint64_t(n)*32<=m) add(centroid_work,mul(n,qcount));
+        for (auto n:candidates) if (uint64_t(n)*minimum<=m) add(centroid_work,mul(n,qcount));
         add(evaluations,centroid_work);
         add(evaluations,mul(mul(profile_rows,uint64_t(profile_repeats)+1),qcount));
         check(evaluations<=work, "Calibration GT/radius/profile work exceeds declared allowance");
         uint64_t retained=mul(uint64_t(m)+qcount,uint64_t(dim)*4+8);
         add(retained,mul(uint64_t(qcount)*topk,4)); add(retained,mul(profile_rows,uint64_t(pivots.chunks)*2+4));
         add(retained,mul(uint64_t(qcount)*candidates.size(),128)); add(retained,65536);
+        add(retained,mul(candidates.size(),uint64_t(sizeof(Candidate)) +
+            mul(uint64_t(args.u32("--max_reps",15))+1,sizeof(TrainingPass)+sizeof(double))));
         add(retained,mul(dim,256ull*4*4)); // PQ centroid/transpose/LUT storage allowance.
         check(retained<budget && retained<=SIZE_MAX, "Calibration retained data exceeds memory allowance");
         const auto source_before=artifact_digest(path), pivot_before=artifact_digest(pq+"_pq_pivots.bin"),
@@ -150,6 +156,8 @@ int main(int argc,char** argv) {
         config.build_threads=args.u32("--build_threads",1); config.memory_budget_gb=double(budget-retained)/(1024.0*1024*1024);
         config.trainer_mode=parse_trainer_mode(args.get("--trainer_mode","ann-reuse-seeded"));
         config.init=parse_centroid_init(args.get("--init","random_partition")); config.training_breadth=args.u32("--training_breadth",64);
+        config.training_rerank_factor=args.real("--training_rerank_factor",3);
+        config.training_refine_breadth=args.u32("--training_refine_breadth",128);
         RouterOptions routing; routing.mode=parse_router_mode(args.get("--router_mode","hnswlib"));
         const auto optimized=args.u32("--optimized_modes",0); check(optimized<=1, "optimized_modes must be 0 or 1");
         routing.native_modes=optimized; routing.degree=args.u32("--router_degree",16);
@@ -160,8 +168,10 @@ int main(int argc,char** argv) {
         routing.native_work_limit=args.integer("--routing_work_limit",1000000000); routing.memory_budget_bytes=budget-retained;
         std::vector<Candidate> records; std::vector<CandidateCost> costs;
         for (const auto n:candidates) {
-            Candidate record; record.cost.nlist=n; record.eligible=uint64_t(n)*32<=m;
+            Candidate record; record.cost.nlist=n; record.eligible=uint64_t(n)*minimum<=m;
             if (!record.eligible) { records.push_back(std::move(record)); continue; }
+            if (uint64_t(n)*32>m) std::cerr<<"WARNING: nlist="<<n<<" has "<<double(m)/n
+                <<" sample rows per centroid, below the historical project minimum 32; not production qualified\n";
             config.nlist=n; config.validate();
             auto trained=train_centroids_ann((root/"sample.bin").string(),config,routing,{256,work,work});
             check(trained.sampled_ids.size()==m, "Calibration trainer omitted sample rows");
@@ -220,7 +230,9 @@ int main(int argc,char** argv) {
         const uint32_t chosen=costs.empty()?0:choose_nlist(costs);
         claim_artifact((root/"report.json").string()); std::ofstream out(root/"report.json"); out<<std::setprecision(17)<<std::boolalpha<<'{';
         bool first=true; auto emit=[&](const char* key,const auto& value) { bufann_bench::json_kv(out,first,key,value); };
-        emit("version",1); emit("kind","ivf_cost_model"); emit("completed",chosen!=0); emit("production_qualified",false);
+        emit("version",2); emit("kind","ivf_cost_model"); emit("completed",chosen!=0); emit("production_qualified",false);
+        emit("min_sample_per_centroid",minimum);
+        emit("candidate_eligibility_policy","declared_project_minimum_not_paper_requirement");
         emit("objective","mean_T1_plus_T2_excludes_fetch_and_exact_rerank"); emit("selection_source","cost_model");
         emit("data_type",data_type_name(dtype)); emit("dim",dim); emit("source_rows",shape.rows); emit("base_count",base);
         emit("sample_count",m); emit("synthetic_query_count",qcount); emit("topk",topk); emit("target_recall",recall); emit("seed",seed);
@@ -247,7 +259,9 @@ int main(int argc,char** argv) {
         for (size_t i=0;i<records.size();++i) {
             const auto& record=records[i]; out<<(i?",":"")<<'{'; bool f=true;
             bufann_bench::json_kv(out,f,"nlist",record.cost.nlist); bufann_bench::json_kv(out,f,"eligible",record.eligible);
-            if (!record.eligible) bufann_bench::json_kv(out,f,"drop_reason","sample_count_per_cluster_below_32");
+            bufann_bench::json_kv(out,f,"sample_rows_per_centroid",double(m)/record.cost.nlist);
+            bufann_bench::json_kv(out,f,"below_legacy_32_adequacy",uint64_t(record.cost.nlist)*32>m);
+            if (!record.eligible) bufann_bench::json_kv(out,f,"drop_reason",minimum==32 ? "sample_count_per_cluster_below_32" : "sample_count_per_cluster_below_declared_minimum");
             else {
                 bufann_bench::json_kv(out,f,"t1_us",record.cost.t1_us); bufann_bench::json_kv(out,f,"t2_us",record.cost.t2_us);
                 bufann_bench::json_kv(out,f,"total_us",record.cost.t1_us+record.cost.t2_us); ivf_cli::training_metrics(out,f,record.training);

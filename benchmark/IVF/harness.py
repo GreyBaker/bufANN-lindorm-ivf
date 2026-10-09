@@ -29,13 +29,13 @@ def bundle_suffixes(prefix, mutable=False):
             "missing/symlink/oversized IVF manifest")
     version = manifest.read_text().split(maxsplit=1)[0]
     family = "IVFMUTABLE" if mutable else "IVFINDEX"
-    require(version in (family + "1", family + "2") or (not mutable and version == "IVFINDEX3"),
+    require(version in (family + "1", family + "2") or (not mutable and version in ("IVFINDEX3", "IVFINDEX4")),
             "unsupported IVF bundle version")
     native = version.endswith("2")
-    if version == "IVFINDEX3":
+    if version in ("IVFINDEX3", "IVFINDEX4"):
         fields = [line.split() for line in manifest.read_text().splitlines() if line.startswith("optimized_modes ")]
         require(len(fields) == 1 and fields[0] in (["optimized_modes", "0"], ["optimized_modes", "1"]),
-                "invalid version-3 optimized-mode flag")
+                "invalid optimized-mode flag")
         native = fields[0][1] == "1"
     return (MUTABLE_SUFFIXES if mutable else SUFFIXES) + (NATIVE_SUFFIXES if native else ())
 
@@ -125,15 +125,33 @@ def read_cost_model_report(path):
         require(len(dict(pairs)) == len(pairs), "duplicate cost-model report field")
         return dict(pairs)
     record = json.loads(path.read_text(), object_pairs_hook=unique)
-    require(record.get("version") == 1 and record.get("kind") == "ivf_cost_model" and record.get("completed") is True,
+    require(record.get("version") in (1, 2) and record.get("kind") == "ivf_cost_model" and record.get("completed") is True,
             "incomplete/unsupported cost-model report")
     chosen = record.get("selected_nlist")
     require(type(chosen) is int and chosen > 0, "invalid model-selected nlist")
+    minimum = 32 if record["version"] == 1 else record.get("min_sample_per_centroid")
+    require(type(minimum) is int and 1 <= minimum <= 0x7fffffff, "invalid declared sample adequacy minimum")
+    if record["version"] == 2:
+        require(record.get("candidate_eligibility_policy") == "declared_project_minimum_not_paper_requirement",
+                "unsupported candidate eligibility policy")
+        mode = record.get("trainer_mode")
+        legacy_modes = ("exact", "ann-rebuild", "ann-reuse", "ann-reuse-seeded")
+        count_modes = ("ann-reuse-count", "ann-reuse-seeded-count")
+        require(mode in legacy_modes + count_modes + ("lv", "lv-plus"), "unsupported report trainer")
+        expected = ("pca95_refit_each_pass_initial_refinement" if mode in ("lv", "lv-plus") else
+                    "full_count_based" if mode in count_modes else "exact_full_assignment" if mode == "exact" else
+                    "legacy_full_breadth_rerank")
+        require(record.get("training_search_policy") == expected, "inconsistent training search policy")
+    require(type(record["sample_count"]) is int and record["sample_count"] > 0, "invalid calibration sample count")
+    for candidate in record["candidates"]:
+        n = candidate["nlist"]
+        require(type(n) is int and 0 < n <= 0x7fffffff and type(candidate["eligible"]) is bool and
+                candidate["eligible"] == (n * minimum <= record["sample_count"]), "incorrect candidate eligibility")
     candidates = [candidate for candidate in record["candidates"] if candidate["eligible"]]
     require(candidates and len({c["nlist"] for c in record["candidates"]}) == len(record["candidates"]),
             "empty/duplicate cost-model candidates")
     for candidate in candidates:
-        require(candidate["nlist"] * 32 <= record["sample_count"], "ineligible model candidate")
+        require(candidate["nlist"] * minimum <= record["sample_count"], "ineligible model candidate")
         a, b = candidate["t1_us"], candidate["t2_us"]
         require(math.isfinite(a) and math.isfinite(b) and a >= 0 and b >= 0 and
                 candidate["total_us"] == a + b, "invalid cost-model candidate estimate")
@@ -164,10 +182,16 @@ def nlist_selection(args, settings, sources):
         observed = record[aliases.get(key, key)]
         same = settings[key] == str(observed) if isinstance(observed, str) else float(settings[key]) == observed
         require(same, "cost-model/build setting mismatch: " + key)
-    return {"source": "cost_model", "nlist": record["selected_nlist"], "report_path": str(Path(path).resolve()),
+    for key, default in (("training_rerank_factor", 3), ("training_refine_breadth", 128)):
+        require(float(settings.get(key, default)) == record.get(key, default), "cost-model/build setting mismatch: " + key)
+    selection = {"source": "cost_model", "nlist": record["selected_nlist"], "report_path": str(Path(path).resolve()),
             "report_identity": digest(path), "objective": record["objective"],
             "topk": record["topk"], "target_recall": record["target_recall"], "rerank_factor": record["rerank_factor"],
-            "validation_completed": record.get("validation_completed", False), "production_qualified": False}
+             "validation_completed": record.get("validation_completed", False), "production_qualified": False}
+    if record["version"] == 2:
+        selection.update(min_sample_per_centroid=record["min_sample_per_centroid"],
+                         candidate_eligibility_policy=record["candidate_eligibility_policy"])
+    return selection
 
 
 def prepared_selection(prepared):
@@ -188,6 +212,11 @@ def build_settings():
     defaults.update(optimized_modes="0", refine_ef="128", pca_variance="0.95", routing_work_limit="1000000000")
     defaults.update(trainer_mode="ann-reuse-seeded", init="random_partition", training_breadth="64")
     result = {key: os.environ.get("IVF_" + key.upper(), value) for key, value in defaults.items()}
+    # Preserve legacy cache keys unless the new trainer/settings are requested.
+    for key, default in (("training_rerank_factor", "3"), ("training_refine_breadth", "128")):
+        value = os.environ.get("IVF_" + key.upper())
+        if result["trainer_mode"] in ("lv", "lv-plus") or value is not None:
+            result[key] = default if value is None else value
     # Query-only mode/factor overrides do not alter the build/cache identity.
     result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "hnswlib")
     result["router_rerank_factor"] = os.environ.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")

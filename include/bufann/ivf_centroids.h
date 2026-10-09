@@ -16,6 +16,14 @@ struct TrainerLimits {
 struct TrainingPass {
     double graph_seconds = 0, assignment_seconds = 0, mean_seconds = 0;
     double assigned_sse = 0;
+    // Setup subsets of graph_seconds; worker times are summed, not wall times.
+    double refinement_seconds = 0, pca_seconds = 0;
+    double projection_worker_seconds = 0, traversal_worker_seconds = 0, rerank_worker_seconds = 0;
+    uint64_t returned_candidates = 0, candidate_rerank_distances = 0;
+    uint32_t requested_breadth = 0, effective_breadth = 0, candidate_count = 0;
+    uint32_t projected_dim = 0, initially_refined_nodes = 0, isolated_reinsertions = 0;
+    uint32_t bottom_unreachable = 0, zero_indegree = 0;
+    double retained_variance = 1;
 };
 struct TrainingStats {
     std::vector<double> objective_history; // Sample SSE before each mean update.
@@ -28,6 +36,8 @@ struct TrainingStats {
     uint64_t assignment_index_refreshes = 0, reinserted_centroids = 0;
     uint64_t seeded_searches = 0, seed_fallbacks = 0;
     uint64_t graph_distance_evaluations = 0; // Assignment traversal only, not graph construction/update.
+    uint64_t returned_candidates = 0, candidate_rerank_distances = 0;
+    uint64_t objective_distance_evaluations = 0; // Separate from candidate reranking.
     uint32_t final_unreachable = 0, empty_sample_clusters = 0, largest_sample_cluster = 0;
     // Exact mode includes all distance evaluations. HNSW mode leaves this
     // unavailable rather than misreporting searches as distance evaluations.

@@ -81,7 +81,9 @@ std::vector<PatchedGraphHit> PatchedCentroidGraph::search(std::span<const float>
     return result;
 }
 void PatchedCentroidGraph::refresh(std::span<const float> vectors) {
-    check(!impl_->projection && vectors.size() == uint64_t(count_)*dim_, "Invalid training coordinate refresh");
+    // Quiescent refresh always maintains links using the full-coordinate space;
+    // projected traversal is only used by search(), never construction/reinsertion.
+    check(vectors.size() == uint64_t(count_)*dim_, "Invalid training coordinate refresh");
     for (float value : vectors) check(std::isfinite(value), "Nonfinite training centroid");
     auto& g = *impl_->graph;
     // This allowance is separately included in the trainer's preflight estimate.

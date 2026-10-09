@@ -462,6 +462,103 @@ CentroidTraining train_centroids_hnsw(const std::string& path, const BuildConfig
     return detail::train_centroids_impl(path, config, limits, &factory, workspace);
 }
 
+std::unique_ptr<detail::AssignmentIndex> detail::make_reusable_assignment(std::span<const float> centroids,
+    const BuildConfig& config, const RouterOptions& options) {
+    config.validate();
+    check(trainer_reuses_graph(config.trainer_mode) && centroids.size() == uint64_t(config.nlist)*config.dim,
+          "Invalid reusable training index shape/mode");
+    validate_values(centroids, config.dim);
+    struct ReusableAssignment final : detail::AssignmentIndex {
+        std::unique_ptr<PatchedCentroidGraph> graph;
+        uint32_t breadth, count, dimension;
+        std::span<const float> coordinates;
+        BuildConfig config;
+        RouterOptions options;
+        std::unique_ptr<CentroidPCA> pca;
+        TrainingPass phase;
+        ReusableAssignment(uint32_t dim, std::span<const float> centroids, const RouterOptions& opts, const BuildConfig& cfg)
+            : graph(PatchedCentroidGraph::build(dim, centroids,
+                {opts.degree, opts.construction_breadth, opts.seed, opts.memory_budget_bytes, opts.native_work_limit})),
+              breadth(cfg.training_breadth), count(uint32_t(centroids.size()/dim)), dimension(dim), coordinates(centroids), config(cfg), options(opts) {
+            if (trainer_optimized_search(config.trainer_mode)) {
+                const auto start = std::chrono::steady_clock::now();
+                graph->refine(config.training_refine_breadth);
+                phase.refinement_seconds = seconds(start);
+                phase.initially_refined_nodes = graph->diagnostics().refined_nodes;
+                phase.isolated_reinsertions = graph->diagnostics().reinserted_nodes;
+                fit_projection();
+            }
+        }
+        static double seconds(std::chrono::steady_clock::time_point start) {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+        }
+        void fit_projection() {
+            const auto start = std::chrono::steady_clock::now();
+            pca.reset(); // Never overlap two solver/projection workspaces.
+            pca = std::make_unique<CentroidPCA>(CentroidPCA::fit(dimension, coordinates, .95, options.memory_budget_bytes, options.native_work_limit));
+            validate_values(pca->projected(), pca->retained_dim());
+            graph->configure_projection(pca->retained_dim());
+            phase.pca_seconds = seconds(start);
+        }
+        void describe_pass(TrainingPass& pass) const override {
+            pass.refinement_seconds = phase.refinement_seconds; pass.pca_seconds = phase.pca_seconds;
+            pass.initially_refined_nodes = phase.initially_refined_nodes; pass.isolated_reinsertions = phase.isolated_reinsertions;
+            pass.requested_breadth = breadth;
+            pass.candidate_count = pca ? uint32_t(std::min<long double>(count, std::ceil(config.training_rerank_factor))) :
+                trainer_count_candidates(config.trainer_mode) ? 1 : std::min(count, breadth);
+            pass.effective_breadth = std::min(count, std::max(breadth, pass.candidate_count));
+            pass.projected_dim = pca ? pca->retained_dim() : dimension;
+            pass.retained_variance = pca ? pca->retained_variance() : 1;
+            pass.bottom_unreachable = graph->diagnostics().unreachable_after;
+            pass.zero_indegree = graph->diagnostics().zero_indegree;
+        }
+        uint32_t assign(std::span<const float> vector, uint32_t previous, uint64_t& work) const override {
+            detail::AssignmentMeasurements measured;
+            const auto result = assign_measured(vector, previous, measured); work += measured.graph_work; return result;
+        }
+        uint32_t assign_measured(std::span<const float> vector, uint32_t previous, detail::AssignmentMeasurements& m) const override {
+            const auto entries = trainer_seeds_assignment(config.trainer_mode) && previous < count ?
+                std::span<const uint32_t>(&previous, 1) : std::span<const uint32_t>();
+            const bool counted = trainer_count_candidates(config.trainer_mode);
+            if (counted) validate_values(vector, dimension);
+            const uint32_t candidates = pca ? uint32_t(std::min<long double>(count, std::ceil(config.training_rerank_factor))) :
+                counted ? 1 : std::min(count, breadth);
+            std::vector<float> projected;
+            auto start = std::chrono::steady_clock::now();
+            if (pca) { projected = pca->project(vector); validate_values(projected, pca->retained_dim()); m.projection_seconds += seconds(start); }
+            start = std::chrono::steady_clock::now();
+            uint64_t distances = 0;
+            auto hits = graph->search(pca ? std::span<const float>(projected) : vector, candidates, std::max(breadth, candidates), entries,
+                pca ? pca->projected() : std::span<const float>{}, pca ? pca->retained_dim() : 0, &distances, trainer_seeds_assignment(config.trainer_mode));
+            m.traversal_seconds += seconds(start); m.graph_work += distances; m.returned_candidates += hits.size();
+            check(!hits.empty(), "Training ANN returned no centroid");
+            // Count-based full traversal returns nearest-one in float; its double
+            // objective distance is computed separately by the shared trainer.
+            if (counted && !pca) return hits.front().id;
+            start = std::chrono::steady_clock::now();
+            // Preserve breadth-sized double rescoring for the legacy controls.
+            double best = std::numeric_limits<double>::infinity(); uint32_t label = UINT32_MAX;
+            for (auto hit : hits) {
+                double distance = 0;
+                for (uint32_t d = 0; d < dimension; ++d) {
+                    const double delta = double(vector[d])-coordinates[size_t(hit.id)*dimension+d];
+                    distance += delta*delta;
+                }
+                if (distance < best || (distance == best && hit.id < label)) { best = distance; label = hit.id; }
+            }
+            m.rerank_distances += hits.size(); m.rerank_seconds += seconds(start);
+            check(label < count, "Training ANN returned no centroid"); return label;
+        }
+        void refresh(std::span<const float> centroids) override {
+            validate_values(centroids, dimension);
+            phase = {}; graph->refresh(centroids); coordinates = centroids;
+            if (pca) fit_projection(); // Joined boundary, including final assignment.
+        }
+        uint32_t unreachable() const override { return graph->diagnostics().unreachable_after; }
+    };
+    return std::make_unique<ReusableAssignment>(config.dim, centroids, options, config);
+}
+
 CentroidTraining train_centroids_ann(const std::string& path, const BuildConfig& config,
                                     const RouterOptions& options, const TrainerLimits& limits) {
     config.validate();
@@ -474,42 +571,23 @@ CentroidTraining train_centroids_ann(const std::string& path, const BuildConfig&
     uint64_t workspace = CentroidRouter::estimate_build_bytes(config.dim, config.nlist, training_options);
     const uint64_t snapshot = uint64_t(config.nlist) * (uint64_t(options.degree)*16 + 256);
     const uint64_t workers = std::min(config.training_count(), config.build_threads);
-    const uint64_t per_worker = 2ull*config.nlist + 64ull*std::min(config.nlist, config.training_breadth) + 4096;
+    const bool optimized = trainer_optimized_search(config.trainer_mode);
+    const uint32_t returned = optimized ? uint32_t(std::min<long double>(config.nlist, std::ceil(config.training_rerank_factor))) :
+        trainer_count_candidates(config.trainer_mode) ? 1 : std::min(config.nlist, config.training_breadth);
+    const uint64_t per_worker = 2ull*config.nlist + 64ull*std::min(config.nlist, std::max(config.training_breadth, returned)) +
+        uint64_t(config.dim)*sizeof(float) + 4096;
     check(snapshot <= UINT64_MAX-workspace, "Training snapshot estimate overflow"); workspace += snapshot;
+    if (optimized) {
+        const uint64_t pca = CentroidPCA::estimate_bytes(config.dim, config.nlist);
+        const uint64_t refinement_scratch = 64ull*std::min<uint64_t>(config.nlist, uint64_t(config.training_refine_breadth)+1);
+        check(pca <= UINT64_MAX-workspace, "Training PCA estimate overflow"); workspace += pca;
+        check(refinement_scratch <= UINT64_MAX-workspace, "Training refinement estimate overflow"); workspace += refinement_scratch;
+    }
     check(workers <= (UINT64_MAX-workspace)/per_worker, "Training worker estimate overflow"); workspace += workers*per_worker;
-    struct ReusableAssignment final : detail::AssignmentIndex {
-        std::unique_ptr<PatchedCentroidGraph> graph;
-        uint32_t breadth, count, dimension;
-        std::span<const float> coordinates;
-        ReusableAssignment(uint32_t dim, std::span<const float> centroids, const RouterOptions& options, uint32_t ef)
-            : graph(PatchedCentroidGraph::build(dim, centroids,
-                {options.degree, options.construction_breadth, options.seed, options.memory_budget_bytes, options.native_work_limit})),
-              breadth(ef), count(uint32_t(centroids.size()/dim)), dimension(dim), coordinates(centroids) {}
-        uint32_t assign(std::span<const float> vector, uint32_t previous, uint64_t& work) const override {
-            const auto entries = previous < count ? std::span<const uint32_t>(&previous, 1) : std::span<const uint32_t>();
-            uint64_t distances = 0;
-            auto hits = graph->search(vector, std::min(count, breadth), breadth, entries, {}, 0, &distances, true);
-            work += distances;
-            // Same oversampling/double rescoring as the unchanged rebuilt
-            // control. Do not count omitted rescoring as graph-reuse speedup.
-            double best = std::numeric_limits<double>::infinity(); uint32_t label = UINT32_MAX;
-            for (auto hit : hits) {
-                double distance = 0;
-                for (uint32_t d = 0; d < dimension; ++d) {
-                    const double delta = double(vector[d])-coordinates[size_t(hit.id)*dimension+d];
-                    distance += delta*delta;
-                }
-                if (distance < best || (distance == best && hit.id < label)) { best = distance; label = hit.id; }
-            }
-            check(label < count, "Training ANN returned no centroid"); return label;
-        }
-        void refresh(std::span<const float> centroids) override { graph->refresh(centroids); coordinates = centroids; }
-        uint32_t unreachable() const override { return graph->diagnostics().unreachable_after; }
-    };
     const detail::AssignmentFactory factory = [&](std::span<const float> centroids) {
-        return std::make_unique<ReusableAssignment>(config.dim, centroids, training_options, config.training_breadth);
+        return detail::make_reusable_assignment(centroids, config, training_options);
     };
     return detail::train_centroids_impl(path, config, limits, &factory, workspace, true,
-        config.trainer_mode == TrainerMode::AnnReuseSeeded);
+        trainer_seeds_assignment(config.trainer_mode));
 }
 } // namespace diskann::ivf

@@ -11,7 +11,11 @@ TrainerMode parse_trainer_mode(const std::string& name) {
     if (name == "ann-rebuild") return TrainerMode::AnnRebuild;
     if (name == "ann-reuse") return TrainerMode::AnnReuse;
     if (name == "ann-reuse-seeded") return TrainerMode::AnnReuseSeeded;
-    throw std::invalid_argument("trainer_mode must be exact, ann-rebuild, ann-reuse, or ann-reuse-seeded");
+    if (name == "ann-reuse-count") return TrainerMode::AnnReuseCount;
+    if (name == "ann-reuse-seeded-count") return TrainerMode::AnnReuseSeededCount;
+    if (name == "lv") return TrainerMode::LV;
+    if (name == "lv-plus") return TrainerMode::LVPlus;
+    throw std::invalid_argument("Unknown centroid trainer mode");
 }
 const char* trainer_mode_name(TrainerMode mode) {
     switch (mode) {
@@ -19,8 +23,22 @@ const char* trainer_mode_name(TrainerMode mode) {
         case TrainerMode::AnnRebuild: return "ann-rebuild";
         case TrainerMode::AnnReuse: return "ann-reuse";
         case TrainerMode::AnnReuseSeeded: return "ann-reuse-seeded";
+        case TrainerMode::AnnReuseCount: return "ann-reuse-count";
+        case TrainerMode::AnnReuseSeededCount: return "ann-reuse-seeded-count";
+        case TrainerMode::LV: return "lv";
+        case TrainerMode::LVPlus: return "lv-plus";
     }
     throw std::invalid_argument("Invalid centroid trainer mode");
+}
+bool trainer_reuses_graph(TrainerMode mode) {
+    return mode != TrainerMode::Exact && mode != TrainerMode::AnnRebuild;
+}
+bool trainer_seeds_assignment(TrainerMode mode) {
+    return mode == TrainerMode::AnnReuseSeeded || mode == TrainerMode::AnnReuseSeededCount || mode == TrainerMode::LVPlus;
+}
+bool trainer_optimized_search(TrainerMode mode) { return mode == TrainerMode::LV || mode == TrainerMode::LVPlus; }
+bool trainer_count_candidates(TrainerMode mode) {
+    return trainer_optimized_search(mode) || mode == TrainerMode::AnnReuseCount || mode == TrainerMode::AnnReuseSeededCount;
 }
 CentroidInit parse_centroid_init(const std::string& name) {
     if (name == "sample") return CentroidInit::Sample;
@@ -72,6 +90,13 @@ void BuildConfig::validate() const {
     trainer_mode_name(trainer_mode); centroid_init_name(init);
     if (!training_breadth || training_breadth > INT32_MAX)
         throw std::invalid_argument("training_breadth must be in [1, INT32_MAX]");
+    if (!std::isfinite(training_rerank_factor) || training_rerank_factor < 1 ||
+        !training_refine_breadth || training_refine_breadth > INT32_MAX)
+        throw std::invalid_argument("Invalid training rerank/refinement settings");
+    if (!trainer_optimized_search(trainer_mode) && (training_rerank_factor != 3 || training_refine_breadth != 128))
+        throw std::invalid_argument("Training rerank/refinement overrides require lv or lv-plus");
+    if (trainer_optimized_search(trainer_mode) && init != CentroidInit::RandomPartition)
+        throw std::invalid_argument("Paper-aligned LV/LV+ requires random_partition initialization");
     if (dim == 0 || base_count == 0 || nlist == 0) {
         throw std::invalid_argument("dim, base_count, and nlist must be positive");
     }

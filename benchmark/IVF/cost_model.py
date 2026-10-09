@@ -27,7 +27,8 @@ def main():
         "router_degree": "16", "construction_breadth": "200", "query_breadth": "128", "insert_breadth": "64",
         "router_seed": "100", "refine_ef": "128", "pca_variance": ".95", "router_rerank_factor": "3",
         "routing_work_limit": "1000000000", "profile_codes": "100000", "profile_repeats": "3",
-        "routing_repeats": "3", "rerank_factor": "4", "work_limit": "1000000000"}
+        "routing_repeats": "3", "rerank_factor": "4", "work_limit": "1000000000",
+        "min_sample_per_centroid": "32", "training_rerank_factor": "3", "training_refine_breadth": "128"}
     for key, value in defaults.items():
         parser.add_argument("--" + key.replace("_", "-"), default=value, required=value is None)
     args = parser.parse_args()

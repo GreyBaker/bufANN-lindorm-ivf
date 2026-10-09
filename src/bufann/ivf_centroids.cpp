@@ -94,6 +94,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
         check(*result.distance_evaluations <= limits.max_distance_evaluations,
               "Exact centroid assignment exceeds declared work limit");
     }
+    result.objective_distance_evaluations = factory ? result.assignment_searches : *result.distance_evaluations;
     // Samples, IDs, permutation, assignments, distances; centroids, next means,
     // double sums and occupancy; row buffer, objective history, worker stacks.
     add(result.estimated_bytes, mul(sample_cells, sizeof(float)));
@@ -167,15 +168,18 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
             }
         }
         check(!factory || bool(index), "Assignment factory returned no index");
+        if (index) index->describe_pass(pass);
         pass.graph_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - phase).count();
         phase = std::chrono::steady_clock::now();
         std::atomic<uint64_t> cursor{0};
         std::atomic<uint64_t> graph_work{0}, seed_count{0}, fallback_count{0};
+        std::vector<AssignmentMeasurements> measurements(workers);
         std::exception_ptr error;
         std::mutex error_mutex;
-        auto work = [&] {
+        auto work = [&](uint32_t worker) {
             try {
-                uint64_t local_work = 0, local_seeded = 0, local_fallback = 0;
+                auto& measured = measurements[worker];
+                uint64_t local_seeded = 0, local_fallback = 0;
                 for (;;) {
                     const uint64_t begin = cursor.fetch_add(limits.block_rows);
                     if (begin >= count) break;
@@ -186,7 +190,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
                         if (index) {
                             const uint32_t previous = seeded ? assignment[r] : UINT32_MAX;
                             if (seeded) { if (previous < config.nlist) ++local_seeded; else ++local_fallback; }
-                            label = index->assign(std::span<const float>(samples).subspan(r * config.dim, config.dim), previous, local_work);
+                            label = index->assign_measured(std::span<const float>(samples).subspan(r * config.dim, config.dim), previous, measured);
                             check(label < config.nlist, "Assignment index returned an invalid centroid ID");
                         }
                         const uint32_t first = index ? label : 0;
@@ -204,7 +208,7 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
                         distances[r] = best;
                     }
                 }
-                graph_work.fetch_add(local_work); seed_count.fetch_add(local_seeded); fallback_count.fetch_add(local_fallback);
+                graph_work.fetch_add(measured.graph_work); seed_count.fetch_add(local_seeded); fallback_count.fetch_add(local_fallback);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 if (!error) error = std::current_exception();
@@ -213,12 +217,18 @@ CentroidTraining detail::train_centroids_impl(const std::string& path, const Bui
         };
         {
             std::vector<std::jthread> threads;
-            for (uint32_t w = 1; w < workers; ++w) threads.emplace_back(work);
-            work(); // Destruction joins before error/result inspection.
+            for (uint32_t w = 1; w < workers; ++w) threads.emplace_back(work, w);
+            work(0); // Destruction joins before error/result inspection.
         }
         if (error) std::rethrow_exception(error);
         pass.assignment_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - phase).count();
         result.graph_distance_evaluations += graph_work.load();
+        for (const auto& m : measurements) {
+            pass.returned_candidates += m.returned_candidates; pass.candidate_rerank_distances += m.rerank_distances;
+            pass.projection_worker_seconds += m.projection_seconds;
+            pass.traversal_worker_seconds += m.traversal_seconds; pass.rerank_worker_seconds += m.rerank_seconds;
+        }
+        result.returned_candidates += pass.returned_candidates; result.candidate_rerank_distances += pass.candidate_rerank_distances;
         result.seeded_searches += seed_count.load(); result.seed_fallbacks += fallback_count.load();
     };
     for (uint32_t iteration = 0; iteration < config.max_reps; ++iteration) {
