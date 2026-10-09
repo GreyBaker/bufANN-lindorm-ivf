@@ -14,7 +14,9 @@ int main(int argc, char** argv) {
             "--index_prefix", "--pq_prefix", "--base_count", "--nlist", "--sample_rate",
             "--max_reps", "--seed", "--build_threads", "--memory_budget_gb",
             "--id_capacity", "--page_size", "--buffer_frames", "--router_degree",
-            "--construction_breadth", "--query_breadth", "--insert_breadth", "--router_seed", "--result_file"});
+            "--construction_breadth", "--query_breadth", "--insert_breadth", "--router_seed", "--result_file",
+            "--optimized_modes", "--router_mode", "--refine_ef", "--pca_variance",
+            "--router_rerank_factor", "--routing_work_limit"});
         if (args.help) {
             std::cout << "IVF build (--validate_inputs 1: validation only; 0: native execution in full routing-enabled builds).\n"
                 "Usage: ivf_build --validate_inputs 0|1 --data_type float|int8|uint8\n"
@@ -24,6 +26,11 @@ int main(int argc, char** argv) {
                 "Execution settings: [--id_capacity N] [--page_size N] [--buffer_frames N]\n"
                 "  [--router_degree N] [--construction_breadth N] [--query_breadth N]\n"
                 "  [--insert_breadth N] [--router_seed N] [--result_file JSON_PATH]\n";
+            std::cout << "Optimized routing: --optimized_modes 1 builds the patched hnswlib/PCA ablations.\n"
+                "  [--router_mode hnswlib|exact|patched-full|refined|pca|pca-refined]\n"
+                "  --router_mode is the frozen base/insert assignment default, not a query-only ablation.\n"
+                "  [--refine_ef N] [--pca_variance F]\n"
+                "  [--router_rerank_factor F] [--routing_work_limit N] (PCA/refinement work allowance)\n";
             return 0;
         }
         const bool validation = args.validation_mode();
@@ -54,6 +61,8 @@ int main(int argc, char** argv) {
 #ifdef IVF_NATIVE_EXECUTION
         if (!validation) { ivf_cli::execute_build(args, config, vectors, pq); return 0; }
 #endif
+        args.reject_present({"--optimized_modes", "--router_mode", "--refine_ef", "--pca_variance",
+                             "--router_rerank_factor", "--routing_work_limit"}, "routing execution-only setting");
         ivf_cli::validation_record("build", data_type_name(config.data_type), config.dim, config.base_count, pq.chunks);
         return 0;
 #ifdef IVF_NATIVE_EXECUTION

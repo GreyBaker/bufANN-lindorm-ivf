@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Synthetic persisted-router diagnostics, all dtypes/modes; no production inputs."""
+import argparse
+import json
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--fixtures", required=True)
+    p.add_argument("--diagnostic", required=True)
+    p.add_argument("--scratch", type=Path, required=True)
+    args = p.parse_args()
+    args.scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="router_diagnostics_", dir=args.scratch) as tmp:
+        root = Path(tmp)
+        fixtures = root / "fixtures"
+        result = subprocess.run([args.fixtures, str(fixtures)], text=True, capture_output=True, timeout=180)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        # The graph family is shared across the ablation: no centroid rebuild,
+        # PCA refit or list/assignment change is allowed by this diagnostic.
+        prefix = fixtures / "router_0"
+        original = {f: f.read_bytes() for f in fixtures.glob("router_0.*")}
+        for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
+            query = root / (dtype + ".bin")
+            offset = 200 if dtype == "uint8" else -20
+            query.write_bytes(struct.pack("<II", 4, 13) + struct.pack("<" + fmt*52, *(offset + (i%11) for i in range(52))))
+            command = [args.diagnostic, "--index_prefix", str(prefix), "--query_file", str(query), "--data_type", dtype,
+                "--nprobe", "10", "--query_threads", "2", "--evaluation_work_limit", "3072", "--router_breadth", "128"]
+            for mode in ("exact", "hnswlib", "patched-full", "refined", "pca", "pca-refined"):
+                path = root / (dtype + "_" + mode + ".json")
+                cmd = command + ["--router_mode", mode, "--result_file", str(path)]
+                completed = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+                assert completed.returncode == 0, (completed.stdout, completed.stderr)
+                record = json.loads(path.read_text())
+                assert record == json.loads(completed.stdout) and record["router_mode"] == mode
+                assert record["query_rows"] == 4 and 0 <= record["centroid_recall_fraction"] <= 1
+                assert not record["production_qualified"] and record["router_qps"] > 0
+                assert 0 <= record["assignment_agreement_fraction"] <= 1
+                assert record["distance_counted_queries"] == (0 if mode == "hnswlib" else 4)
+                if mode == "exact":
+                    assert record["centroid_recall_fraction"] == 1 and record["distance_evaluations"] == 3072
+                repeated = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
+                assert repeated.returncode != 0 and "exists" in repeated.stderr
+            for extra in (["--memory_budget_gb", "0.001"], ["--query_rows", "0"], ["--router_mode", "unknown"],
+                          ["--router_rerank_factor", "0.5"], ["--router_rerank_factor", "nan"]):
+                refused = subprocess.run(command + extra, text=True, capture_output=True, timeout=90)
+                assert refused.returncode != 0 and "ERROR:" in refused.stderr, (refused.stdout, refused.stderr)
+            bad = command.copy()
+            bad[bad.index("--evaluation_work_limit") + 1] = "3071"
+            assert subprocess.run(bad, capture_output=True, timeout=90).returncode != 0
+        assert all(path.read_bytes() == raw for path, raw in original.items())
+    print("Persisted native-router diagnostic modes/typed inputs/identity/work/output fixtures passed")
+
+
+if __name__ == "__main__":
+    main()

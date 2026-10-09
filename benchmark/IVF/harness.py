@@ -18,7 +18,24 @@ import sys
 SUFFIXES = (".centroids.bin", ".hnsw", ".router", ".lists", ".heap", ".heap.meta",
             ".heap.meta.ivf", ".pq.bin", ".manifest")
 MUTABLE_SUFFIXES = (".centroids.bin", ".hnsw", ".router", ".mlists", ".heap", ".heap.meta",
-                    ".heap.meta.ivf", ".pq.bin", ".heap.state", ".origin", ".manifest")
+                     ".heap.meta.ivf", ".pq.bin", ".heap.state", ".origin", ".manifest")
+NATIVE_SUFFIXES = (".patched.hnsw", ".refined.hnsw", ".pca")
+
+
+def bundle_suffixes(prefix, mutable=False):
+    manifest = Path(str(prefix) + ".manifest")
+    require(manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 16384,
+            "missing/symlink/oversized IVF manifest")
+    version = manifest.read_text().split(maxsplit=1)[0]
+    family = "IVFMUTABLE" if mutable else "IVFINDEX"
+    require(version in (family + "1", family + "2"), "unsupported IVF bundle version")
+    return (MUTABLE_SUFFIXES if mutable else SUFFIXES) + (NATIVE_SUFFIXES if version.endswith("2") else ())
+
+
+def query_router_flags():
+    return [part for key in ("router_mode", "router_rerank_factor", "router_breadth")
+            if (value := os.environ.get("IVF_" + key.upper())) is not None
+            for part in ("--" + key, value)]
 
 
 def mutation_identity(args, work):
@@ -99,8 +116,12 @@ def profile(args):
 def build_settings():
     defaults = {"nlist": None, "sample_rate": "1", "max_reps": "15", "seed": "0", "build_threads": "1",
                 "memory_budget_gb": "1", "page_size": "4096", "buffer_frames": "64", "router_degree": "16",
-                "construction_breadth": "200", "query_breadth": "128", "insert_breadth": "64", "router_seed": "100"}
+                 "construction_breadth": "200", "query_breadth": "128", "insert_breadth": "64", "router_seed": "100"}
+    defaults.update(optimized_modes="0", refine_ef="128", pca_variance="0.95", routing_work_limit="1000000000")
     result = {key: os.environ.get("IVF_" + key.upper(), value) for key, value in defaults.items()}
+    # Query-only mode/factor overrides do not alter the build/cache identity.
+    result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "hnswlib")
+    result["router_rerank_factor"] = os.environ.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
     require(result["nlist"] is not None, "set IVF_NLIST explicitly")
     return result
 
@@ -124,7 +145,7 @@ def command_log(command, path):
 def component_digests(directory, dataset):
     require(directory.is_dir() and not directory.is_symlink(), f"bundle directory must be real: {directory}")
     result = {}
-    for suffix in SUFFIXES:
+    for suffix in bundle_suffixes(directory / dataset):
         name = dataset + suffix
         path = directory / name
         require(path.is_file() and not path.is_symlink(), f"bundle must contain real files: {path}")
@@ -162,7 +183,7 @@ def prepare(args):
         metadata = read_json(cache / "cache.json")
         require(metadata["identity"] == identity, "IVF cache identity mismatch")
         require(component_digests(cache / "index", args.dataset) == metadata["components"], "IVF cache integrity mismatch")
-        for suffix in SUFFIXES:
+        for suffix in bundle_suffixes(cache / "index" / args.dataset):
             shutil.copyfile(cache / "index" / (args.dataset + suffix), Path(str(prefix) + suffix))
         require(component_digests(index, args.dataset) == metadata["components"], "IVF restore integrity mismatch")
         print(f"IVF cache restored: {key} (real copies, not fresh build metrics)")
@@ -179,7 +200,7 @@ def prepare(args):
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.mkdir()
             (cache / "index").mkdir()
-            for suffix in SUFFIXES:
+            for suffix in bundle_suffixes(prefix):
                 shutil.copyfile(Path(str(prefix) + suffix), cache / "index" / (args.dataset + suffix))
             require(component_digests(cache / "index", args.dataset) == components, "IVF cache copy integrity mismatch")
             write_json(cache / "cache.json", {"identity": identity, "components": components}) # last; not atomic/fsync
@@ -207,7 +228,7 @@ def run(args):
     prefix = work / "index" / args.dataset
     require((work / "index").is_dir() and not (work / "index").is_symlink(), "working index directory must not symlink into cache")
     require(digest(Path(str(prefix) + ".manifest")) == prepared["manifest_identity"], "manifest changed since prepare")
-    for suffix in SUFFIXES:
+    for suffix in bundle_suffixes(prefix):
         require(not Path(str(prefix) + suffix).is_symlink(), "working bundle must not symlink into cache")
     output = args.output_dir.resolve()
     require(output == work or work in output.parents, "run output must stay under prepared work tree")
@@ -237,7 +258,7 @@ def run(args):
                 "mutation execution count/live set mismatch")
         require(mutation_identity(args, work) == mutation, "source/update IDs changed during mutation")
         require(all(Path(str(saved) + suffix).is_file() and not Path(str(saved) + suffix).is_symlink()
-                    for suffix in MUTABLE_SUFFIXES), "missing mutable checkpoint family")
+                    for suffix in bundle_suffixes(saved, mutable=True)), "missing mutable checkpoint family")
         prefix = saved
     command = [os.environ["IVF_DRIVER_BIN"], "--validate_inputs", "0", "--data_type", args.dtype,
         "--metric", args.metric, "--dim", str(args.dim), "--nlist", prepared["settings"]["nlist"],
@@ -250,6 +271,7 @@ def run(args):
         "--result_file", str(output / "native_result.json"), "--search_result_file", str(output / "neighbors.bin")]
     if mutation is not None:
         command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
+    command += query_router_flags()
     command_log(command, output / "run.log")
     record = read_json(output / "native_result.json")
     require(record["baseline"] == "IVF" and record["phase"] == "query" and record["workload"] == "query" and "recall" in record,

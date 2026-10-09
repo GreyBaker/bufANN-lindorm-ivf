@@ -45,8 +45,10 @@ uint64_t estimate_query_workspace(const CentroidRouter& router, const PostingLis
     add_product(bytes, config.nprobe, 32);
     add_product(bytes, router.dim(), sizeof(T) + sizeof(float));
     add_product(bytes, router.nlist(), 2);
-    add_product(bytes, exact_routing || config.nprobe == router.nlist() ? router.nlist() :
-        std::min(router.nlist(), std::max(config.nprobe, router.options().query_breadth)), 64);
+    // Allow any already-built query mode/breadth, including exact overrides.
+    (void)exact_routing;
+    add_product(bytes, router.nlist(), router.has_native_modes() ? 128 : 64);
+    if (router.has_native_modes()) add_product(bytes, router.dim(), sizeof(float));
     add_product(bytes, batch, stride * sizeof(T) + sizeof(uint32_t) + 1);
     check(bytes <= SIZE_MAX, "IVF query workspace exceeds size_t");
     return bytes;
@@ -65,7 +67,7 @@ QueryResult search(const CentroidRouter& router, const PostingLists& lists,
     const size_t batch = std::min<size_t>(budget, heap.copy_batch_limit());
     QueryResult result;
     auto start = Clock::now();
-    const auto routed = router.search(query, config.nprobe, limits.exact_routing);
+    const auto routed = router.search(query, config.nprobe, limits.exact_routing, &result.router_stats, limits.routing);
     for (auto hit : routed) result.selected_lists.push_back(hit.list_id);
     result.routing_us = elapsed_us(start);
     start = Clock::now();
@@ -143,8 +145,9 @@ uint64_t estimate_mutable_query_workspace(const CentroidRouter& router, const Mu
     add_product(bytes, config.nprobe, 32);
     add_product(bytes, router.dim(), sizeof(T) + sizeof(float));
     add_product(bytes, router.nlist(), 2);
-    add_product(bytes, exact_routing || config.nprobe == router.nlist() ? router.nlist() :
-        std::min(router.nlist(), std::max(config.nprobe, router.options().query_breadth)), 64);
+    (void)exact_routing;
+    add_product(bytes, router.nlist(), router.has_native_modes() ? 128 : 64);
+    if (router.has_native_modes()) add_product(bytes, router.dim(), sizeof(float));
     add_product(bytes, std::min<size_t>(budget, heap.copy_batch_limit()), stride * sizeof(T) + 5);
     check(bytes <= SIZE_MAX, "Mutable IVF query workspace exceeds size_t"); return bytes;
 }
@@ -227,7 +230,8 @@ QueryResult search_mutable(const CentroidRouter& router, const MutablePostingLis
     check(estimate_mutable_query_workspace(router, lists, codebook, heap, config, limits.exact_routing) <= limits.workspace_bytes,
           "Mutable IVF query exceeds workspace allowance");
     auto start = Clock::now();
-    const auto routed = router.search(query, config.nprobe, limits.exact_routing);
+    RoutingStats routing_stats;
+    const auto routed = router.search(query, config.nprobe, limits.exact_routing, &routing_stats, limits.routing);
     std::vector<uint32_t> selected; selected.reserve(routed.size());
     for (auto hit : routed) selected.push_back(hit.list_id);
     const double routing = elapsed_us(start);
@@ -240,6 +244,7 @@ QueryResult search_mutable(const CentroidRouter& router, const MutablePostingLis
     const double scan = elapsed_us(start);
     auto result = rerank_mutable_candidates(router, lists, codebook, heap, query, scanned.candidates, config, limits);
     result.selected_lists = std::move(selected); result.scanned_codes = scanned.scanned_codes;
+    result.router_stats = routing_stats;
     result.routing_us = routing; result.adc_us = adc; result.scan_select_us = scan; return result;
 }
 

@@ -56,7 +56,7 @@ def main():
         env.update(DATASET="tiny", BENCH_DATASETS_DIR=str(profiles), IVF_BUILD_DIR=str(args.build_dir),
                    EVAL_TEMPFILES=str(root / "work first"), EVAL_CACHED=str(root / "cache"), IVF_NLIST="2",
                    IVF_PQ_PREFIX=str(pq_prefix), IVF_GT_FILE=str(truth), IVF_MAX_REPS="2", IVF_BUILD_THREADS="2",
-                   IVF_NPROBE="2", IVF_RERANK_FACTOR="3", QUERY_THREADS="2")
+                    IVF_NPROBE="2", IVF_RERANK_FACTOR="3", QUERY_THREADS="2")
         originals = {p: checksum(p) for p in (data, queries, truth, deep_truth, profile)}
         run(prepare, env)
         work = Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/query"

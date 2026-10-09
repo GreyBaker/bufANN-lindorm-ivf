@@ -16,7 +16,8 @@ int main(int argc, char** argv) {
             "--full_data_file", "--insert_ids_file", "--delete_ids_file",
             "--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file",
             "--index_format", "--private_heap_path", "--checkpoint_prefix",
-            "--scheduler", "--pool_threads", "--query_ratio", "--query_count", "--scheduler_seed"});
+            "--scheduler", "--pool_threads", "--query_ratio", "--query_count", "--scheduler_seed",
+            "--router_mode", "--router_rerank_factor", "--router_breadth"});
         if (args.help) {
             std::cout << "IVF driver (--validate_inputs 1: validation only; 0: native execution in full routing-enabled builds).\n"
                 "Usage: ivf_driver --validate_inputs 0|1 --data_type float|int8|uint8\n"
@@ -36,6 +37,9 @@ int main(int argc, char** argv) {
             std::cout << "Mixed: --workload mixed --scheduler weighted|fixed_8_8 (default weighted)\n"
                 "  [--pool_threads N] [--query_ratio 1..99] [--query_count N] [--scheduler_seed N]\n"
                 "One quiescent round per call; GT/results apply only to the post-round query pass.\n";
+            std::cout << "Query-only overrides among persisted modes (assignments stay frozen):\n"
+                "  [--router_mode hnswlib|exact|patched-full|refined|pca|pca-refined]\n"
+                "  [--router_rerank_factor F] [--router_breadth N]\n";
             return 0;
         }
         const bool validation = args.validation_mode();
@@ -48,7 +52,8 @@ int main(int argc, char** argv) {
 #endif
         args.reject_present({"--memory_budget_gb", "--buffer_frames", "--result_file", "--search_result_file",
                              "--index_format", "--private_heap_path", "--checkpoint_prefix",
-                             "--scheduler", "--pool_threads", "--query_ratio", "--query_count", "--scheduler_seed"}, "execution-only setting");
+                             "--scheduler", "--pool_threads", "--query_ratio", "--query_count", "--scheduler_seed",
+                             "--router_mode", "--router_rerank_factor", "--router_breadth"}, "execution-only setting");
         const auto type = parse_data_type(args.get("--data_type", "float"));
         const uint32_t dim = args.u32("--dim");
         if (dim == 0) throw std::invalid_argument("dim must be positive");

@@ -36,6 +36,10 @@ if(TARGET ivf_index AND NOT MSVC)
 endif()
 
 if(TARGET ivf_router AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ivf_router_diagnostics "${IVF_ROOT}/tests/ivf_router_diagnostics.cpp")
+    target_link_libraries(ivf_router_diagnostics PRIVATE ivf_router Threads::Threads)
+    target_compile_options(ivf_router_diagnostics PRIVATE -fno-fast-math)
+    set_target_properties(ivf_router_diagnostics PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
     add_executable(ivf_training_diagnostics ivf_training_diagnostics.cpp)
     target_link_libraries(ivf_training_diagnostics PRIVATE ivf_router Threads::Threads)
     target_compile_options(ivf_training_diagnostics PRIVATE -fno-fast-math)
@@ -57,6 +61,14 @@ if(IVF_BUILD_CONTRACT_TESTS)
     add_test(NAME ivf_centroid_training COMMAND ivf_centroid_tests
         "${CMAKE_CURRENT_BINARY_DIR}/centroid_fixtures")
     if(TARGET ivf_router)
+        add_executable(ivf_patched_router_tests ivf_patched_router_tests.cpp)
+        target_link_libraries(ivf_patched_router_tests PRIVATE ivf_router Threads::Threads)
+        if(NOT MSVC)
+            target_compile_options(ivf_patched_router_tests PRIVATE -fno-fast-math)
+        endif()
+        add_test(NAME ivf_patched_centroid_routing COMMAND ivf_patched_router_tests
+            "${CMAKE_CURRENT_BINARY_DIR}/patched_router_fixtures")
+        set_tests_properties(ivf_patched_centroid_routing PROPERTIES TIMEOUT 180)
         add_executable(ivf_mutable_list_tests ivf_mutable_list_tests.cpp)
         target_link_libraries(ivf_mutable_list_tests PRIVATE ivf_lists Threads::Threads)
         if(NOT MSVC)
@@ -118,6 +130,13 @@ if(IVF_BUILD_CONTRACT_TESTS)
     endif()
     add_test(NAME ivf_contracts COMMAND ivf_contract_tests "${CMAKE_CURRENT_BINARY_DIR}/fixtures")
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    if(TARGET ivf_router_diagnostics)
+        add_test(NAME ivf_patched_router_diagnostics COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_router_diagnostics.py"
+            --fixtures $<TARGET_FILE:ivf_patched_router_tests> --diagnostic $<TARGET_FILE:ivf_router_diagnostics>
+            --scratch "${CMAKE_CURRENT_BINARY_DIR}/router_diagnostic_fixtures")
+        set_tests_properties(ivf_patched_router_diagnostics PROPERTIES TIMEOUT 180)
+    endif()
     if(TARGET ivf_training_diagnostics)
         add_test(NAME ivf_training_diagnostics COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_training_diagnostics.py"
@@ -131,6 +150,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
         target_compile_options(ivf_pq_helper_parity PRIVATE -fno-fast-math)
     endif()
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_patched_cli_smoke COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_s08_cli.py"
+            --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+            --scratch "${CMAKE_CURRENT_BINARY_DIR}/s08_cli_fixtures")
+        set_tests_properties(ivf_patched_cli_smoke PROPERTIES TIMEOUT 180)
         set(IVF_PQ_PIVOT_HELPER "" CACHE FILEPATH "Optional existing standalone PQ pivot helper for trained integration tests")
         set(IVF_PQ_CODES_HELPER "" CACHE FILEPATH "Optional existing standalone PQ code helper for trained integration tests")
         if(IVF_PQ_PIVOT_HELPER OR IVF_PQ_CODES_HELPER)
@@ -154,6 +178,14 @@ if(IVF_BUILD_CONTRACT_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_execution.py"
             --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
             --scratch "${CMAKE_CURRENT_BINARY_DIR}/execution_fixtures")
+        foreach(mode patched-full refined pca pca-refined)
+            string(REPLACE "-" "_" label "${mode}")
+            add_test(NAME ivf_${label}_query_composition COMMAND ivf_search_tests
+                "${CMAKE_CURRENT_BINARY_DIR}/${label}_search_fixtures" "${mode}")
+            add_test(NAME ivf_${label}_mutable_session COMMAND ivf_mutable_index_tests
+                "${CMAKE_CURRENT_BINARY_DIR}/${label}_mutable_fixtures" "${mode}")
+            set_tests_properties(ivf_${label}_query_composition ivf_${label}_mutable_session PROPERTIES TIMEOUT 300)
+        endforeach()
     endif()
     add_test(NAME ivf_cli_contracts COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.py"

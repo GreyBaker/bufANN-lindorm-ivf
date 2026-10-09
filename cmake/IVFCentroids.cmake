@@ -23,13 +23,22 @@ if(IVF_BUILD_ROUTING AND NOT TARGET ivf_router)
     if(NOT ivf_hnswlib_POPULATED)
         FetchContent_Populate(ivf_hnswlib)
     endif()
-    add_library(ivf_router STATIC "${IVF_ROOT}/src/bufann/ivf_router.cpp")
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${IVF_ROOT}/dependencies/hnswlib-patches/apply.py")
+    execute_process(COMMAND "${Python3_EXECUTABLE}" "${IVF_ROOT}/dependencies/hnswlib-patches/apply.py"
+        "${ivf_hnswlib_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ivf-hnswlib"
+        RESULT_VARIABLE ivf_patch_result)
+    if(NOT ivf_patch_result EQUAL 0)
+        message(FATAL_ERROR "Cannot apply pinned hnswlib IVF patches")
+    endif()
+    add_library(ivf_router STATIC "${IVF_ROOT}/src/bufann/ivf_router.cpp"
+        "${IVF_ROOT}/src/bufann/ivf_patched_graph.cpp" "${IVF_ROOT}/src/bufann/ivf_pca.cpp")
     target_link_libraries(ivf_router PUBLIC ivf_centroids)
-    target_include_directories(ivf_router SYSTEM PRIVATE "${ivf_hnswlib_SOURCE_DIR}")
-    # v0.8.0's SSE upper-layer lookahead reads past full neighbor arrays.
-    # Use upstream's supported scalar path in ALL builds, not an ASan-only
-    # suppression or a modified dependency. Compiler auto-vectorization remains.
-    target_compile_definitions(ivf_router PRIVATE NO_MANUAL_VECTORIZATION)
+    target_include_directories(ivf_router SYSTEM PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ivf-hnswlib")
+    option(IVF_ROUTER_SANITIZER_SCALAR "Disable manual HNSW SIMD in sanitizer builds" ON)
+    if(CMAKE_CXX_FLAGS MATCHES "sanitize" AND IVF_ROUTER_SANITIZER_SCALAR)
+        target_compile_definitions(ivf_router PRIVATE NO_MANUAL_VECTORIZATION)
+    endif()
     if(NOT MSVC)
         target_compile_options(ivf_router PRIVATE -fno-fast-math)
     endif()

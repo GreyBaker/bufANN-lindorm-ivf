@@ -174,7 +174,7 @@ def main():
             build = [args.build, "--validate_inputs", "0", "--data_type", dtype, "--dim", "3",
                      "--data_file", str(data), "--pq_prefix", str(pq_prefix), "--index_prefix", str(prefix),
                      "--base_count", "3", "--nlist", "2", "--max_reps", "2", "--build_threads", "2",
-                     "--buffer_frames", "256", "--query_breadth", "2", "--insert_breadth", "2"]
+                      "--buffer_frames", "256", "--query_breadth", "2", "--insert_breadth", "2"]
             for number, extra in enumerate((["--id_capacity", "2"], ["--page_size", "123"],
                                             ["--router_degree", "0"], ["--query_breadth", "0"],
                                             ["--buffer_frames", "1"], ["--memory_budget_gb", "0.001"])):

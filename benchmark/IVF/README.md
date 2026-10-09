@@ -1,4 +1,4 @@
-# Native IVF query and mutation harness (S04–S06)
+# Native IVF query and mutation harness (S04–S08)
 
 Linux/WSL query-only scripts are implemented and tested with synthetic and
 standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
@@ -7,6 +7,12 @@ graph, Vamana conversion, distributed service or SPFresh source change is requir
 Sequential insert/delete prepare/run pairs and native mutable checkpoint/reopen
 are implemented (S05); concurrent weighted/fixed 8+8 mixed prepare/run pairs are
 implemented (S06). Production and paired SPFresh qualification remain pending.
+
+S08 adds the revised patched-hnswlib/PCA modes; SPFresh comparison is deferred,
+not underway. See `docs/s08-native-routing.md` for modes, artifacts, flags and
+centroid-only diagnostics. `IVF_OPTIMIZED_MODES=1` builds all ablations;
+`IVF_ASSIGNMENT_ROUTER_MODE=pca-refined` sets the frozen build/insert default.
+`IVF_ROUTER_MODE` changes queries only without invalidating that build cache.
 
 ## Build with installed system dependencies
 

@@ -6,6 +6,13 @@ configured on this machine: SIFT1M/SIFT10M profiles resolve to missing placehold
 roots and WSL has no dataset/PQ overrides. No dataset download, resampling, profile
 edit or production benchmark was performed for this segment.
 
+**Current boundary:** S08 adds fixed-router ablations through
+`ivf_router_diagnostics` and `router_sweep.py`; see
+`docs/s08-native-routing.md`. These are not SPFresh comparisons. Production
+qualification and S07/SPFresh comparison remain deferred. The verification
+counts at the end of this older S03/S04 note are historical; current S08 evidence
+is in `docs/implementation-progress.md`.
+
 ## Bounded exact-vs-HNSW training comparison
 
 `benchmark/IVF/build.sh` also builds `tests/ivf_training_diagnostics`. The tool is

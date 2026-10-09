@@ -17,6 +17,7 @@
 
 namespace {
 using namespace diskann::ivf;
+RouterMode fixture_mode = RouterMode::Hnswlib;
 constexpr uint32_t dim = 13, chunks = 3, rows = 180, base = 160, first = 5;
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 template<typename F> void rejects(F&& f) {
@@ -79,7 +80,8 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     BuildConfig training; training.data_type = type; training.dim = dim; training.base_count = base;
     training.nlist = 8; training.max_reps = 3; training.build_threads = 4;
     const auto trained = train_centroids_hnsw(vectors, training);
-    auto router = CentroidRouter::build(dim, trained.centroids);
+    RouterOptions routing; routing.native_modes = fixture_mode != RouterMode::Hnswlib; routing.mode = fixture_mode;
+    auto router = CentroidRouter::build(dim, trained.centroids, routing);
     const auto lists = PostingLists::build<T>(vectors, codes_path, *router, {base, first, 200, chunks});
     const HeapOptions options{dim, 200, 4096, 3};
     const auto heap_path = (root / "vectors.heap").string(), meta_path = (root / "vectors.meta").string();
@@ -179,7 +181,7 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     const float far_center = std::is_same_v<T, float> ? 1000 : (std::is_same_v<T, uint8_t> ? 240 : 120);
     std::vector<float> empty_centroids(2 * dim, far_center);
     for (uint32_t d = 0; d < dim; ++d) empty_centroids[d] = 0;
-    auto empty_router = CentroidRouter::build(dim, empty_centroids);
+    auto empty_router = CentroidRouter::build(dim, empty_centroids, routing);
     ListBuildOptions empty_options{base, first, 200, chunks}; empty_options.exact_assignment = true;
     auto empty_lists = PostingLists::build<T>(vectors, codes_path, *empty_router, empty_options);
     require(empty_lists.ids(1).empty(), "empty-list fixture unexpectedly occupied");
@@ -198,7 +200,7 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     // Native self-contained bundle: retrain from the same seeded base, persist
     // every component, reopen without source data/PQ files, and rerank exactly.
     const auto prefix = (root / "native bundle").string();
-    NativeIndex<T>::build(prefix, vectors, pivot_path, codes_path, training, options, {}, first);
+    NativeIndex<T>::build(prefix, vectors, pivot_path, codes_path, training, options, routing, first);
     auto index = NativeIndex<T>::open(prefix, {256});
     require(index->manifest().source_rows == rows && index->manifest().training.base_count == base &&
             index->manifest().first_id == first && index->manifest().chunks == chunks &&
@@ -223,6 +225,7 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     // Relocate all bundle files; no manifest stores absolute or source paths.
     auto copy_bundle = [&](const std::string& to) {
         for (auto suffix : index_component_suffixes) std::filesystem::copy_file(prefix + suffix, to + suffix);
+        if (routing.native_modes) for (auto suffix : native_router_suffixes) std::filesystem::copy_file(prefix + suffix, to + suffix);
         std::filesystem::copy_file(prefix + ".manifest", to + ".manifest");
     };
     std::filesystem::create_directory(root / "relocated");
@@ -237,6 +240,27 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
         std::fstream file(damaged + index_component_suffixes[i], std::ios::binary | std::ios::in | std::ios::out);
         char byte{}; file.read(&byte, 1); byte ^= 1; file.seekp(0); file.write(&byte, 1); file.close();
         rejects([&] { NativeIndex<T>::open(damaged); });
+    }
+    if (routing.native_modes) for (auto suffix : native_router_suffixes) {
+        const auto damaged = (root / (std::string("damaged_native") + suffix)).string(); copy_bundle(damaged);
+        std::fstream file(damaged + suffix, std::ios::binary | std::ios::in | std::ios::out);
+        char byte{}; file.read(&byte, 1); byte ^= 1; file.seekp(0); file.write(&byte, 1); file.close();
+        rejects([&] { NativeIndex<T>::open(damaged); });
+    }
+    if (routing.native_modes) {
+        const auto missing_mode = (root / "missing_mode_component").string(); copy_bundle(missing_mode);
+        std::filesystem::remove(missing_mode + ".pca"); rejects([&] { NativeIndex<T>::open(missing_mode); });
+        const auto unknown = (root / "unknown_version").string(); copy_bundle(unknown);
+        std::ifstream input(unknown + ".manifest"); std::string text((std::istreambuf_iterator<char>(input)), {}); input.close();
+        text.replace(0, std::string("IVFINDEX2").size(), "IVFINDEX99");
+        { std::ofstream out(unknown + ".manifest"); out << text; }
+        rejects([&] { NativeIndex<T>::open(unknown); });
+        const auto mismatched_pca = (root / "mismatched_pca_dimension").string(); copy_bundle(mismatched_pca);
+        input.open(mismatched_pca + ".manifest"); text.assign(std::istreambuf_iterator<char>(input), {}); input.close();
+        const auto begin = text.find("native_routing "), end = text.find('\n', begin), last = text.rfind(' ', end);
+        text.replace(last + 1, end - last - 1, "0");
+        { std::ofstream out(mismatched_pca + ".manifest"); out << text; }
+        rejects([&] { NativeIndex<T>::open(mismatched_pca); });
     }
     const auto incomplete = (root / "incomplete").string();
     { std::ofstream out(incomplete + ".manifest"); }
@@ -279,7 +303,7 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     {
         std::ifstream in(mismatched_router + ".router"); std::vector<std::string> tokens;
         std::string token; while (in >> token) tokens.push_back(token); in.close();
-        require(tokens.size() == 13, "unexpected router descriptor fixture");
+        require(tokens.size() == (routing.native_modes ? 35u : 13u), "unexpected router descriptor fixture");
         tokens[6] = std::to_string(training.nlist + 1000);
         std::ofstream out(mismatched_router + ".router");
         for (const auto& value : tokens) out << value << ' ';
@@ -307,7 +331,8 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
 } // namespace
 int main(int argc, char** argv) {
     try {
-        require(argc == 2, "expected fixture directory");
+        require(argc == 2 || argc == 3, "expected fixture directory [native mode]");
+        if (argc == 3) fixture_mode = parse_router_mode(argv[2]);
         const auto root = std::filesystem::path(argv[1]) /
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         exercise<float>(root / "float", DataType::Float);

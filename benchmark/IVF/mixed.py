@@ -105,6 +105,7 @@ def run(args):
             "--result_file", str(dest / "native_result.json"), "--search_result_file", str(dest / "neighbors.bin")]
         if args.query_count is not None:
             command += ["--query_count", str(args.query_count)]
+        command += h.query_router_flags()
         h.command_log(command, dest / "run.log")
         record = h.read_json(dest / "native_result.json")
         h.require(record["workload"] == "mixed" and record["insert_count"] == args.insert_cap and

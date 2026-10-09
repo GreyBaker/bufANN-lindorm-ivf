@@ -86,10 +86,17 @@ void build_typed(const Arguments& args, const BuildConfig& config, const BinMeta
     routing.insert_breadth = args.u32("--insert_breadth", 64);
     routing.seed = args.u32("--router_seed", 100);
     routing.memory_budget_bytes = budget;
+    const auto native = args.u32("--optimized_modes", 0);
+    check(native <= 1, "optimized_modes must be 0 or 1");
+    routing.native_modes = native != 0; routing.mode = parse_router_mode(args.get("--router_mode", "hnswlib"));
+    routing.refine_breadth = args.u32("--refine_ef", 128);
+    routing.pca_variance = args.real("--pca_variance", .95); routing.router_rerank_factor = args.real("--router_rerank_factor", 3);
+    routing.native_work_limit = args.integer("--routing_work_limit", 1000000000);
     const auto start = Clock::now();
     NativeIndex<T>::build(args.require("--index_prefix"), args.require("--data_file"),
         args.require("--pq_prefix") + "_pq_pivots.bin", args.require("--pq_prefix") + "_pq_compressed.bin",
         config, heap, routing);
+    auto router = CentroidRouter::load(args.require("--index_prefix"), budget);
     const auto elapsed = seconds(start);
     const auto peak_rss = peak_process_rss_mb();
     std::ostringstream record;
@@ -103,6 +110,18 @@ void build_typed(const Arguments& args, const BuildConfig& config, const BinMeta
     emit("id_capacity", heap.id_capacity); emit("page_size", heap.page_size); emit("buffer_frames", heap.buffer_frames);
     emit("router_degree", routing.degree); emit("construction_breadth", routing.construction_breadth);
     emit("query_breadth", routing.query_breadth); emit("insert_breadth", routing.insert_breadth); emit("router_seed", routing.seed);
+    emit("router_mode", router_mode_name(routing.mode)); emit("assignment_router_mode", router_mode_name(routing.mode));
+    emit("optimized_modes_built", routing.native_modes); emit("pca_retained_dim", router->projected_dim());
+    emit("pca_retained_variance", router->retained_variance()); emit("pca_degenerate", router->pca_degenerate());
+    emit("pca_variance_target", routing.pca_variance); emit("router_rerank_factor", routing.router_rerank_factor);
+    emit("refine_ef", routing.refine_breadth);
+    emit("routing_work_limit", routing.native_work_limit);
+    emit("patched_unreachable_before", router->unreachable_before(false)); emit("refined_unreachable_before", router->unreachable_before(true));
+    emit("isolated_reinserted_nodes", router->reinserted_nodes(true));
+    if (routing.native_modes) {
+        emit("patched_unreachable_after", router->unreachable_after(false)); emit("refined_unreachable_after", router->unreachable_after(true));
+        emit("patched_zero_indegree", router->zero_indegree(false)); emit("refined_zero_indegree", router->zero_indegree(true));
+    }
     emit("build_time_s", elapsed); emit("peak_process_rss_mb", peak_rss);
     emit("memory_budget_bytes", budget); emit("training_assignment", "hnsw_rebuilt_each_pass");
     emit("pq_policy", "global_nonresidual_pq8_external_unverified");
@@ -113,6 +132,8 @@ void build_typed(const Arguments& args, const BuildConfig& config, const BinMeta
 struct WorkerStats {
     uint64_t scanned = 0, reranked = 0, stages = 0, batches = 0, pages = 0, short_rows = 0;
     double routing = 0, adc = 0, scan = 0, fetch = 0, rerank = 0;
+    double projection = 0, graph = 0, centroid_rerank = 0;
+    uint64_t router_distances = 0, router_counted_queries = 0;
     std::exception_ptr failure;
 };
 
@@ -125,7 +146,7 @@ struct UpdateStats {
 };
 template<typename T>
 UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index, uint64_t budget, uint64_t resident_bytes,
-                        std::span<const T> queries, const SearchConfig& config, MixedStats& mixed) {
+                         std::span<const T> queries, const SearchConfig& config, MixedStats& mixed, RoutingRequest routing) {
     const auto& m = index.origin_manifest();
     args.reject_present({"--pq_prefix"}, "mixed updates use frozen bundle PQ");
     const auto source = args.require("--full_data_file");
@@ -173,7 +194,7 @@ UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index, uint64_t 
     mixed = run_mixed_round(plan, {
         [&](uint64_t i) { index.insert(inserts[size_t(i)], {coordinates.data() + size_t(i) * m.training.dim, m.training.dim}, {mutation_bytes, false}); },
         [&](uint64_t i) { if (!index.erase(deletes[size_t(i)])) ++missing; },
-        [&](uint64_t i) { (void)index.query(queries.subspan(size_t(i % query_rows) * m.training.dim, m.training.dim), config, {query_bytes, false}); }});
+        [&](uint64_t i) { (void)index.query(queries.subspan(size_t(i % query_rows) * m.training.dim, m.training.dim), config, {query_bytes, false, routing}); }});
     mixed.runtime_threads_before_launch = runtime_threads;
     check(missing == 0 && index.size() == uint64_t(initial_live) + plan.inserts - plan.deletes, "Mixed round count/live set mismatch");
     for (auto id : inserts) check(index.contains(id), "Completed mixed insert missing at barrier");
@@ -198,6 +219,7 @@ void validate_driver_paths(const Arguments& args, bool updating) {
         const auto prefix = args.require("--checkpoint_prefix");
         paths.push_back(prefix + ".manifest");
         for (auto suffix : mutable_component_suffixes) paths.push_back(prefix + suffix);
+        for (auto suffix : native_router_suffixes) paths.push_back(prefix + suffix);
         args.require("--private_heap_path");
     } else args.reject_present({"--checkpoint_prefix"}, "not used by search-only execution");
     std::vector<std::filesystem::path> normalized;
@@ -306,6 +328,7 @@ template<typename T> void emit_update(std::ostream& record, bool& first, const A
     emit("publication", "manifest_last_nonatomic_no_fsync");
     const auto& m = index.origin_manifest();
     emit("base_count", m.training.base_count); emit("source_rows", m.source_rows);
+    emit("assignment_router_mode", router_mode_name(m.routing.mode)); emit("trainer_mode", "hnsw-rebuilt-control");
     emit("router_degree", m.routing.degree); emit("construction_breadth", m.routing.construction_breadth);
     emit("query_breadth", m.routing.query_breadth); emit("insert_breadth", m.routing.insert_breadth); emit("router_seed", m.routing.seed);
     emit("input_index_format", args.get("--index_format", "immutable"));
@@ -316,7 +339,8 @@ template<typename T> void emit_update(std::ostream& record, bool& first, const A
     emit("cache_policy", "uncontrolled_after_full_source_and_bundle_hash_and_private_copy");
 }
 template<typename T> void mutate_typed(const Arguments& args, DataType type) {
-    args.reject_present({"--query_file", "--gt_file", "--search_result_file", "--query_threads", "--recall_at", "--nprobe", "--rerank_factor"},
+    args.reject_present({"--query_file", "--gt_file", "--search_result_file", "--query_threads", "--recall_at", "--nprobe", "--rerank_factor",
+                         "--router_mode", "--router_rerank_factor", "--router_breadth"},
                         "not used by mutation-only execution; query the saved checkpoint separately");
     validate_driver_paths(args, true);
     const auto budget = budget_bytes(args.real("--memory_budget_gb", 1)); const auto start = Clock::now();
@@ -348,6 +372,11 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     SearchConfig config{args.u32("--nprobe", 1), args.u32("--recall_at", 10),
                         args.real("--rerank_factor", 2.0), args.u32("--query_threads", 1)};
     config.validate(manifest.training.nlist);
+    RoutingRequest routing{parse_router_mode(args.get("--router_mode", router_mode_name(manifest.routing.mode))),
+        args.real("--router_rerank_factor", manifest.routing.router_rerank_factor), args.u32("--router_breadth", manifest.routing.query_breadth)};
+    check(routing.rerank_factor >= 1 && routing.breadth > 0 && routing.breadth <= INT32_MAX &&
+        (manifest.routing.native_modes || routing.mode == RouterMode::Exact || routing.mode == RouterMode::Hnswlib),
+        "Query router settings invalid or native modes not built");
     const auto queries = inspect_vectors(args.require("--query_file"), type, dim);
     const bool has_truth = args.has("--gt_file");
     BinMetadata truth{};
@@ -403,7 +432,7 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     UpdateStats updates; MixedStats mixed;
     if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
         if (updating) {
-            updates = is_mixed ? mixed_index(args, *index, budget, bytes, std::span<const T>(coordinates), config, mixed) : update_index(args, *index, budget, bytes);
+            updates = is_mixed ? mixed_index(args, *index, budget, bytes, std::span<const T>(coordinates), config, mixed, routing) : update_index(args, *index, budget, bytes);
             // Account for additional retained list capacity after insertion.
             bytes = std::max(bytes, updates.bytes);
             const auto post_query_bytes = index->estimated_query_bytes(config);
@@ -430,13 +459,17 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
                     const auto q = next.fetch_add(1, std::memory_order_relaxed);
                     if (q >= queries.rows) break;
                     const auto query_start = Clock::now();
-                    auto result = index->query({coordinates.data() + size_t(q) * dim, dim}, config, {query_bytes, false});
+                    auto result = index->query({coordinates.data() + size_t(q) * dim, dim}, config, {query_bytes, false, routing});
                     latency[q] = seconds(query_start) * 1e6;
                     s.scanned += result.scanned_codes; s.reranked += result.reranked_vectors;
                     s.stages += result.logical_fetch_stages; s.batches += result.backend_batch_calls;
                     s.pages += result.heap_pages_read; s.short_rows += result.hits.size() < config.recall_at;
                     s.routing += result.routing_us; s.adc += result.adc_us; s.scan += result.scan_select_us;
                     s.fetch += result.fetch_us; s.rerank += result.rerank_us;
+                    s.projection += result.router_stats.projection_us; s.graph += result.router_stats.graph_us;
+                    s.centroid_rerank += result.router_stats.centroid_rerank_us;
+                    s.router_distances += result.router_stats.distance_evaluations;
+                    s.router_counted_queries += result.router_stats.distance_count_available;
                     for (size_t j = 0; j < result.hits.size(); ++j) {
                         ids[size_t(q) * config.recall_at + j] = result.hits[j].id;
                         const double distance = result.hits[j].squared_distance;
@@ -455,6 +488,8 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
         total.batches += s.batches; total.pages += s.pages; total.short_rows += s.short_rows;
         total.routing += s.routing; total.adc += s.adc; total.scan += s.scan;
         total.fetch += s.fetch; total.rerank += s.rerank;
+        total.projection += s.projection; total.graph += s.graph; total.centroid_rerank += s.centroid_rerank;
+        total.router_distances += s.router_distances; total.router_counted_queries += s.router_counted_queries;
     }
     double recall = 0;
     if (has_truth) {
@@ -499,6 +534,15 @@ void search_typed(const Arguments& args, DataType type, std::unique_ptr<Index> i
     if (!updating) emit("base_count", manifest.training.base_count);
     emit("pq_chunks", manifest.chunks);
     emit("nprobe", config.nprobe); emit("recall_at", config.recall_at); emit("rerank_factor", config.rerank_factor);
+    emit("router_mode", router_mode_name(routing.mode)); emit("router_rerank_factor", routing.rerank_factor); emit("router_breadth", routing.breadth);
+    if (!updating) { emit("assignment_router_mode", router_mode_name(manifest.routing.mode)); emit("trainer_mode", "hnsw-rebuilt-control"); }
+    emit("optimized_modes_built", manifest.routing.native_modes); emit("pca_retained_dim", index->router().projected_dim());
+    emit("pca_variance_target", manifest.routing.pca_variance); emit("pca_retained_variance", index->router().retained_variance());
+    emit("pca_degenerate", index->router().pca_degenerate()); emit("refine_ef", manifest.routing.refine_breadth);
+    emit("router_projection_us_total", total.projection); emit("router_graph_us_total", total.graph);
+    emit("router_centroid_rerank_us_total", total.centroid_rerank); emit("router_distance_evaluations", total.router_distances);
+    emit("router_distance_counted_queries", total.router_counted_queries);
+    emit("router_distance_count_scope", "patched_graph_plus_full_centroid_rerank_or_exact_enumeration_hnswlib_graph_unavailable");
     emit("query_threads", config.query_threads); emit("active_query_threads", workers); emit("query_count", queries.rows);
     if (!updating) {
         emit("query_breadth", manifest.routing.query_breadth); emit("buffer_pool_frames", args.u32("--buffer_frames", 64));

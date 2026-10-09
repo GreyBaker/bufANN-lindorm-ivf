@@ -38,6 +38,7 @@ uint64_t budget_bytes(const BuildConfig& config) {
     return static_cast<uint64_t>(bytes);
 }
 void validate(const IndexManifest& m) {
+    check(m.router_backend == "hnswlib-0.8.0-prefetch1" || (!m.routing.native_modes && m.router_backend == "hnswlib-0.8.0-nomv"), "Invalid IVF router producer identity");
     m.training.validate();
     check(m.source_rows >= m.training.base_count && m.first_id < m.heap.id_capacity &&
           uint64_t(m.first_id) + m.training.base_count <= m.heap.id_capacity &&
@@ -77,9 +78,13 @@ uint64_t pq_allowance(const IndexManifest& m) {
 IndexManifest read_manifest_file(const std::string& path) {
     check(std::filesystem::file_size(path) <= 16384, "IVF manifest exceeds framing limit");
     std::ifstream in(path, std::ios::binary); in.imbue(std::locale::classic());
-    word(in, "IVFINDEX1"); word(in, "l2"); word(in, "global_nonresidual_pq8_external_unverified");
-    word(in, "hnswlib-0.8.0-nomv");
+    std::string version; in >> version;
+    check(version == "IVFINDEX1" || version == "IVFINDEX2", "Unsupported IVF index version");
+    word(in, "l2"); word(in, "global_nonresidual_pq8_external_unverified");
+    std::string backend; in >> backend;
+    check(backend == "hnswlib-0.8.0-prefetch1" || (version == "IVFINDEX1" && backend == "hnswlib-0.8.0-nomv"), "IVF backend mismatch");
     IndexManifest m;
+    m.router_backend = backend;
     std::string dtype; in >> dtype; m.training.data_type = parse_data_type(dtype);
     m.training.dim = integer<uint32_t>(in); m.training.nlist = integer<uint32_t>(in);
     m.chunks = integer<uint32_t>(in); m.source_rows = integer<uint32_t>(in);
@@ -94,18 +99,31 @@ IndexManifest read_manifest_file(const std::string& path) {
     m.routing.degree = integer<uint32_t>(in); m.routing.construction_breadth = integer<uint32_t>(in);
     m.routing.query_breadth = integer<uint32_t>(in); m.routing.insert_breadth = integer<uint32_t>(in);
     m.routing.seed = integer<uint32_t>(in); m.routing.memory_budget_bytes = integer<uint64_t>(in);
+    if (version == "IVFINDEX2") {
+        word(in, "native_routing"); std::string mode; in >> mode; m.routing.mode = parse_router_mode(mode); m.routing.native_modes = true;
+        m.routing.refine_breadth = integer<uint32_t>(in); const auto reverse = integer<uint32_t>(in);
+        check(reverse <= 1, "Invalid native reverse-edge flag"); m.routing.refine_reverse_edges = reverse != 0;
+        in >> m.routing.pca_variance >> m.routing.router_rerank_factor; check(bool(in), "Invalid native PCA/rerank metadata");
+        m.routing.native_work_limit = integer<uint64_t>(in);
+        m.pca_retained_dim = integer<uint32_t>(in);
+        check(m.pca_retained_dim > 0 && m.pca_retained_dim <= m.training.dim, "Invalid manifest PCA retained dimension");
+    }
     for (auto& digest : m.sources) { word(in, "source"); digest = {integer<uint64_t>(in), integer<uint64_t>(in)}; }
     for (size_t i = 0; i < m.components.size(); ++i) {
         word(in, index_component_suffixes[i]); m.components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
+    }
+    if (m.routing.native_modes) for (size_t i = 0; i < m.native_components.size(); ++i) {
+        word(in, native_router_suffixes[i]); m.native_components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
     }
     in >> std::ws; check(in.eof(), "Trailing IVF manifest data"); validate(m); return m;
 }
 IndexManifest read_manifest(const std::string& prefix) { return read_manifest_file(prefix + ".manifest"); }
 void write_manifest_file(const std::string& path, const IndexManifest& m) {
+    check(!m.routing.native_modes || (m.pca_retained_dim > 0 && m.pca_retained_dim <= m.training.dim), "Missing fitted PCA manifest dimension");
     validate(m);
     std::ofstream out(path, std::ios::binary); out.imbue(std::locale::classic());
     out << std::setprecision(std::numeric_limits<double>::max_digits10)
-        << "IVFINDEX1 l2 global_nonresidual_pq8_external_unverified hnswlib-0.8.0-nomv\n"
+        << (m.routing.native_modes ? "IVFINDEX2" : "IVFINDEX1") << " l2 global_nonresidual_pq8_external_unverified " << m.router_backend << '\n'
         << data_type_name(m.training.data_type) << ' ' << m.training.dim << ' ' << m.training.nlist << ' '
         << m.chunks << ' ' << m.source_rows << ' ' << m.training.base_count << ' ' << m.first_id << ' '
         << m.heap.id_capacity << ' ' << m.heap.page_size << ' ' << m.heap.buffer_frames << '\n'
@@ -114,9 +132,14 @@ void write_manifest_file(const std::string& path, const IndexManifest& m) {
         << "routing " << m.routing.degree << ' ' << m.routing.construction_breadth << ' '
         << m.routing.query_breadth << ' ' << m.routing.insert_breadth << ' ' << m.routing.seed << ' '
         << m.routing.memory_budget_bytes << '\n';
+    if (m.routing.native_modes) out << "native_routing " << router_mode_name(m.routing.mode) << ' ' << m.routing.refine_breadth << ' '
+        << m.routing.refine_reverse_edges << ' ' << m.routing.pca_variance << ' ' << m.routing.router_rerank_factor << ' '
+        << m.routing.native_work_limit << ' ' << m.pca_retained_dim << '\n';
     for (auto digest : m.sources) out << "source " << digest.bytes << ' ' << digest.hash << '\n';
     for (size_t i = 0; i < m.components.size(); ++i)
         out << index_component_suffixes[i] << ' ' << m.components[i].bytes << ' ' << m.components[i].hash << '\n';
+    if (m.routing.native_modes) for (size_t i = 0; i < m.native_components.size(); ++i)
+        out << native_router_suffixes[i] << ' ' << m.native_components[i].bytes << ' ' << m.native_components[i].hash << '\n';
     out.close(); check(bool(out), "IVF manifest write failed");
 }
 void write_manifest(const std::string& prefix, const IndexManifest& m) { write_manifest_file(prefix + ".manifest", m); }
@@ -131,7 +154,10 @@ void copy_component(const std::string& from, const std::string& to) {
 }
 bool same_routing(const RouterOptions& a, const RouterOptions& b) {
     return a.degree == b.degree && a.construction_breadth == b.construction_breadth &&
-        a.query_breadth == b.query_breadth && a.insert_breadth == b.insert_breadth && a.seed == b.seed;
+        a.query_breadth == b.query_breadth && a.insert_breadth == b.insert_breadth && a.seed == b.seed &&
+        a.native_modes == b.native_modes && a.mode == b.mode && a.refine_breadth == b.refine_breadth &&
+        a.refine_reverse_edges == b.refine_reverse_edges && a.pca_variance == b.pca_variance &&
+        a.router_rerank_factor == b.router_rerank_factor && a.native_work_limit == b.native_work_limit;
 }
 void require_new_artifact(const std::string& path) {
     check(!std::filesystem::exists(std::filesystem::symlink_status(path)), "Mutable IVF output artifact exists");
@@ -149,18 +175,26 @@ uint64_t mutable_other_allowance(const IndexManifest& m, uint32_t frames, uint64
 struct MutableManifest {
     uint32_t live = 0, retained = 0;
     std::array<ArtifactDigest, 10> components{};
+    bool native = false;
+    std::array<ArtifactDigest, 3> native_components{};
 };
 MutableManifest read_mutable_manifest(const std::string& prefix) {
     check(std::filesystem::file_size(prefix + ".manifest") <= 4096, "Mutable IVF manifest exceeds framing limit");
     std::ifstream in(prefix + ".manifest", std::ios::binary); in.imbue(std::locale::classic());
-    word(in, "IVFMUTABLE1"); MutableManifest m;
+    std::string version; in >> version; check(version == "IVFMUTABLE1" || version == "IVFMUTABLE2", "Unsupported mutable IVF version");
+    MutableManifest m; m.native = version == "IVFMUTABLE2";
     m.live = integer<uint32_t>(in); m.retained = integer<uint32_t>(in);
     for (size_t i = 0; i < m.components.size(); ++i) {
         word(in, mutable_component_suffixes[i]); m.components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
     }
+    if (m.native) for (size_t i = 0; i < m.native_components.size(); ++i) {
+        word(in, native_router_suffixes[i]); m.native_components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
+    }
     in >> std::ws; check(in.eof(), "Trailing mutable IVF manifest data"); return m;
 }
 void validate_frozen_components(const MutableManifest& current, const IndexManifest& origin) {
+    check(current.native == origin.routing.native_modes && (!current.native || current.native_components == origin.native_components),
+          "Mutable IVF checkpoint changed native router/PCA identity");
     for (size_t i : {0u, 1u, 2u, 7u})
         check(current.components[i] == origin.components[i], "Mutable IVF checkpoint changed frozen router/PQ identity");
     check(current.live <= current.retained && current.retained <= origin.heap.id_capacity - origin.first_id,
@@ -201,13 +235,16 @@ void NativeIndex<T>::build(const std::string& prefix, const std::string& vectors
     check(!std::filesystem::exists(std::filesystem::symlink_status(prefix + ".manifest")), "IVF index manifest exists");
     for (auto suffix : index_component_suffixes)
         check(!std::filesystem::exists(std::filesystem::symlink_status(prefix + suffix)), "IVF index component exists");
+    if (routing.native_modes) for (auto suffix : native_router_suffixes) require_new_artifact(prefix + suffix);
     claim_artifact(prefix + ".manifest"); // Reserves the prefix against another builder.
     std::vector<float> centroids;
     {
-        auto trained = train_centroids_hnsw(vectors, training, routing);
+        auto trainer_routing = routing; trainer_routing.native_modes = false; trainer_routing.mode = RouterMode::Hnswlib;
+        auto trained = train_centroids_hnsw(vectors, training, trainer_routing);
         centroids = std::move(trained.centroids);
     }
     auto router = CentroidRouter::build(training.dim, centroids, routing);
+    if (routing.native_modes) m.pca_retained_dim = router->projected_dim();
     std::vector<float>().swap(centroids);
     router->save(prefix);
     ListBuildOptions list_options{training.base_count, first_id, heap.id_capacity, m.chunks, budget - retained};
@@ -220,6 +257,7 @@ void NativeIndex<T>::build(const std::string& prefix, const std::string& vectors
     check(m.sources == std::array<ArtifactDigest, 3>{artifact_digest(vectors), artifact_digest(pivots), artifact_digest(codes)},
           "IVF source changed during build");
     for (size_t i = 0; i < m.components.size(); ++i) m.components[i] = artifact_digest(prefix + index_component_suffixes[i]);
+    if (routing.native_modes) for (size_t i = 0; i < m.native_components.size(); ++i) m.native_components[i] = artifact_digest(prefix + native_router_suffixes[i]);
     write_manifest(prefix, m); // Last successful operation; not an atomic/fsync commit.
 }
 
@@ -236,11 +274,13 @@ std::unique_ptr<NativeIndex<T>> NativeIndex<T>::open(const std::string& prefix, 
     check(bytes <= options.memory_budget_bytes && bytes <= SIZE_MAX, "IVF composed open exceeds workspace allowance");
     for (size_t i = 0; i < m.components.size(); ++i)
         check(artifact_digest(prefix + index_component_suffixes[i]) == m.components[i], "IVF index component integrity mismatch");
+    if (m.routing.native_modes) for (size_t i = 0; i < m.native_components.size(); ++i)
+        check(artifact_digest(prefix + native_router_suffixes[i]) == m.native_components[i], "IVF native component integrity mismatch");
     auto result = std::unique_ptr<NativeIndex>(new NativeIndex);
     result->_manifest = m; result->_estimated_open_bytes = bytes;
     result->_router = CentroidRouter::load(prefix, router_bytes);
     check(result->_router->dim() == m.training.dim && result->_router->nlist() == m.training.nlist &&
-          same_routing(result->_router->options(), m.routing), "IVF manifest/router mismatch");
+          same_routing(result->_router->options(), m.routing) && (!m.routing.native_modes || result->_router->projected_dim() == m.pca_retained_dim), "IVF manifest/router mismatch");
     result->_lists = std::make_unique<PostingLists>(PostingLists::load(prefix + ".lists", list_allowance(m)));
     const auto& lists = *result->_lists;
     check(lists.data_type() == type<T>() && lists.dim() == m.training.dim && lists.nlist() == m.training.nlist &&
@@ -310,6 +350,8 @@ std::unique_ptr<MutableIndex<T>> MutableIndex<T>::fork(const std::string& source
     check(result->_heap->size() == result->_lists->size(), "Mutable IVF fork heap/list population mismatch");
     for (size_t i = 0; i < m.components.size(); ++i)
         check(artifact_digest(source + index_component_suffixes[i]) == m.components[i], "Immutable IVF source changed during fork");
+    if (m.routing.native_modes) for (size_t i = 0; i < m.native_components.size(); ++i)
+        check(artifact_digest(source + native_router_suffixes[i]) == m.native_components[i], "Native IVF source changed during fork");
     return result;
 }
 template<typename T>
@@ -318,6 +360,7 @@ template<typename T>
 uint64_t MutableIndex<T>::estimated_mutation_bytes(bool exact) const {
     uint64_t bytes = 65536;
     add(bytes, _router->nlist(), 2);
+    if (_router->has_native_modes()) { add(bytes, _router->nlist(), 128); add(bytes, _router->dim(), sizeof(float)); }
     add(bytes, exact ? _router->nlist() : std::min(_router->nlist(), _router->options().insert_breadth), 64);
     add(bytes, _router->dim(), sizeof(T) + sizeof(float));
     add(bytes, _heap->aligned_dim(), sizeof(T)); add(bytes, _pq->chunks());
@@ -390,6 +433,7 @@ uint64_t MutableIndex<T>::estimated_checkpoint_bytes() const {
     uint64_t bytes = 65536;
     add(bytes, _heap->id_capacity(), 32); add(bytes, _heap->retained_file_bytes() / _origin.heap.page_size, 16);
     add(bytes, _origin.training.nlist, 16); add(bytes, _origin.training.dim, sizeof(float));
+    if (_router->has_native_modes()) add(bytes, _router->nlist(), 32); // Native graph validation BFS/indegrees.
     return bytes;
 }
 template<typename T>
@@ -399,6 +443,7 @@ void MutableIndex<T>::checkpoint(const std::string& prefix, uint64_t workspace_b
     validate_checkpoint_membership();
     require_new_artifact(prefix + ".manifest");
     for (auto suffix : mutable_component_suffixes) require_new_artifact(prefix + suffix);
+    if (_origin.routing.native_modes) for (auto suffix : native_router_suffixes) require_new_artifact(prefix + suffix);
     check(artifact_digest(_pq_artifact_path) == _origin.components[7], "Mutable IVF private PQ sidecar changed");
     claim_artifact(prefix + ".manifest"); // Exclusive prefix reservation; empty on partial failure.
     _router->save(prefix);
@@ -406,13 +451,16 @@ void MutableIndex<T>::checkpoint(const std::string& prefix, uint64_t workspace_b
     _heap->checkpoint_mutable_copy(prefix + ".heap", prefix + ".heap.meta", prefix + ".heap.state");
     copy_component(_pq_artifact_path, prefix + ".pq.bin");
     claim_artifact(prefix + ".origin"); write_manifest_file(prefix + ".origin", _origin);
-    MutableManifest current; current.live = _lists->size(); current.retained = _heap->retained_size();
+    MutableManifest current; current.live = _lists->size(); current.retained = _heap->retained_size(); current.native = _origin.routing.native_modes;
     for (size_t i = 0; i < current.components.size(); ++i) current.components[i] = artifact_digest(prefix + mutable_component_suffixes[i]);
+    if (current.native) for (size_t i = 0; i < current.native_components.size(); ++i) current.native_components[i] = artifact_digest(prefix + native_router_suffixes[i]);
     validate_frozen_components(current, _origin);
     std::ofstream out(prefix + ".manifest", std::ios::binary); out.imbue(std::locale::classic());
-    out << "IVFMUTABLE1 " << current.live << ' ' << current.retained << '\n';
+    out << (current.native ? "IVFMUTABLE2" : "IVFMUTABLE1") << ' ' << current.live << ' ' << current.retained << '\n';
     for (size_t i = 0; i < current.components.size(); ++i)
         out << mutable_component_suffixes[i] << ' ' << current.components[i].bytes << ' ' << current.components[i].hash << '\n';
+    if (current.native) for (size_t i = 0; i < current.native_components.size(); ++i)
+        out << native_router_suffixes[i] << ' ' << current.native_components[i].bytes << ' ' << current.native_components[i].hash << '\n';
     out.close(); check(bool(out), "Mutable IVF checkpoint manifest write failure");
 }
 template<typename T>
@@ -423,6 +471,8 @@ std::unique_ptr<MutableIndex<T>> MutableIndex<T>::reopen(const std::string& pref
     const auto current = read_mutable_manifest(prefix);
     for (size_t i = 0; i < current.components.size(); ++i)
         check(artifact_digest(prefix + mutable_component_suffixes[i]) == current.components[i], "Mutable IVF checkpoint integrity mismatch");
+    if (current.native) for (size_t i = 0; i < current.native_components.size(); ++i)
+        check(artifact_digest(prefix + native_router_suffixes[i]) == current.native_components[i], "Mutable native component integrity mismatch");
     auto origin = read_manifest_file(prefix + ".origin"); validate_frozen_components(current, origin);
     check(origin.training.data_type == type<T>(), "Mutable IVF checkpoint dtype mismatch");
     const auto other = mutable_other_allowance(origin, options.buffer_frames, current.components[4].bytes);
@@ -439,7 +489,7 @@ std::unique_ptr<MutableIndex<T>> MutableIndex<T>::reopen(const std::string& pref
     const auto router_bytes = CentroidRouter::estimate_build_bytes(origin.training.dim, origin.training.nlist, origin.routing);
     result->_router = CentroidRouter::load(prefix, router_bytes);
     check(result->_router->dim() == origin.training.dim && result->_router->nlist() == origin.training.nlist &&
-          same_routing(result->_router->options(), origin.routing), "Mutable IVF checkpoint router mismatch");
+          same_routing(result->_router->options(), origin.routing) && (!origin.routing.native_modes || result->_router->projected_dim() == origin.pca_retained_dim), "Mutable IVF checkpoint router mismatch");
     result->_pq = std::make_unique<PQCodebook<T>>(prefix + ".pq.bin", origin.training.dim, origin.chunks);
     copy_component(prefix + ".heap", heap_path);
     result->_pq_artifact_path = heap_path + ".pq.bin"; copy_component(prefix + ".pq.bin", result->_pq_artifact_path);
@@ -451,6 +501,8 @@ std::unique_ptr<MutableIndex<T>> MutableIndex<T>::reopen(const std::string& pref
     result->validate_checkpoint_membership();
     for (size_t i = 0; i < current.components.size(); ++i)
         check(artifact_digest(prefix + mutable_component_suffixes[i]) == current.components[i], "Mutable IVF checkpoint changed during reopen");
+    if (current.native) for (size_t i = 0; i < current.native_components.size(); ++i)
+        check(artifact_digest(prefix + native_router_suffixes[i]) == current.native_components[i], "Mutable native checkpoint changed during reopen");
     return result;
 }
 template class MutableIndex<float>;

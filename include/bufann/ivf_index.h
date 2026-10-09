@@ -10,8 +10,10 @@ inline constexpr std::array<const char*, 8> index_component_suffixes{
     ".centroids.bin", ".hnsw", ".router", ".lists", ".heap", ".heap.meta", ".heap.meta.ivf", ".pq.bin"};
 inline constexpr std::array<const char*, 10> mutable_component_suffixes{
     ".centroids.bin", ".hnsw", ".router", ".mlists", ".heap", ".heap.meta", ".heap.meta.ivf", ".pq.bin", ".heap.state", ".origin"};
+inline constexpr std::array<const char*, 3> native_router_suffixes{".patched.hnsw", ".refined.hnsw", ".pca"};
 
 struct IndexManifest {
+    std::string router_backend = "hnswlib-0.8.0-prefetch1";
     BuildConfig training;
     RouterOptions routing;
     HeapOptions heap;
@@ -22,6 +24,8 @@ struct IndexManifest {
     // training provenance/code-to-vector parity is NOT independently verified.
     std::array<ArtifactDigest, 3> sources{}; // vectors, pivots, codes
     std::array<ArtifactDigest, 8> components{};
+    std::array<ArtifactDigest, 3> native_components{}; // Version 2 only; legacy framing unchanged.
+    uint32_t pca_retained_dim = 0; // Version 2; actual fitted projection, digest-bound below.
 };
 struct IndexOpenOptions {
     uint32_t buffer_frames = 64;
@@ -42,6 +46,7 @@ class NativeIndex {
     static std::unique_ptr<NativeIndex> open(const std::string& prefix,
                                             const IndexOpenOptions& options = {});
     const IndexManifest& manifest() const { return _manifest; }
+    const CentroidRouter& router() const { return *_router; }
     uint64_t estimated_open_bytes() const { return _estimated_open_bytes; }
     uint64_t estimated_query_bytes(const SearchConfig& config, bool exact_routing = false) const;
     QueryResult query(std::span<const T> vector, const SearchConfig& config,
@@ -87,6 +92,7 @@ class MutableIndex {
     void checkpoint(const std::string& new_prefix, uint64_t workspace_bytes = 64ull * 1024 * 1024);
     uint64_t estimated_checkpoint_bytes() const;
     const IndexManifest& origin_manifest() const { return _origin; }
+    const CentroidRouter& router() const { return *_router; }
     uint32_t size() const { return _lists->size(); }
     uint32_t retained_heap_records() const { return _heap->retained_size(); }
     uint64_t retained_heap_bytes() const { return _heap->retained_file_bytes(); }

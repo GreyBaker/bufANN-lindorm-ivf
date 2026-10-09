@@ -14,6 +14,7 @@ struct ExactHit {
 struct QueryLimits {
     uint64_t workspace_bytes = 64ull * 1024 * 1024;
     bool exact_routing = false;
+    RoutingRequest routing{}; // Query-only override; never changes list/insert assignments.
 };
 struct QueryResult {
     std::vector<uint32_t> selected_lists;
@@ -29,6 +30,7 @@ struct QueryResult {
     // allocation overhead is not attributed to a stage. Totals across threads
     // are not whole-run wall time or CPU time.
     double routing_us = 0, adc_us = 0, scan_select_us = 0, fetch_us = 0, rerank_us = 0;
+    RoutingStats router_stats{};
 };
 template<typename T>
 uint64_t estimate_query_workspace(const CentroidRouter& router, const PostingLists& lists,

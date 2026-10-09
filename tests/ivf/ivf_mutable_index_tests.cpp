@@ -20,6 +20,7 @@
 
 namespace {
 using namespace diskann::ivf;
+RouterMode fixture_mode = RouterMode::Hnswlib;
 constexpr uint32_t dim = 13, chunks = 3, rows = 64, base = 24, first = 5, capacity = 96;
 void require(bool ok, const char* text) { if (!ok) throw std::runtime_error(text); }
 template<typename F> void rejects(F&& operation) {
@@ -67,10 +68,14 @@ void rehash_manifest(const std::string& prefix) {
     for (auto suffix : mutable_component_suffixes) {
         const auto digest = artifact_digest(prefix + suffix); text << suffix << ' ' << digest.bytes << ' ' << digest.hash << '\n';
     }
+    if (std::filesystem::exists(prefix + ".patched.hnsw")) for (auto suffix : native_router_suffixes) {
+        const auto digest = artifact_digest(prefix + suffix); text << suffix << ' ' << digest.bytes << ' ' << digest.hash << '\n';
+    }
     in.close(); std::ofstream out(prefix + ".manifest"); out << text.str(); require(bool(out), "manifest fixture write failed");
 }
 void copy_checkpoint(const std::string& from, const std::string& to) {
     for (auto suffix : mutable_component_suffixes) std::filesystem::copy_file(from + suffix, to + suffix);
+    if (std::filesystem::exists(from + ".patched.hnsw")) for (auto suffix : native_router_suffixes) std::filesystem::copy_file(from + suffix, to + suffix);
     std::filesystem::copy_file(from + ".manifest", to + ".manifest");
 }
 
@@ -167,7 +172,10 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     const auto prefix = (root / "immutable source").string();
     BuildConfig training; training.data_type = type; training.dim = dim; training.base_count = base;
     training.nlist = 4; training.max_reps = 2; training.build_threads = 2;
-    NativeIndex<T>::build(prefix, vectors, pq_path, codes_path, training, {dim, capacity, 4096, 2}, {}, first);
+    RouterOptions routing; routing.native_modes = fixture_mode != RouterMode::Hnswlib; routing.mode = fixture_mode;
+    NativeIndex<T>::build(prefix, vectors, pq_path, codes_path, training, {dim, capacity, 4096, 2}, routing, first);
+    std::array<ArtifactDigest, 3> native_identity{};
+    if (routing.native_modes) for (size_t i = 0; i < native_identity.size(); ++i) native_identity[i] = artifact_digest(prefix + native_router_suffixes[i]);
     std::array<ArtifactDigest, 9> source_identity;
     for (size_t i = 0; i < index_component_suffixes.size(); ++i) source_identity[i] = artifact_digest(prefix + index_component_suffixes[i]);
     source_identity.back() = artifact_digest(prefix + ".manifest");
@@ -193,7 +201,12 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
                 [&](uint64_t i) { mutation_gate(); require(mixed->erase(first + round * 8 + uint32_t(i)), "mixed delete lost a base ID"); },
                 [&](uint64_t i) {
                     if (fixed && i < 8) overlap_gate.arrive_and_wait();
-                    for (auto hit : mixed->query(query, config).hits) {
+                    auto foreground_config = config;
+                    if (routing.native_modes) foreground_config.nprobe = 2; // Exercise traversal, not all-list fallback, under updates.
+                    const auto result = mixed->query(query, foreground_config);
+                    if (routing.native_modes) require(result.router_stats.graph_us >= 0 && result.router_stats.distance_count_available,
+                        "Native mixed traversal counters missing");
+                    for (auto hit : result.hits) {
                         double squared = 0; const auto coordinates = row(hit.id >= first + base ? 0 : hit.id - first);
                         for (uint32_t d = 0; d < dim; ++d) { const double delta = double(query[d]) - double(coordinates[d]); squared += delta * delta; }
                         require(hit.squared_distance == squared, "mixed query returned mismatched/stale coordinates");
@@ -560,6 +573,8 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
     for (size_t i = 0; i < index_component_suffixes.size(); ++i)
         require(artifact_digest(prefix + index_component_suffixes[i]) == source_identity[i], "session changed immutable source component");
     require(artifact_digest(prefix + ".manifest") == source_identity.back(), "session changed immutable manifest");
+    if (routing.native_modes) for (size_t i = 0; i < native_identity.size(); ++i)
+        require(artifact_digest(prefix + native_router_suffixes[i]) == native_identity[i], "session changed native router/PCA source");
     auto original = NativeIndex<T>::open(prefix, {2});
     std::fill(live.begin(), live.end(), 0); std::fill_n(live.begin(), base, 1);
     require(original->query(query, config).hits == oracle(), "source query changed after mutation session destruction");
@@ -568,7 +583,8 @@ template<typename T> void exercise(const std::filesystem::path& root, DataType t
 
 int main(int argc, char** argv) {
     try {
-        require(argc == 2, "expected owned fixture directory");
+        require(argc == 2 || argc == 3, "expected owned fixture directory [native mode]");
+        if (argc == 3) fixture_mode = parse_router_mode(argv[2]);
         const auto root = std::filesystem::path(argv[1]) / std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         exercise<float>(root / "float", DataType::Float);
         exercise<int8_t>(root / "int8", DataType::Int8);

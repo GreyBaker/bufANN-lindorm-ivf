@@ -58,7 +58,7 @@ def main():
             env.update(DATASET=dataset, BENCH_DATASETS_DIR=str(profiles), IVF_BUILD_DIR=str(args.build_dir), IVF_PQ_PREFIX=str(pq),
                 EVAL_TEMPFILES=str(root / "work"), EVAL_CACHED=str(root / "cache"), IVF_NLIST="1", IVF_MAX_REPS="1", IVF_BUILD_THREADS="1",
                 IVF_BUFFER_FRAMES="2", UPDATE_PERCENT="25", UPDATE_BATCH="8", QUERY_POINTS="128", IVF_NPROBE="1",
-                IVF_RERANK_FACTOR="32", QUERY_THREADS="2", NTHREADS="16", INCREMENTAL_GT_BIN=str(helper))
+                 IVF_RERANK_FACTOR="32", QUERY_THREADS="2", NTHREADS="16", INCREMENTAL_GT_BIN=str(helper))
             prepare, execute = repo / "benchmark/IVF/sift/update_prepare.sh", repo / "benchmark/IVF/sift/update.sh"
             original = {p: digest(p) for p in (data, query, deep)}
             run(prepare, env)
