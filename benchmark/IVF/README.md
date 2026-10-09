@@ -1,4 +1,4 @@
-# Native IVF query and mutation harness (S04–S09)
+# Native IVF query and mutation harness (S04–S10)
 
 Linux/WSL query-only scripts are implemented and tested with synthetic and
 standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
@@ -26,8 +26,8 @@ IVF_BUILD_DIR="$PWD/build/ivf-benchmark" bash benchmark/IVF/build.sh \
   -DINTEL_OMP_LIBRARY_DIR=/opt/intel/oneapi/compiler/2026.1/lib
 ```
 
-The script enables `IVF_BUILD_ROUTING=ON` and builds `ivf_build`/`ivf_driver` plus
-`ivf_training_diagnostics` without
+The script enables `IVF_BUILD_ROUTING=ON` and builds `ivf_build`/`ivf_driver`,
+`ivf_cost_model` and training/router diagnostics without
 changing other baseline build trees. Administrator-installed MKL (ILP64, Intel
 threaded), iomp5 and libaio linkage is retained. Override paths for your install;
 default build directory is `build/ivf-benchmark`, jobs default to 4. Prepare/run
@@ -99,7 +99,8 @@ component contents. Working index directories/components may not symlink to cach
 
 ### Settings
 
-Build settings use `IVF_` plus the uppercase CLI field: `IVF_NLIST` (required),
+Build settings use `IVF_` plus the uppercase CLI field: `IVF_NLIST` (required unless
+`IVF_COST_MODEL_REPORT` supplies a frozen choice),
 `IVF_SAMPLE_RATE` (1), `IVF_MAX_REPS` (15), `IVF_SEED` (0), `IVF_BUILD_THREADS` (1),
 `IVF_MEMORY_BUDGET_GB` (1), `IVF_PAGE_SIZE` (4096), `IVF_BUFFER_FRAMES` (64),
 `IVF_ROUTER_DEGREE` (16), `IVF_CONSTRUCTION_BREADTH` (200), `IVF_QUERY_BREADTH` (128),
@@ -186,6 +187,21 @@ not cold-device throughput. Pin/copy admission remains serialized. Detailed
 timing/read/RSS scopes: [s04-cli-execution.md](../../docs/s04-cli-execution.md).
 
 ## Tested gates and remaining work
+
+### S10 calibration and selection provenance
+
+`benchmark/IVF/cost_model.py` orchestrates the native paper-style `T1+T2` tool
+using only base rows and disjoint synthetic queries. It freezes source/PQ/tool
+identities, actual samples/GT/routers, eligible/excluded candidates and predictions.
+`IVF_COST_MODEL_REPORT=/path/report.json` supplies its chosen `nlist` to preparation;
+settings/source mismatches and conflicting manual choices fail. Preparation/cache
+metadata and adjacent run `nlist_selection.json` preserve the report path/hash.
+Native metrics and index formats remain unchanged; manual controls remain available.
+
+This is functional implementation, **not** production calibration or the required
+SIFT10M prediction-validation study. Fetch/rerank are excluded; no end-to-end-QPS
+optimum is claimed. Build/calibration examples, interpretations and remaining gates:
+[s10-cost-model.md](../../docs/s10-cost-model.md).
 
 `ivf_query_harness` covers actual build/run, canonical records/results, cache
 restore/config/source identity changes, no-store behavior, no overwrites, failed

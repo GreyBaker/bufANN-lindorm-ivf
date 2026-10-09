@@ -12,6 +12,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/IVFContracts.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/IVFCentroids.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/IVFLists.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/IVFCostModel.cmake)
 find_package(Threads REQUIRED)
 
 foreach(tool ivf_build ivf_driver)
@@ -26,6 +27,10 @@ endforeach()
 # Native execution is available only with the actual Linux heap backend and
 # opt-in centroid routing, never in dependency-isolated contract tools.
 if(TARGET ivf_index AND NOT MSVC)
+    add_executable(ivf_cost_model "${IVF_ROOT}/tests/ivf_cost_model.cpp")
+    target_link_libraries(ivf_cost_model PRIVATE ivf_cost_model_core BufANN)
+    target_compile_options(ivf_cost_model PRIVATE -fno-fast-math)
+    set_target_properties(ivf_cost_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
     add_library(ivf_cli_execution STATIC "${IVF_ROOT}/tests/ivf_cli_execution.cpp")
     target_link_libraries(ivf_cli_execution PUBLIC ivf_index Threads::Threads)
     target_compile_options(ivf_cli_execution PRIVATE -fno-fast-math)
@@ -61,6 +66,12 @@ if(IVF_BUILD_CONTRACT_TESTS)
     add_test(NAME ivf_centroid_training COMMAND ivf_centroid_tests
         "${CMAKE_CURRENT_BINARY_DIR}/centroid_fixtures")
     if(TARGET ivf_router)
+        add_executable(ivf_cost_model_tests ivf_cost_model_tests.cpp)
+        target_link_libraries(ivf_cost_model_tests PRIVATE ivf_cost_model_core)
+        if(NOT MSVC)
+            target_compile_options(ivf_cost_model_tests PRIVATE -fno-fast-math)
+        endif()
+        add_test(NAME ivf_cost_model_core COMMAND ivf_cost_model_tests)
         add_executable(ivf_ann_training_tests ivf_ann_training_tests.cpp)
         target_link_libraries(ivf_ann_training_tests PRIVATE ivf_router Threads::Threads)
         get_target_property(IVF_PATCHED_INCLUDE ivf_router INCLUDE_DIRECTORIES)
@@ -159,6 +170,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
         target_compile_options(ivf_pq_helper_parity PRIVATE -fno-fast-math)
     endif()
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_cost_model_cli COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_cost_model.py"
+            --tool $<TARGET_FILE:ivf_cost_model> --build-dir "${CMAKE_BINARY_DIR}"
+            --scratch "${CMAKE_CURRENT_BINARY_DIR}/cost_model_fixtures")
+        set_tests_properties(ivf_cost_model_cli PROPERTIES TIMEOUT 180)
         add_test(NAME ivf_ann_training_cli COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_CURRENT_SOURCE_DIR}/test_s09_cli.py"
             --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>

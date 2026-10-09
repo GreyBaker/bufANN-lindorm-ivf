@@ -27,6 +27,7 @@ struct ListScan {
     std::vector<PQCandidate> candidates; // Nearest first; ID breaks distance ties.
     uint64_t scanned_codes = 0;
 };
+struct ScanProfile { double per_code_us = 0; uint64_t scanned_codes = 0; };
 
 // Immutable CSR ID/code lists. Global, non-residual 8-bit PQ only. IDs remain
 // first_id + input row; no insertion tail, coordinates or vector graph stored.
@@ -53,6 +54,11 @@ class PostingLists {
     // malformed/nonfinite tables and zero budget; keep at most budget entries.
     ListScan scan(std::span<const uint32_t> lists, std::span<const float> distances,
                   uint32_t budget, uint64_t workspace_bytes = 64ull * 1024 * 1024) const;
+    // W8 uses the exact W4 scan/selection path on one list of real source codes.
+    // Setup is outside timing; no alternative ADC kernel or per-list model term.
+    static ScanProfile profile_scan(std::span<const uint8_t> codes, uint32_t chunks,
+        std::span<const float> distances, uint32_t budget, uint32_t repeats,
+        uint64_t workspace_bytes = 64ull * 1024 * 1024);
  private:
     PostingLists() = default;
     uint32_t _chunks = 0;

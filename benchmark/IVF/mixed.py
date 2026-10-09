@@ -69,13 +69,14 @@ def run(args):
     prepared = json.loads(path.read_text())
     h.require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
     base = h.read_json(w / "prepared.json")
+    selection = h.prepared_selection(base)
     h.require(base["profile"] == h.profile(args) and h.digest(base["query"]) == base["query_identity"], "mixed query/profile changed")
     prefix = w / "index" / args.dataset
     h.require(h.digest(Path(str(prefix) + ".manifest")) == base["manifest_identity"], "mixed base manifest changed")
     base_components = h.component_digests(w / "index", args.dataset)
     output = args.output_dir.resolve()
     h.require(output == w or w in output.parents, "mixed outputs must stay under prepared work")
-    for name in ("rounds", "result.json", "summary.json"):
+    for name in ("rounds", "result.json", "summary.json", "nlist_selection.json"):
         dest = output / name
         h.require(not dest.exists() and not dest.is_symlink(), f"mixed output exists: {dest}")
     scheduler = os.environ.get("IVF_SCHEDULER", "weighted")
@@ -83,6 +84,7 @@ def run(args):
     h.require(scheduler in ("weighted", "fixed_8_8") and threads.isdigit() and 0 < int(threads) <= 256 and
               (scheduler != "fixed_8_8" or int(threads) == 16), "invalid mixed scheduler/foreground allocation")
     output.mkdir(parents=True, exist_ok=True)
+    h.write_json(output / "nlist_selection.json", selection)
     (output / "rounds").mkdir()
     records = []
     for r in range(args.rounds):

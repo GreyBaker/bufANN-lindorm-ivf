@@ -7,6 +7,7 @@ no atomic publication/recovery. Native bundle validation remains authoritative.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -116,6 +117,66 @@ def write_json(path, record):
         out.write("\n")
 
 
+def read_cost_model_report(path):
+    path = Path(path)
+    require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 16 << 20,
+            "missing/symlink/oversized cost-model report")
+    def unique(pairs):
+        require(len(dict(pairs)) == len(pairs), "duplicate cost-model report field")
+        return dict(pairs)
+    record = json.loads(path.read_text(), object_pairs_hook=unique)
+    require(record.get("version") == 1 and record.get("kind") == "ivf_cost_model" and record.get("completed") is True,
+            "incomplete/unsupported cost-model report")
+    chosen = record.get("selected_nlist")
+    require(type(chosen) is int and chosen > 0, "invalid model-selected nlist")
+    candidates = [candidate for candidate in record["candidates"] if candidate["eligible"]]
+    require(candidates and len({c["nlist"] for c in record["candidates"]}) == len(record["candidates"]),
+            "empty/duplicate cost-model candidates")
+    for candidate in candidates:
+        require(candidate["nlist"] * 32 <= record["sample_count"], "ineligible model candidate")
+        a, b = candidate["t1_us"], candidate["t2_us"]
+        require(math.isfinite(a) and math.isfinite(b) and a >= 0 and b >= 0 and
+                candidate["total_us"] == a + b, "invalid cost-model candidate estimate")
+    require(chosen == min(candidates, key=lambda c: (c["total_us"], c["nlist"]))["nlist"],
+            "cost-model selection is not minimum T1+T2")
+    return record
+
+
+def nlist_selection(args, settings, sources):
+    path = os.environ.get("IVF_COST_MODEL_REPORT")
+    if not path:
+        return {"source": "manual", "nlist": int(settings["nlist"])}
+    record = read_cost_model_report(path)
+    require(record["data_type"] == args.dtype and record["dim"] == args.dim and
+            record["source_rows"] == args.full_count and record["base_count"] == args.base_count,
+            "cost-model profile does not match build")
+    require([record["identities"][key] for key in ("data", "pq_pivots", "pq_codes")] == sources,
+            "cost-model source/PQ identity does not match build")
+    require(record["objective"] == "mean_T1_plus_T2_excludes_fetch_and_exact_rerank" and
+            record["calibration_query_policy"] == "disjoint_base_rows_no_official_queries",
+            "unsupported cost-model objective/calibration policy")
+    aliases = {"init": "trainer_init", "sample_rate": "target_sample_rate", "nlist": "selected_nlist"}
+    keys = ("nlist", "sample_rate", "max_reps", "seed", "build_threads", "trainer_mode", "init", "training_breadth",
+            "memory_budget_gb", "router_mode", "optimized_modes", "router_degree", "construction_breadth",
+            "query_breadth", "insert_breadth", "router_seed", "refine_ef", "pca_variance",
+            "router_rerank_factor", "routing_work_limit")
+    for key in keys:
+        observed = record[aliases.get(key, key)]
+        same = settings[key] == str(observed) if isinstance(observed, str) else float(settings[key]) == observed
+        require(same, "cost-model/build setting mismatch: " + key)
+    return {"source": "cost_model", "nlist": record["selected_nlist"], "report_path": str(Path(path).resolve()),
+            "report_identity": digest(path), "objective": record["objective"],
+            "topk": record["topk"], "target_recall": record["target_recall"], "rerank_factor": record["rerank_factor"],
+            "validation_completed": record.get("validation_completed", False), "production_qualified": False}
+
+
+def prepared_selection(prepared):
+    selection = prepared.get("nlist_selection", {"source": "manual", "nlist": int(prepared["settings"]["nlist"])})
+    if selection["source"] == "cost_model":
+        require(digest(selection["report_path"]) == selection["report_identity"], "prepared cost-model report changed")
+    return selection
+
+
 def profile(args):
     return {key: getattr(args, key) for key in ("dataset", "dtype", "metric", "dim", "full_count", "base_count")}
 
@@ -130,7 +191,11 @@ def build_settings():
     # Query-only mode/factor overrides do not alter the build/cache identity.
     result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "hnswlib")
     result["router_rerank_factor"] = os.environ.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
-    require(result["nlist"] is not None, "set IVF_NLIST explicitly")
+    if os.environ.get("IVF_COST_MODEL_REPORT"):
+        chosen = read_cost_model_report(os.environ["IVF_COST_MODEL_REPORT"])["selected_nlist"]
+        require(result["nlist"] is None or int(result["nlist"]) == chosen, "IVF_NLIST disagrees with cost-model selection")
+        result["nlist"] = str(chosen)
+    require(result["nlist"] is not None, "set IVF_NLIST explicitly or provide IVF_COST_MODEL_REPORT")
     return result
 
 
@@ -179,7 +244,9 @@ def prepare(args):
     identity = {"version": 1, "profile": profile(args), "settings": settings,
                 "sources": [digest(data), digest(pivots), digest(codes)],
                 "builder": digest(builder), "bufann_libraries": {path.name: digest(path) for path in libraries},
-                "cache_tag": os.environ.get("IVF_CACHE_TAG", "")}
+                 "cache_tag": os.environ.get("IVF_CACHE_TAG", "")}
+    selection = nlist_selection(args, settings, identity["sources"])
+    identity["nlist_selection"] = selection
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = args.cache_root.resolve() / args.dataset / "IVF" / key
     index = work / "index"
@@ -212,7 +279,10 @@ def prepare(args):
                 shutil.copyfile(Path(str(prefix) + suffix), cache / "index" / (args.dataset + suffix))
             require(component_digests(cache / "index", args.dataset) == components, "IVF cache copy integrity mismatch")
             write_json(cache / "cache.json", {"identity": identity, "components": components}) # last; not atomic/fsync
+    if selection["source"] == "cost_model":
+        require(digest(selection["report_path"]) == selection["report_identity"], "cost-model report changed during prepare")
     write_json(work / "prepared.json", {"version": 1, "profile": profile(args), "settings": settings,
+        "nlist_selection": selection,
         "cache_key": key, "cache_hit": hit, "cache_policy": "sha256_inputs_tools_settings_real_bundle_copies",
         "query": str(args.query.resolve()), "query_identity": digest(args.query),
         "truth": str(args.truth.resolve()), "truth_identity": digest(args.truth),
@@ -225,6 +295,7 @@ def run(args):
     work = args.work_dir.resolve()
     prepared = read_json(work / "prepared.json")
     require(prepared["version"] == 1 and prepared["profile"] == profile(args), "profile changed since prepare")
+    selection = prepared_selection(prepared)
     mutation = mutation_identity(args, work)
     if mutation is not None:
         require(read_json(work / "mutation_prepared.json") == mutation, "mutation/source identity changed since prepare")
@@ -241,9 +312,12 @@ def run(args):
     output = args.output_dir.resolve()
     require(output == work or work in output.parents, "run output must stay under prepared work tree")
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("run.log", "native_result.json", "result.json", "neighbors.bin"):
+    for name in ("run.log", "native_result.json", "result.json", "neighbors.bin", "nlist_selection.json"):
         path = output / name
         require(not path.exists() and not path.is_symlink(), f"run output exists: {path}; use a fresh IVF_RUN_TAG")
+    # Keep native result.json byte-identical to native_result.json; provenance is
+    # an adjacent experiment record, never a fabricated native query metric.
+    write_json(output / "nlist_selection.json", selection)
     if mutation is not None:
         for name in ("mutation.log", "mutation_result.json", "mutation_metrics.json", "private.heap", "private.heap.pq.bin", "query.heap", "query.heap.pq.bin", "checkpoint"):
             path = output / name

@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <filesystem>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <type_traits>
@@ -228,6 +230,35 @@ ListScan PostingLists::scan(std::span<const uint32_t> lists, std::span<const flo
     result.candidates.resize(best.size());
     for (size_t i = best.size(); i > 0; --i) { result.candidates[i - 1] = best.top(); best.pop(); }
     return result;
+}
+
+ScanProfile PostingLists::profile_scan(std::span<const uint8_t> codes, uint32_t chunks,
+    std::span<const float> distances, uint32_t budget, uint32_t repeats, uint64_t workspace_bytes) {
+    check(chunks && !codes.empty() && codes.size() % chunks == 0 && repeats && budget,
+          "Invalid scan calibration buffers/repeats");
+    const auto rows = codes.size() / chunks;
+    check(rows <= INT32_MAX, "Scan calibration population too large");
+    uint64_t retained = mul(rows, uint64_t(chunks) + 4); add(retained, 16);
+    uint64_t bytes = retained;
+    add(bytes, mul(std::min<size_t>(rows, budget), 48)); add(bytes, 4);
+    check(bytes <= workspace_bytes, "Scan calibration exceeds workspace allowance");
+    PostingLists lists; lists._chunks = chunks;
+    lists._offsets = {0, rows}; lists._codes.assign(codes.begin(), codes.end());
+    lists._ids.resize(rows); std::iota(lists._ids.begin(), lists._ids.end(), 0);
+    const uint32_t selected[]{0};
+    // Validate and warm the same scanner once, separately from timed repeats.
+    const auto scratch_bytes = workspace_bytes - retained;
+    lists.scan(selected, distances, budget, scratch_bytes);
+    ScanProfile profile;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t r = 0; r < repeats; ++r) {
+        const auto result = lists.scan(selected, distances, budget, scratch_bytes);
+        profile.scanned_codes += result.scanned_codes;
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    profile.per_code_us = us / profile.scanned_codes;
+    check(std::isfinite(profile.per_code_us) && profile.per_code_us > 0, "Invalid measured scan coefficient");
+    return profile;
 }
 
 template PostingLists PostingLists::build<float>(const std::string&, const std::string&, const CentroidRouter&, const ListBuildOptions&);
