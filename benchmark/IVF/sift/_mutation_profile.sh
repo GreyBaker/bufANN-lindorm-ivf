@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared S05 profile arithmetic, matching SPFresh without sourcing its runtime.
+# Sequential mutation profile arithmetic, matching SPFresh without its runtime.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATASET="${DATASET:-sift1m}"

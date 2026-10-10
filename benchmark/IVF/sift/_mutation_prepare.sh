@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_mutation_profile.sh"
-: "${IVF_NLIST:?Set IVF_NLIST explicitly; production training budgets are not qualified}"
+ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to pivots plus full-source PQ codes}"
 ensure_dataset
 [[ ! -e "$WORK_DIR" && ! -L "$WORK_DIR" ]] || error "work tree already exists; choose a fresh EVAL_TEMPFILES root"

@@ -9,126 +9,181 @@
 #include <mutex>
 
 namespace ivf_cli {
-namespace detail {
-// Both release and abort change the predicate under the wait mutex. An atomic
-// cancellation flag plus an unlocked notify can lose a wake during launch failure.
-class MixedStartGate {
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    bool released_ = false, aborted_ = false;
- public:
-    bool wait() {
+  namespace detail {
+    // Both release and abort change the predicate under the wait mutex. An
+    // atomic cancellation flag plus an unlocked notify can lose a wake during
+    // launch failure.
+    class MixedStartGate {
+      std::mutex              mutex_;
+      std::condition_variable ready_;
+      bool                    released_ = false, aborted_ = false;
+
+     public:
+      bool wait() {
         std::unique_lock lock(mutex_);
         ready_.wait(lock, [&] { return released_; });
         return !aborted_;
-    }
-    void release(bool aborted = false) {
-        { std::lock_guard lock(mutex_); released_ = true; aborted_ = aborted; }
+      }
+      void release(bool aborted = false) {
+        {
+          std::lock_guard lock(mutex_);
+          released_ = true;
+          aborted_ = aborted;
+        }
         ready_.notify_all();
-    }
-};
-} // namespace detail
-struct MixedPlan {
-    bool fixed_8_8 = false;
+      }
+    };
+  }  // namespace detail
+  struct MixedPlan {
+    bool     fixed_8_8 = false;
     uint32_t pool_threads = 16;
     uint64_t inserts = 0, deletes = 0, queries = 0;
     uint64_t seed = ann_bench::WeightedUpdatePool::kDefaultSeed;
-    void validate() const {
-        if (!pool_threads || pool_threads > 256 || !inserts || !deletes || !queries ||
-            inserts > UINT64_MAX - deletes || queries > UINT64_MAX - inserts - deletes ||
-            queries > SIZE_MAX / sizeof(double) || (fixed_8_8 && pool_threads != 16))
-            throw std::invalid_argument("Invalid mixed plan/counts/worker allocation");
+    void     validate() const {
+      if (!pool_threads || pool_threads > 256 || !inserts || !deletes ||
+          !queries || inserts > UINT64_MAX - deletes ||
+          queries > UINT64_MAX - inserts - deletes ||
+          queries > SIZE_MAX / sizeof(double) ||
+          (fixed_8_8 && pool_threads != 16))
+        throw std::invalid_argument(
+            "Invalid mixed plan/counts/worker allocation");
     }
-};
-struct MixedStats {
+  };
+  struct MixedStats {
     std::array<uint64_t, 3> completed{};
-    uint64_t overlapping_queries = 0;
-    uint32_t peak_mutations = 0, peak_queries = 0;
-    uint32_t runtime_threads_before_launch = 0; // Filled by the native Linux CLI.
-    double wall_s = 0;
+    uint64_t                overlapping_queries = 0;
+    uint32_t                peak_mutations = 0, peak_queries = 0;
+    uint32_t                runtime_threads_before_launch =
+        0;  // Filled by the native Linux CLI.
+    double                wall_s = 0;
     std::array<double, 3> callback_us{};
-    std::vector<double> query_latency_us;
-};
-// Callback exceptions are retained, admission stops, admitted callbacks finish,
-// and all workers join before rethrow. No success stats on partial execution.
-// Overlap is measured admitted operation intervals (including monitor/native
-// lock/I/O waits and retirement bookkeeping), not bare callback timing,
-// CPU simultaneity, device IOPS, collection snapshots or final-GT recall.
-inline MixedStats run_mixed_round(const MixedPlan& plan,
-    const std::array<std::function<void(uint64_t)>, 3>& tasks) {
+    std::vector<double>   query_latency_us;
+  };
+  // Callback exceptions are retained, admission stops, admitted callbacks
+  // finish, and all workers join before rethrow. No success stats on partial
+  // execution. Overlap is measured admitted operation intervals (including
+  // monitor/native lock/I/O waits and retirement bookkeeping), not bare
+  // callback timing, CPU simultaneity, device IOPS, collection snapshots or
+  // final-GT recall.
+  inline MixedStats run_mixed_round(
+      const MixedPlan&                                    plan,
+      const std::array<std::function<void(uint64_t)>, 3>& tasks) {
     plan.validate();
-    for (const auto& task : tasks) if (!task) throw std::invalid_argument("Missing mixed callback");
+    for (const auto& task : tasks)
+      if (!task)
+        throw std::invalid_argument("Missing mixed callback");
     using Clock = std::chrono::steady_clock;
-    MixedStats result; result.query_latency_us.resize(size_t(plan.queries));
-    std::mutex mutex;
-    std::atomic<bool> cancelled{false}; std::exception_ptr failure;
-    uint32_t active_mutations = 0, active_queries = 0;
-    uint64_t mutation_epoch = 0;
-    auto invoke = [&](size_t op, uint64_t id) noexcept {
-        uint64_t epoch = 0; bool overlaps = false;
-        {
-            std::lock_guard lock(mutex);
-            if (cancelled.load()) return;
-            if (op == 2) {
-                epoch = mutation_epoch; overlaps = active_mutations != 0;
-                result.peak_queries = std::max(result.peak_queries, ++active_queries);
-            } else { ++mutation_epoch; result.peak_mutations = std::max(result.peak_mutations, ++active_mutations); }
+    MixedStats result;
+    result.query_latency_us.resize(size_t(plan.queries));
+    std::mutex         mutex;
+    std::atomic<bool>  cancelled{false};
+    std::exception_ptr failure;
+    uint32_t           active_mutations = 0, active_queries = 0;
+    uint64_t           mutation_epoch = 0;
+    auto               invoke = [&](size_t op, uint64_t id) noexcept {
+      uint64_t epoch = 0;
+      bool     overlaps = false;
+      {
+        std::lock_guard lock(mutex);
+        if (cancelled.load())
+          return;
+        if (op == 2) {
+          epoch = mutation_epoch;
+          overlaps = active_mutations != 0;
+          result.peak_queries = std::max(result.peak_queries, ++active_queries);
+        } else {
+          ++mutation_epoch;
+          result.peak_mutations =
+              std::max(result.peak_mutations, ++active_mutations);
         }
-        const auto start = Clock::now();
-        std::exception_ptr error;
-        try { tasks[op](id); } catch (...) { error = std::current_exception(); }
-        const auto elapsed = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
-        {
-            std::lock_guard lock(mutex);
-            if (op == 2) {
-                --active_queries;
-                result.overlapping_queries += overlaps || active_mutations || epoch != mutation_epoch;
-                result.query_latency_us[size_t(id)] = elapsed;
-            } else { --active_mutations; ++mutation_epoch; }
-            if (error) { if (!failure) failure = error; cancelled = true; }
-            else ++result.completed[op];
-            result.callback_us[op] += elapsed;
+      }
+      const auto         start = Clock::now();
+      std::exception_ptr error;
+      try {
+        tasks[op](id);
+      } catch (...) {
+        error = std::current_exception();
+      }
+      const auto elapsed =
+          std::chrono::duration<double, std::micro>(Clock::now() - start)
+              .count();
+      {
+        std::lock_guard lock(mutex);
+        if (op == 2) {
+          --active_queries;
+          result.overlapping_queries +=
+              overlaps || active_mutations || epoch != mutation_epoch;
+          result.query_latency_us[size_t(id)] = elapsed;
+        } else {
+          --active_mutations;
+          ++mutation_epoch;
         }
+        if (error) {
+          if (!failure)
+            failure = error;
+          cancelled = true;
+        } else
+          ++result.completed[op];
+        result.callback_us[op] += elapsed;
+      }
     };
     const auto start = Clock::now();
     if (!plan.fixed_8_8) {
-        const uint64_t counts[]{plan.inserts, plan.deletes, plan.queries};
-        const std::function<void(uint64_t)> wrapped[]{
-            [&](uint64_t i) { invoke(0, i); }, [&](uint64_t i) { invoke(1, i); }, [&](uint64_t i) { invoke(2, i); }};
-        ann_bench::WeightedUpdatePool::run(plan.pool_threads, counts, wrapped, plan.seed);
+      const uint64_t counts[]{plan.inserts, plan.deletes, plan.queries};
+      const std::function<void(uint64_t)> wrapped[]{
+          [&](uint64_t i) { invoke(0, i); }, [&](uint64_t i) { invoke(1, i); },
+          [&](uint64_t i) { invoke(2, i); }};
+      ann_bench::WeightedUpdatePool::run(plan.pool_threads, counts, wrapped,
+                                         plan.seed);
     } else {
-        // All 16 workers are created before admission. No extra scheduler thread;
-        // the calling thread orchestrates/joins. Fixed mutation claims alternate
-        // insert/delete while both streams remain, not serial mutation phases.
-        std::atomic<uint64_t> next_mutation{0}, next_query{0};
-        detail::MixedStartGate gate;
-        std::vector<std::jthread> workers; workers.reserve(16);
-        try {
-            for (uint32_t w = 0; w < 16; ++w) workers.emplace_back([&, w] {
-                if (!gate.wait()) return;
-                if (w < 8) {
-                    const auto common = std::min(plan.inserts, plan.deletes);
-                    while (!cancelled.load()) {
-                        const auto n = next_mutation.fetch_add(1);
-                        if (n >= plan.inserts + plan.deletes) break;
-                        if (n < 2 * common) invoke(size_t(n % 2), n / 2);
-                        else invoke(plan.inserts > plan.deletes ? 0 : 1, common + n - 2 * common);
-                    }
-                } else while (!cancelled.load()) {
-                    const auto n = next_query.fetch_add(1);
-                    if (n >= plan.queries) break;
-                    invoke(2, n);
-                }
-            });
-            gate.release();
-        } catch (...) { cancelled = true; gate.release(true); throw; }
-        // Explicit join before inspecting stats or destroying captured counters.
-        for (auto& worker : workers) worker.join();
+      // All 16 workers are created before admission. No extra scheduler thread;
+      // the calling thread orchestrates/joins. Fixed mutation claims alternate
+      // insert/delete while both streams remain, not serial mutation phases.
+      std::atomic<uint64_t>     next_mutation{0}, next_query{0};
+      detail::MixedStartGate    gate;
+      std::vector<std::jthread> workers;
+      workers.reserve(16);
+      try {
+        for (uint32_t w = 0; w < 16; ++w)
+          workers.emplace_back([&, w] {
+            if (!gate.wait())
+              return;
+            if (w < 8) {
+              const auto common = std::min(plan.inserts, plan.deletes);
+              while (!cancelled.load()) {
+                const auto n = next_mutation.fetch_add(1);
+                if (n >= plan.inserts + plan.deletes)
+                  break;
+                if (n < 2 * common)
+                  invoke(size_t(n % 2), n / 2);
+                else
+                  invoke(plan.inserts > plan.deletes ? 0 : 1,
+                         common + n - 2 * common);
+              }
+            } else
+              while (!cancelled.load()) {
+                const auto n = next_query.fetch_add(1);
+                if (n >= plan.queries)
+                  break;
+                invoke(2, n);
+              }
+          });
+        gate.release();
+      } catch (...) {
+        cancelled = true;
+        gate.release(true);
+        throw;
+      }
+      // Explicit join before inspecting stats or destroying captured counters.
+      for (auto& worker : workers)
+        worker.join();
     }
     result.wall_s = std::chrono::duration<double>(Clock::now() - start).count();
-    if (failure) std::rethrow_exception(failure);
-    if (result.completed != std::array<uint64_t, 3>{plan.inserts, plan.deletes, plan.queries})
-        throw std::runtime_error("Mixed scheduler lost operations");
+    if (failure)
+      std::rethrow_exception(failure);
+    if (result.completed !=
+        std::array<uint64_t, 3>{plan.inserts, plan.deletes, plan.queries})
+      throw std::runtime_error("Mixed scheduler lost operations");
     return result;
-}
-} // namespace ivf_cli
+  }
+}  // namespace ivf_cli

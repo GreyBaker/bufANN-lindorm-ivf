@@ -114,6 +114,9 @@ Construction/pruning use full coordinates. Refinement replaces bottom out-edges
 from a frozen search/prune pass and reinserts zero-in-degree nodes once; global
 connectivity is not guaranteed. PCA traversal reranks in full coordinates.
 Final centroids/routers/PCA are frozen across mutations and query overrides.
+An explicit query `--router_mode default` resolves to the persisted mode, as
+does omitting the flag. New bundles use producer `hnswlib-0.8.0-stock1`;
+historical labels remain readable and unchanged on copying/checkpointing.
 
 ### Sequential insert/delete
 
@@ -291,13 +294,12 @@ record minima, ratios, exclusions, below-32 warnings and trainer search policy;
 version-1 reports retain implicit minimum 32 and legacy trainer contracts.
 Do not edit frozen reports to admit excluded candidates or refit predictions.
 
-`IVF_COST_MODEL_REPORT` supplies the Python harness's chosen nlist, but shell
-prepare guards still require explicit matching `IVF_NLIST`. This remains a
-**workaround**, not report-only shell support:
+`IVF_COST_MODEL_REPORT` supplies the chosen nlist for query, mutation and mixed
+shell preparation. `IVF_NLIST` may be omitted; if also supplied, it must match:
 
 ```bash
 export IVF_COST_MODEL_REPORT=/new/path/calibration-r10/report.json
-export IVF_NLIST="$(python3 -c 'import json,os; print(json.load(open(os.environ["IVF_COST_MODEL_REPORT"]))["selected_nlist"])')"
+unset IVF_NLIST
 # Match every report trainer/router/resource setting; full builds require sample rate 1.
 export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_INIT=random_partition
 export IVF_TRAINING_BREADTH=64 IVF_BUILD_THREADS=4 IVF_MEMORY_BUDGET_GB=4
@@ -329,6 +331,11 @@ python3 benchmark/IVF/router_sweep.py \
 ```
 
 Exact reference enumeration costs `query_rows * nlist` distances. Records retain
+exclusive settings/plan/summary files, per-trial process logs (including failed
+or timed-out children), input/tool/helper hashes and available/selected affinity.
+Use `--cpus` for explicit pinning. Hashing warms inputs; cache state is otherwise
+uncontrolled. No output is overwritten, and failed partial evidence is retained.
+Native records retain
 centroid recall, identities, projection/graph/rerank times, distance availability,
 PCA dimension/variance, connectivity and lifetime RSS. Timed worker search includes
 centroid-match scoring, excludes exact GT/load/checks. A mode-query warmup and prior
@@ -410,6 +417,9 @@ Make MKL/Intel OpenMP runtime libraries discoverable via loader configuration or
 LV/PCA/candidate oracles, bounded work/memory refusal, exact SSE/artifacts, report
 minima 32/20/1 and historical compatibility, frozen provenance, build/reopen,
 mutation/mixed scoring, caches/no-overwrite/identity failures, repeats and gates.
+Additional checks cover sibling CMake target visibility, routing builds without
+Python discovery, artifact claim/hash behavior, report-only shell preparation,
+historical producer preservation and router-sweep failure/timeout evidence.
 Optional `ivf_trained_helper_integration` requires both existing standalone helpers
 configured with `IVF_PQ_PIVOT_HELPER` and `IVF_PQ_CODES_HELPER`; it checks trained
 encoder/ADC parity and script results for all dtypes (4096 rows, 13 dimensions,

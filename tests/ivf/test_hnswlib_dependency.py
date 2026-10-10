@@ -1,4 +1,5 @@
 """Check vendored IVF ownership and exact, unmodified fetched v0.8.0 headers."""
+
 import argparse
 import hashlib
 from pathlib import Path
@@ -28,30 +29,53 @@ def main():
     local = args.dependency / "include/ivf_patched"
     check({p.name for p in local.iterdir()} == set(UPSTREAM_SHA256), "unexpected local header set")
     check(not (args.dependency / "include/ivf_vanilla").exists(), "comparison must not be vendored")
-    check(not (args.dependency / "apply.py").exists(), "build-time patch application must be removed")
+    check(
+        not (args.dependency / "apply.py").exists(), "build-time patch application must be removed"
+    )
     for name in UPSTREAM_SHA256:
         text = (local / name).read_text(encoding="utf-8")
-        check(text.startswith("// Modified from hnswlib v0.8.0:"), f"missing modification notice: {name}")
-        check("namespace ivf_hnswlib" in text and "namespace hnswlib" not in text,
-              f"local namespace separation lost: {name}")
+        check(
+            text.startswith("// Modified from hnswlib v0.8.0:"),
+            f"missing modification notice: {name}",
+        )
+        check(
+            "namespace ivf_hnswlib" in text and "namespace hnswlib" not in text,
+            f"local namespace separation lost: {name}",
+        )
     repo = args.dependency.parents[1]
     module = (repo / "cmake/Hnswlib.cmake").read_text()
-    check("execute_process" not in module and "find_package(Python3" not in module,
-          "routing dependency must not execute Python or generate headers")
-    check("SHA256=cf61d7dd8dc9bfba7f4abe0ed26698e90ac9f49a0badb2e1b0f3ba89b72cf3bb" in module,
-          "upstream archive pin changed")
-    check("#include <hnswlib/hnswlib.h>" in (repo / "src/bufann/ivf_router.cpp").read_text(),
-          "stock comparison must include the fetched upstream header")
+    check(
+        "execute_process" not in module and "find_package(Python3" not in module,
+        "routing dependency must not execute Python or generate headers",
+    )
+    check(
+        "SHA256=cf61d7dd8dc9bfba7f4abe0ed26698e90ac9f49a0badb2e1b0f3ba89b72cf3bb" in module,
+        "upstream archive pin changed",
+    )
+    check(
+        "#include <hnswlib/hnswlib.h>" in (repo / "src/bufann/ivf_router.cpp").read_text(),
+        "stock comparison must include the fetched upstream header",
+    )
     check((args.dependency / "LICENSE").is_file(), "missing upstream license")
     if args.source:
         upstream = args.source / "hnswlib"
-        check({p.name for p in upstream.glob("*.h")} == set(UPSTREAM_SHA256), "unexpected upstream header set")
+        check(
+            {p.name for p in upstream.glob("*.h")} == set(UPSTREAM_SHA256),
+            "unexpected upstream header set",
+        )
         for name, expected in UPSTREAM_SHA256.items():
-            check(hashlib.sha256((upstream / name).read_bytes()).hexdigest() == expected,
-                  f"comparison header is not unmodified v0.8.0: {name}")
-    print("Local IVF headers checked; " +
-          ("all seven comparison headers are exact upstream v0.8.0."
-           if args.source else "routing OFF: no upstream fetch required."))
+            check(
+                hashlib.sha256((upstream / name).read_bytes()).hexdigest() == expected,
+                f"comparison header is not unmodified v0.8.0: {name}",
+            )
+    print(
+        "Local IVF headers checked; "
+        + (
+            "all seven comparison headers are exact upstream v0.8.0."
+            if args.source
+            else "routing OFF: no upstream fetch required."
+        )
+    )
 
 
 if __name__ == "__main__":

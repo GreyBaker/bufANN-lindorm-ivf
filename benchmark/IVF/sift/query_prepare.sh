@@ -6,7 +6,7 @@ DATASET="${DATASET:-sift1m}"
 WORKLOAD=query
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 source "$REPO_DIR/benchmark/IVF/common.sh"
-: "${IVF_NLIST:?Set IVF_NLIST explicitly; production training budgets are not qualified}"
+ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing pivots plus full-source PQ codes}"
 [[ -f "$DATA_BIN" && -f "$QUERY_BIN" ]] || error "stage the configured .bin inputs first"
 [[ ! -e "$WORK_DIR" && ! -L "$WORK_DIR" ]] || error "work tree already exists; preserve it or choose a fresh EVAL_TEMPFILES root"
