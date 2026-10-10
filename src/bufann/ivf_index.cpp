@@ -75,8 +75,6 @@ namespace diskann::ivf {
       check(m.format_version != 4 ||
                 trainer_count_candidates(m.training.trainer_mode),
             "Version-4 trainer policy mismatch");
-      check(supported_router_backend(m.router_backend, !m.routing.native_modes),
-            "Invalid IVF router producer identity");
       m.training.validate();
       check(m.source_rows >= m.training.base_count &&
                 m.first_id < m.heap.id_capacity &&
@@ -146,11 +144,11 @@ namespace diskann::ivf {
       word(in, "global_nonresidual_pq8_external_unverified");
       std::string backend;
       in >> backend;
-      check(supported_router_backend(backend, version == "IVFINDEX1"),
-            "IVF backend mismatch");
+      check(
+          backend == router_backend_id,
+          "Unsupported IVF index producer; rebuild with hnswlib-0.8.0-stock1");
       IndexManifest m;
       m.format_version = uint32_t(version.back() - '0');
-      m.router_backend = backend;
       std::string dtype;
       in >> dtype;
       m.training.data_type = parse_data_type(dtype);
@@ -253,7 +251,7 @@ namespace diskann::ivf {
       out << std::setprecision(std::numeric_limits<double>::max_digits10)
           << "IVFINDEX" << m.format_version
           << " l2 global_nonresidual_pq8_external_unverified "
-          << m.router_backend << '\n'
+          << router_backend_id << '\n'
           << data_type_name(m.training.data_type) << ' ' << m.training.dim
           << ' ' << m.training.nlist << ' ' << m.chunks << ' ' << m.source_rows
           << ' ' << m.training.base_count << ' ' << m.first_id << ' '

@@ -29,12 +29,16 @@ namespace {
       throw std::runtime_error(text);
   }
   template<typename F>
-  void rejects(F&& operation) {
+  void rejects(F&& operation, const char* expected = nullptr) {
     try {
       operation();
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+      require(!expected ||
+                  std::string(error.what()).find(expected) != std::string::npos,
+              "Unexpected refusal reason");
       return;
     } catch (const diskann::ANNException&) {
+      require(!expected, "Unexpected backend refusal");
       return;
     }
     throw std::runtime_error("expected refusal");
@@ -117,28 +121,6 @@ namespace {
         std::filesystem::copy_file(from + suffix, to + suffix);
     std::filesystem::copy_file(from + ".manifest", to + ".manifest");
   }
-  void rehash_immutable_descriptor(const std::string& prefix) {
-    const auto         digest = artifact_digest(prefix + ".router");
-    std::ifstream      input(prefix + ".manifest");
-    std::ostringstream text;
-    std::string        line;
-    bool               found = false;
-    while (std::getline(input, line)) {
-      if (line.starts_with(".router ")) {
-        text << ".router " << digest.bytes << ' ' << digest.hash << '\n';
-        found = true;
-      } else {
-        text << line << '\n';
-      }
-    }
-    require(input.eof() && !input.bad() && found,
-            "Immutable descriptor fixture read failed");
-    input.close();
-    std::ofstream output(prefix + ".manifest");
-    output << text.str();
-    require(bool(output), "Immutable descriptor fixture write failed");
-  }
-
   // Restrict only this fixture process, and restore even when a check throws.
   // Growth fixtures have no dirty pages; output-copy fixtures have a clean
   // source.
@@ -285,26 +267,6 @@ namespace {
     routing.mode = fixture_mode;
     NativeIndex<T>::build(prefix, vectors, pq_path, codes_path, training,
                           {dim, capacity, 4096, 2}, routing, first);
-    require(NativeIndex<T>::open(prefix, {2})->manifest().router_backend ==
-                current_router_backend,
-            "New index has a stale router producer identity");
-    // Historical safety-corrected bundles retain their producer on mutable
-    // origins. Only test-owned text and its descriptor digest change; graph
-    // bytes stay frozen.
-    auto replace_backend = [&](const std::string& path) {
-      std::ifstream input(path);
-      std::string   text((std::istreambuf_iterator<char>(input)), {});
-      const auto    at = text.find(current_router_backend);
-      require(at != std::string::npos, "Missing current producer in fixture");
-      text.replace(at, std::string(current_router_backend).size(),
-                   legacy_safety_router_backend);
-      std::ofstream output(path);
-      output << text;
-      require(bool(output), "Producer fixture write failed");
-    };
-    replace_backend(prefix + ".router");
-    replace_backend(prefix + ".manifest");
-    rehash_immutable_descriptor(prefix);
     std::array<ArtifactDigest, 3> native_identity{};
     if (routing.native_modes)
       for (size_t i = 0; i < native_identity.size(); ++i)
@@ -724,9 +686,6 @@ namespace {
           artifact_digest(checkpoint + mutable_component_suffixes[i]);
     auto reopened = MutableIndex<T>::reopen(
         checkpoint, (root / "reopened live.heap").string(), {2});
-    require(reopened->origin_manifest().router_backend ==
-                legacy_safety_router_backend,
-            "Mutable checkpoint relabeled a historical producer");
     std::vector<ExactHit> checkpoint_oracle;
     for (uint32_t r = 0; r < rows; ++r)
       if (reopened->contains(first + r))
@@ -791,23 +750,43 @@ namespace {
               "continued mutation modified checkpoint family");
     if constexpr (std::is_same_v<T, float>) {
       uint32_t corruption = 0;
-      auto     bad_case = [&](auto edit) {
+      auto     bad_case = [&](auto edit, bool preflight = false) {
         const auto bad =
             (root / ("corrupt checkpoint " + std::to_string(corruption)))
                 .string();
         copy_checkpoint(checkpoint, bad);
         edit(bad);
         rehash_manifest(bad);
-        rejects([&] {
-          MutableIndex<T>::reopen(
-              bad,
-              (root /
-               ("corrupt reopen " + std::to_string(corruption) + ".heap"))
-                  .string(),
-              {2});
-        });
+        const auto output =
+            (root / ("corrupt reopen " + std::to_string(corruption) + ".heap"))
+                .string();
+        rejects([&] { MutableIndex<T>::reopen(bad, output, {2}); },
+                preflight ? "Unsupported IVF index producer" : nullptr);
+        if (preflight)
+          require(!std::filesystem::exists(output) &&
+                          !std::filesystem::exists(output + ".pq.bin"),
+                      "Rejected producer claimed a private output");
         ++corruption;
       };
+      // Rehash the outer checkpoint so refusal exercises the origin's producer
+      // policy rather than its content digest. No private heap may be claimed.
+      for (const auto* backend :
+           {"hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"})
+        bad_case(
+            [&](const std::string& bad) {
+              std::ifstream input(bad + ".origin");
+              std::string   text((std::istreambuf_iterator<char>(input)), {});
+              const auto    at = text.find(router_backend_id);
+              require(at != std::string::npos,
+                      "Missing stock producer in origin");
+              text.replace(at, std::string(router_backend_id).size(), backend);
+              input.close();
+              {
+                std::ofstream output(bad + ".origin");
+                output << text;
+              }
+            },
+            true);
       bad_case([&](const std::string& bad) {
         replace_at(bad + ".mlists", 44, uint8_t(1));
         rehash_trailer(bad + ".mlists");

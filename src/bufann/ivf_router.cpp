@@ -492,7 +492,7 @@ namespace diskann::ivf {
     meta.imbue(std::locale::classic());
     meta << std::setprecision(17)
          << (_options.native_modes ? "IVFROUTER2" : "IVFROUTER1") << ' '
-         << _artifact_backend << ' ' << _dim << ' ' << nlist() << ' '
+         << router_backend_id << ' ' << _dim << ' ' << nlist() << ' '
          << _options.degree << ' ' << _options.construction_breadth << ' '
          << _options.query_breadth << ' ' << _options.insert_breadth << ' '
          << _options.seed << ' ' << std::filesystem::file_size(vectors) << ' '
@@ -537,9 +537,10 @@ namespace diskann::ivf {
         options.insert_breadth >> options.seed >> vector_bytes >> vector_hash >>
         graph_bytes >> graph_hash;
     check(bool(meta) && (magic == "IVFROUTER1" || magic == "IVFROUTER2") &&
-              supported_router_backend(backend, magic == "IVFROUTER1") &&
               count <= INT32_MAX,
           "Invalid router descriptor");
+    check(backend == router_backend_id,
+          "Unsupported IVF router producer; rebuild with hnswlib-0.8.0-stock1");
     uint64_t native_bytes = 0, native_hash = 0, refined_bytes = 0,
              refined_hash = 0, pca_bytes = 0, pca_hash = 0;
     PatchedGraphDiagnostics base_stats{}, refined_stats{};
@@ -601,7 +602,6 @@ namespace diskann::ivf {
     validate_graph(graph, dim, centroids, options);
     auto router = std::unique_ptr<CentroidRouter>(
         new CentroidRouter(dim, centroids, options));
-    router->_artifact_backend = backend;
     // Release the validation table before loading the graph's vector copy;
     // the preflight estimate allows two copies, not three overlapping ones.
     std::vector<float>().swap(centroids);

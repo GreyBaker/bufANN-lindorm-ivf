@@ -11,6 +11,20 @@ from test_cli import write_pivots
 from test_cli_execution import run
 
 
+def reject_historical_producers(search, path, original):
+    """Reject retired labels in every framing; never relabel test-owned inputs."""
+    assert original.split()[3] == "hnswlib-0.8.0-stock1"
+    try:
+        for backend in ("hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"):
+            rejected = original.replace("hnswlib-0.8.0-stock1", backend)
+            path.write_text(rejected)
+            result = run(search)
+            assert "Unsupported IVF index producer" in result.stderr
+            assert path.read_text() == rejected
+    finally:
+        path.write_text(original)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", required=True)
@@ -154,6 +168,7 @@ def main():
                     "4",
                 ]
                 observed = run(search, "query")
+                reject_historical_producers(search, Path(str(prefix) + ".manifest"), manifest)
                 for key in (
                     "trainer_mode",
                     "trainer_init",
@@ -237,8 +252,8 @@ def main():
                 refused = root / (dtype + "_refused_" + str(index))
                 run(base + ["--index_prefix", str(refused)] + extra)
                 assert not Path(str(refused) + ".manifest").exists()
-            # Legacy framing is supported only with its real rebuilt/sample
-            # semantics; mutable .origin must retain that producer identity.
+            # Older framing remains supported with rebuilt/sample semantics and
+            # the sole stock1 producer. Checkpoints preserve the framing version.
             for version in (1, 2):
                 prefix = root / (dtype + "_legacy" + str(version))
                 legacy = base + [
@@ -261,28 +276,6 @@ def main():
                         line
                         for line in text.splitlines()
                         if not line.startswith(("trainer ", "optimized_modes "))
-                    )
-                    + "\n"
-                )
-                backend = "hnswlib-0.8.0-nomv" if version == 1 else "hnswlib-0.8.0-prefetch1"
-                router_path = Path(str(prefix) + ".router")
-                router_path.write_text(
-                    router_path.read_text().replace("hnswlib-0.8.0-stock1", backend)
-                )
-                descriptor = router_path.read_bytes()
-                # Rebind only the test-owned descriptor digest, keeping all graph
-                # bytes unchanged. Both historical framing and producer survive.
-                descriptor_hash = 14695981039346656037
-                for byte in descriptor:
-                    descriptor_hash = ((descriptor_hash ^ byte) * 1099511628211) & ((1 << 64) - 1)
-                text = (
-                    "\n".join(
-                        (
-                            f".router {len(descriptor)} {descriptor_hash}"
-                            if line.startswith(".router ")
-                            else line.replace("hnswlib-0.8.0-stock1", backend)
-                        )
-                        for line in text.splitlines()
                     )
                     + "\n"
                 )
@@ -310,6 +303,7 @@ def main():
                     "4",
                 ]
                 metrics = run(search, "query")
+                reject_historical_producers(search, manifest, text)
                 assert (
                     metrics["trainer_mode"] == "ann-rebuild"
                     and metrics["trainer_init"] == "sample"

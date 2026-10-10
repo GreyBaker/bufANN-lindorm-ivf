@@ -19,10 +19,13 @@ namespace {
       throw std::runtime_error(why);
   }
   template<class F>
-  void rejects(F f) {
+  void rejects(F f, const char* expected = nullptr) {
     try {
       f();
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+      require(!expected ||
+                  std::string(error.what()).find(expected) != std::string::npos,
+              "Unexpected refusal reason");
       return;
     }
     throw std::runtime_error("Expected refusal");
@@ -223,41 +226,47 @@ namespace {
                                        nullptr,
                                        {RouterMode::Hnswlib, 3, breadth}),
           "Duplicate patch-off parity failed");
-    auto legacy = CentroidRouter::build(dim, v);
+    auto plain = CentroidRouter::build(dim, v);
     rejects([&] {
-      legacy->search({q.data(), dim}, 1, false, nullptr,
-                     {RouterMode::PatchedFull});
+      plain->search({q.data(), dim}, 1, false, nullptr,
+                    {RouterMode::PatchedFull});
     });
-    legacy->save((root / "legacy").string());
-    require(
-        !CentroidRouter::load((root / "legacy").string())->has_native_modes(),
-        "Legacy routing changed");
-    auto       legacy_descriptor = bytes((root / "legacy.router").string());
-    const auto backend_at = legacy_descriptor.find(current_router_backend);
-    require(backend_at != std::string::npos, "Missing producer identity");
-    auto safety_descriptor = legacy_descriptor;
-    safety_descriptor.replace(backend_at,
-                              std::string(current_router_backend).size(),
-                              legacy_safety_router_backend);
-    {
-      std::ofstream file(root / "legacy.router");
-      file << safety_descriptor;
+    const auto plain_prefix = (root / "plain").string();
+    plain->save(plain_prefix);
+    require(!CentroidRouter::load(plain_prefix)->has_native_modes(),
+            "Plain routing changed");
+    // Both descriptor framings require stock1. Alter only test-owned metadata;
+    // failed loads must neither rewrite it nor produce a relabeled copy.
+    for (const auto& source : {plain_prefix, prefix}) {
+      const auto descriptor = bytes(source + ".router");
+      const auto backend_at = descriptor.find(router_backend_id);
+      require(backend_at != std::string::npos,
+              "Missing stock producer identity");
+      for (const auto* backend :
+           {"hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"}) {
+        auto rejected = descriptor;
+        rejected.replace(backend_at, std::string(router_backend_id).size(),
+                         backend);
+        {
+          std::ofstream file(source + ".router");
+          file << rejected;
+        }
+        const auto copy = source + ".rejected_copy";
+        rejects([&] { CentroidRouter::load(source)->save(copy); },
+                "Unsupported IVF router producer");
+        require(bytes(source + ".router") == rejected &&
+                    !std::filesystem::exists(copy + ".router"),
+                "Rejected producer was rewritten or copied");
+      }
+      {
+        std::ofstream file(source + ".router");
+        file << descriptor;
+      }
+      const auto copy = source + ".stock_copy";
+      CentroidRouter::load(source)->save(copy);
+      require(bytes(copy + ".router") == descriptor,
+              "Stock producer roundtrip changed");
     }
-    auto safety = CentroidRouter::load((root / "legacy").string());
-    safety->save((root / "safety_copy").string());
-    require(bytes((root / "safety_copy.router").string()) == safety_descriptor,
-            "Historical safety producer changed on copy");
-    legacy_descriptor.replace(backend_at,
-                              std::string(current_router_backend).size(),
-                              legacy_scalar_router_backend);
-    {
-      std::ofstream file(root / "legacy.router");
-      file << legacy_descriptor;
-    }
-    auto previous = CentroidRouter::load((root / "legacy").string());
-    previous->save((root / "legacy_copy").string());
-    require(bytes((root / "legacy_copy.router").string()) == legacy_descriptor,
-            "Legacy checkpoint changed frozen router producer identity");
     const auto corrupt = prefix + ".refined.hnsw";
     {
       std::fstream file(corrupt,

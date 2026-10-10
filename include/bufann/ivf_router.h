@@ -9,20 +9,9 @@
 #include "bufann/ivf_centroids.h"
 
 namespace diskann::ivf {
-  // Producer identity is independent of artifact framing. Loaded bundles retain
-  // their historical identity when copied or checkpointed; only new builds use
-  // the current label. This identifies the producer, not the reader's code.
-  inline constexpr const char* current_router_backend = "hnswlib-0.8.0-stock1";
-  inline constexpr const char* legacy_safety_router_backend =
-      "hnswlib-0.8.0-prefetch1";
-  inline constexpr const char* legacy_scalar_router_backend =
-      "hnswlib-0.8.0-nomv";
-  inline bool supported_router_backend(const std::string& backend,
-                                       bool               allow_legacy_scalar) {
-    return backend == current_router_backend ||
-           backend == legacy_safety_router_backend ||
-           (allow_legacy_scalar && backend == legacy_scalar_router_backend);
-  }
+  // The only accepted/written producer label, independent of artifact framing.
+  // It identifies the stock comparison dependency, not every IVF graph mode.
+  inline constexpr const char* router_backend_id = "hnswlib-0.8.0-stock1";
   enum class RouterMode {
     Default,
     Hnswlib,
@@ -146,9 +135,6 @@ namespace diskann::ivf {
     RouterOptions         _options;
     std::vector<float>    _centroids;
     std::unique_ptr<Impl> _impl;
-    std::string           _artifact_backend =
-        current_router_backend;  // Load replaces this with the original
-                                 // producer.
   };
 
   // Shared native sampler/means/empty recovery, using rebuilt centroid HNSW for

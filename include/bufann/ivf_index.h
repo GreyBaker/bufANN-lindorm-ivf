@@ -39,8 +39,7 @@ namespace diskann::ivf {
 
   struct IndexManifest {
     uint32_t format_version =
-        3;  // Preserve legacy producer framing in mutable origin checkpoints.
-    std::string   router_backend = current_router_backend;
+        3;  // Preserve loaded framing versions in mutable origin checkpoints.
     BuildConfig   training;
     RouterOptions routing;
     HeapOptions   heap;

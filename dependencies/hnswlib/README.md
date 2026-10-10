@@ -64,12 +64,17 @@ results and must not be relabeled. New comparisons require fresh build identitie
 CLI defaults and graph artifact formats are unchanged, but the stock dependency
 implementation has changed from the previous safety-corrected build.
 
-New router descriptors and index manifests identify this producer as
-`hnswlib-0.8.0-stock1`. Readers still accept historical
-`hnswlib-0.8.0-prefetch1` and the older scalar `hnswlib-0.8.0-nomv` family.
-Copies and mutable checkpoints preserve the loaded producer identity, not the
-current build default. This label describes the comparison dependency; it does
-not imply that the local IVF graph is unmodified upstream or SIMD-qualified.
+Router descriptors, index manifests and mutable checkpoint origins accept only
+`hnswlib-0.8.0-stock1`; writers emit that same constant. Historical
+`hnswlib-0.8.0-prefetch1` and `hnswlib-0.8.0-nomv` labels are no longer supported.
+This is an intentional reader compatibility break, not a framing-version change.
+Rebuild required indexes into fresh prefixes, or retain the original tools for
+historical replay. Never relabel old artifacts or their measurements, including
+transition-period stock builds that still carried the old label.
+
+The label describes the comparison dependency; it does not imply that the local
+IVF graph is unmodified upstream or SIMD-qualified. Modified IVF training/routing
+and scalar sanitizer builds remain available under the sole producer label.
 
 Unmodified v0.8.0 retains known prefetch lookahead issues, including the neighbor-ID
 read previously found by ASan in `hnswalg.h:277-278`. Sanitizer builds disable manual

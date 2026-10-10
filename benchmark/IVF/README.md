@@ -115,8 +115,12 @@ from a frozen search/prune pass and reinserts zero-in-degree nodes once; global
 connectivity is not guaranteed. PCA traversal reranks in full coordinates.
 Final centroids/routers/PCA are frozen across mutations and query overrides.
 An explicit query `--router_mode default` resolves to the persisted mode, as
-does omitting the flag. New bundles use producer `hnswlib-0.8.0-stock1`;
-historical labels remain readable and unchanged on copying/checkpointing.
+does omitting the flag. Readers and writers require producer
+`hnswlib-0.8.0-stock1`, including mutable checkpoint origins. Historical
+`hnswlib-0.8.0-prefetch1` and `hnswlib-0.8.0-nomv` bundles are rejected: rebuild
+into a fresh prefix or use the original tool for historical replay. Do not
+relabel old artifacts/reports, including stock builds made before the label fix.
+Framing versions remain supported independently of the producer policy.
 
 ### Sequential insert/delete
 
@@ -419,7 +423,8 @@ minima 32/20/1 and historical compatibility, frozen provenance, build/reopen,
 mutation/mixed scoring, caches/no-overwrite/identity failures, repeats and gates.
 Additional checks cover sibling CMake target visibility, routing builds without
 Python discovery, artifact claim/hash behavior, report-only shell preparation,
-historical producer preservation and router-sweep failure/timeout evidence.
+retired-producer rejection, stock-only checkpoint roundtrips and router-sweep
+failure/timeout evidence.
 Optional `ivf_trained_helper_integration` requires both existing standalone helpers
 configured with `IVF_PQ_PIVOT_HELPER` and `IVF_PQ_CODES_HELPER`; it checks trained
 encoder/ADC parity and script results for all dtypes (4096 rows, 13 dimensions,
