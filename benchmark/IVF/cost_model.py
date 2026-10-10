@@ -6,8 +6,9 @@ import os
 from pathlib import Path
 import sys
 
-from harness import digest, flags, require, write_json, read_cost_model_report
-from qualify import affinity, execute, runtime_environment
+from common import (affinity, digest, execute, flags, require, runtime_environment,
+                    shared_module_paths, write_json)
+from settings import CALIBRATION_DEFAULTS, read_cost_model_report
 
 
 def main():
@@ -20,15 +21,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=1800)
     # Match native flag spelling via a single explicit map; no pass-through flags
     # can inject official queries, result paths, or a supplied timing coefficient.
-    defaults = {"data_type": "float", "dim": None, "base_count": None, "sample_count": None,
-        "nlist_grid": None, "synthetic_queries": "100", "topk": "10", "target_recall": ".90", "seed": "0",
-        "max_reps": "15", "build_threads": "1", "memory_budget_gb": "1", "trainer_mode": "ann-reuse-seeded",
-        "init": "random_partition", "training_breadth": "64", "router_mode": "hnswlib", "optimized_modes": "0",
-        "router_degree": "16", "construction_breadth": "200", "query_breadth": "128", "insert_breadth": "64",
-        "router_seed": "100", "refine_ef": "128", "pca_variance": ".95", "router_rerank_factor": "3",
-        "routing_work_limit": "1000000000", "profile_codes": "100000", "profile_repeats": "3",
-        "routing_repeats": "3", "rerank_factor": "4", "work_limit": "1000000000",
-        "min_sample_per_centroid": "32", "training_rerank_factor": "3", "training_refine_breadth": "128"}
+    defaults = CALIBRATION_DEFAULTS
     for key, value in defaults.items():
         parser.add_argument("--" + key.replace("_", "-"), default=value, required=value is None)
     args = parser.parse_args()
@@ -39,7 +32,7 @@ def main():
     paths = {"data": data, "pq_pivots": Path(str(pq) + "_pq_pivots.bin"),
         "pq_codes": Path(str(pq) + "_pq_compressed.bin"), "tool": tool, "orchestrator": Path(__file__).resolve(),
         "harness": Path(__file__).with_name("harness.py").resolve(),
-        "qualifier": Path(__file__).with_name("qualify.py").resolve()}
+        "qualifier": Path(__file__).with_name("qualify.py").resolve(), **shared_module_paths()}
     for name in ("libBufANN.a", "libBufANN.so"):
         library = tool.parent.parent / "src" / name
         if library.is_file():

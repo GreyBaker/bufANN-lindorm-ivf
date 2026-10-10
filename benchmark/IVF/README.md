@@ -1,61 +1,63 @@
-# Native IVF build, calibration and workload harness
+# Native IVF build and benchmark guide
 
-Linux/WSL query-only scripts are implemented and tested with synthetic and
-standalone-helper-trained fixtures for `float`, `int8`, and `uint8`. This is not
-production SIFT training, recall/QPS or memory qualification. No vector-level
-graph, Vamana conversion, distributed service or SPFresh source change is required.
-Sequential insert/delete prepare/run pairs and native mutable checkpoint/reopen
-are implemented, as are concurrent weighted/fixed 8+8 mixed prepare/run pairs.
-Production qualification and paired SPFresh comparison are separate from these
-functional features. Configure inputs and dependencies for your own machine;
-examples below are not qualified production settings.
-
-`IVF_OPTIMIZED_MODES=1` builds the patched-hnswlib/PCA router family;
-`IVF_ASSIGNMENT_ROUTER_MODE=pca-refined` sets the frozen build/insert default.
-`IVF_ROUTER_MODE` changes queries only without invalidating that build cache.
+The single-node IVF backend supports build/reload, queries, sequential
+insert/delete and concurrent weighted or fixed 8+8 mixed rounds on Linux/WSL.
+It routes through centroids and reuses global PQ8 codes; no vector graph or
+DiskANN/Vamana conversion is required. BufANN/SPFresh remain separate baselines.
+These tools and small functional fixtures **do not qualify production settings
+or establish paper speedups**. Supply your own inputs, declare resource/quality
+budgets, and keep reserved final queries out of calibration and tuning.
 
 ## Build with installed system dependencies
 
-Use an already-configured full routing-enabled build via `IVF_BUILD_DIR`, or
-configure a separate tree. Example for a oneAPI installation (adjust paths):
+Use an existing full routing-enabled build via `IVF_BUILD_DIR`, or configure a
+separate tree (adjust these oneAPI paths for your installation):
 
 ```bash
-IVF_BUILD_DIR="$PWD/build/ivf-benchmark" bash benchmark/IVF/build.sh \
+export IVF_BUILD_DIR="$PWD/build/ivf-benchmark"
+bash benchmark/IVF/build.sh \
   -DMKL_ROOT=/opt/intel/oneapi/mkl/2026.1 \
   -DMKL_LIBRARY_DIR=/opt/intel/oneapi/mkl/2026.1/lib \
   -DINTEL_OMP_LIBRARY_DIR=/opt/intel/oneapi/compiler/2026.1/lib
 ```
 
-The script enables `IVF_BUILD_ROUTING=ON` and builds `ivf_build`/`ivf_driver`,
-`ivf_cost_model` and training/router diagnostics without
-changing other baseline build trees. Administrator-installed MKL (ILP64, Intel
-threaded), iomp5 and libaio linkage is retained. Override paths for your install;
-default build directory is `build/ivf-benchmark`, jobs default to 4. Prepare/run
-consume existing binaries, **never** silently configure/install dependencies.
-The shared legacy `benchmark/scripts/build.sh` dependency-prefix path remains
-separate and unqualified; it is not the explicit build above.
+This enables `IVF_BUILD_ROUTING=ON` and builds `ivf_build`, `ivf_driver`,
+`ivf_cost_model`, `ivf_training_diagnostics` and `ivf_router_diagnostics` under
+`$IVF_BUILD_DIR/tests/`. The default tree is `build/ivf-benchmark`; set
+`IVF_BUILD_JOBS` to change the default 4 jobs. The full native build retains
+administrator-installed MKL (ILP64, Intel-threaded), iomp5 and libaio linkage.
+Prepare/run scripts consume binaries: they never install or configure dependencies.
+The shared `benchmark/scripts/build.sh` dependency-prefix build is separate.
+IVF/dependency CMake setup is in `cmake/IVF.cmake` and `cmake/Hnswlib.cmake`;
+see [hnswlib documentation](../../dependencies/hnswlib/README.md) for the vendored
+IVF version and checksum-pinned, unmodified upstream comparison. No build-time
+patching or header generation is needed.
+
+The Python entry points are `harness.py` (query/sequential workloads), `mixed.py`
+(mixed rounds), `qualify.py` (training/query experiments), `cost_model.py`
+(calibration) and `router_sweep.py` (fixed-router experiments). Shared local-file
+and process helpers live in `common.py`; build defaults and frozen-report policy
+live in `settings.py`. New training/calibration/query-sweep evidence records the
+shared module identities; legacy build/cache setting fields remain unchanged.
 
 ## Input/PQ/GT contracts
 
-- Load the unchanged `benchmark/datasets/<DATASET>.sh` profile. The `.bin` data
-  and query files must exist for query preparation. Mutation preparation uses
-  the shared `ensure_dataset` staging helper; no new downloader/converter is added.
-- `DATA_BIN` must frame exactly `NPTS_FULL` rows and `DIM` coordinates of
-  `DATA_TYPE`. Only `[0, NPTS_BASE)` becomes the initial index. Profile splits
-  and external source-row IDs are not inferred, changed or remapped.
-- Supply `IVF_PQ_PREFIX` with current five-offset pivots and **full-source** codes
-  (`<prefix>_pq_pivots.bin`, `<prefix>_pq_compressed.bin`). PQ is global,
-  non-residual, 8-bit and reused, not retrained by prepare. Canonical graph PQ
-  files often encode only the base: these must not be passed as full-source codes.
-  If needed, copy the existing pivots to a **new** PQ prefix and run the unchanged
-  `build_pq_codes_standalone TYPE DATA_BIN NEW_PREFIX ACTUAL_PQ_CHUNKS 0` helper.
-  Do not overwrite the canonical prefix or train a different comparison codebook.
-- By default derive base GT from `GT_BIN_KCACHED` using the unchanged shared
-  `resolve_incremental_gt ... --base_trunc NPTS_BASE` helper. Alternatively
-  `IVF_GT_FILE` points at caller-supplied matching base GT; it is linked read-only.
-  GT is IDs/distances plus an optional tags plane; tags must equal the ID plane.
-  Nonidentity tag-space mappings are explicitly refused. No GT is rewritten to
-  fit IVF. Inadequate/deep-cache or nonfinite GT fails rather than faking recall.
+- Load `benchmark/datasets/<DATASET>.sh`. Query preparation requires existing
+  data/query `.bin` files; mutation preparation uses shared `ensure_dataset`
+  staging. `DATA_BIN` must contain exactly `NPTS_FULL` rows of `DIM` coordinates
+  of `DATA_TYPE`. Only `[0, NPTS_BASE)` forms the initial index. Profile splits
+  and external source-row IDs are never inferred or remapped.
+- `IVF_PQ_PREFIX` supplies current five-offset `<prefix>_pq_pivots.bin` and
+  **full-source** `<prefix>_pq_compressed.bin`. PQ is global, non-residual, 8-bit,
+  and not retrained by prepare. Canonical graph codes often cover only the base.
+  If needed, copy existing pivots to a **new** prefix and run
+  `build_pq_codes_standalone TYPE DATA_BIN NEW_PREFIX ACTUAL_PQ_CHUNKS 0`.
+  Do not overwrite the canonical prefix or change the comparison codebook.
+- Base GT defaults to `GT_BIN_KCACHED` filtered by the unchanged shared
+  `resolve_incremental_gt ... --base_trunc NPTS_BASE`. `IVF_GT_FILE` instead
+  supplies matching caller-owned GT, linked read-only. GT contains IDs/distances
+  and optional tags equal to the ID plane; nonidentity tag mappings, nonfinite
+  values and inadequate deep-cache candidates fail rather than fabricating recall.
 
 ## Prepare and run
 
@@ -63,80 +65,55 @@ separate and unqualified; it is not the explicit build above.
 export DATASET=sift1m
 export IVF_BUILD_DIR="$PWD/build/ivf-benchmark"
 export IVF_PQ_PREFIX=/absolute/path/to/existing-full-source-pq/prefix
-export IVF_NLIST=1024  # explicit; example only, not qualified production tuning
-export IVF_MEMORY_BUDGET_GB=4
-export IVF_BUILD_THREADS=4
+export IVF_NLIST=1024  # example only, not qualified tuning
+export IVF_MEMORY_BUDGET_GB=4 IVF_BUILD_THREADS=4
 bash benchmark/IVF/sift/query_prepare.sh
-
 IVF_NPROBE=16 IVF_RERANK_FACTOR=4 QUERY_THREADS=4 \
   bash benchmark/IVF/sift/query.sh
 # query_run.sh is an equivalent alias.
+IVF_RUN_TAG=probe32 IVF_NPROBE=32 QUERY_THREADS=4 \
+  bash benchmark/IVF/sift/query.sh
 ```
 
-Prepare materializes `eval_tempfiles/<dataset>/IVF/query/`: dataset/query/GT links
-are read-only inputs; `index/<dataset><suffix>` are **real bundle files**, not
-writable links into the cache. `prepared.json` is written only after completion.
-Existing work trees are refused, not recursively deleted. To re-prepare, preserve
-the old tree and select a fresh `EVAL_TEMPFILES` root. Failed partial trees remain
-for inspection; no rollback, atomic publication/fsync, WAL or repair is claimed.
+Prepare creates `eval_tempfiles/<dataset>/IVF/query/`: read-only input links,
+real private `index/<dataset><suffix>` bundle files, then `prepared.json`.
+Existing/partial work trees are refused and preserved; select a fresh
+`EVAL_TEMPFILES` root to re-prepare. Run checks profile/query/GT/manifest identities;
+native open validates component contents. Working index files may not symlink
+to cache. Outputs are `run.log`, `native_result.json`, canonical `result.json`
+and interleaved SPFresh `neighbors.bin`; shared metrics extraction is cross-checked
+against native output. Failures do not publish empty successful results.
+Existing run files are refused; safe `IVF_RUN_TAG` values (letters, numbers,
+hyphens, underscores) place new output in `query/runs/<tag>/`.
 
-Run consumes the prepared tree in place and writes `run.log`, `native_result.json`,
-`result.json` and interleaved SPFresh `neighbors.bin`. The unchanged shared
-`write_ann_bench_metrics_json` extracts canonical JSON records and is cross-checked
-against native output. Failures do not publish an empty success `result.json`.
-Existing run files are refused. Repeat/sweep without discarding earlier evidence:
+### Settings and frozen routing
 
-```bash
-IVF_RUN_TAG=probe32 IVF_NPROBE=32 QUERY_THREADS=4 bash benchmark/IVF/sift/query.sh
-```
+Build environment variables are `IVF_` plus uppercase CLI fields. Defaults:
 
-Tagged output is under `query/runs/<tag>/`; safe tags contain letters, numbers,
-hyphens or underscores. For automated repeats/setting sweeps, optional CPU pinning
-and explicitly separate-process warmups, see [QUALIFICATION.md](QUALIFICATION.md).
-These tools do not automatically qualify a configuration. Run checks
-profile, query, GT and native-manifest identities; native open validates all
-component contents. Working index directories/components may not symlink to cache.
+| Fields | Defaults |
+|---|---|
+| `NLIST`, `SAMPLE_RATE`, `MAX_REPS`, `SEED` | explicit nlist, 1, 15, 0 |
+| `BUILD_THREADS`, `MEMORY_BUDGET_GB`, `PAGE_SIZE`, `BUFFER_FRAMES` | 1, 1, 4096, 64 |
+| `ROUTER_DEGREE`, `CONSTRUCTION_BREADTH`, `QUERY_BREADTH`, `INSERT_BREADTH`, `ROUTER_SEED` | 16, 200, 128, 64, 100 |
+| `TRAINER_MODE`, `INIT`, `TRAINING_BREADTH` | `ann-reuse-seeded`, `random_partition`, 64 |
+| `OPTIMIZED_MODES`, `REFINE_EF`, `PCA_VARIANCE`, `BUILD_ROUTER_RERANK_FACTOR`, `ROUTING_WORK_LIMIT` | 0, 128, .95, 3, 1000000000 |
 
-### Settings
+Run defaults: `IVF_NPROBE=1`, `IVF_RERANK_FACTOR=2`, `QUERY_THREADS=1`,
+profile `RECALL_AT` (normally 10), `IVF_BUFFER_FRAMES=64`.
+`IVF_QUERY_MEMORY_BUDGET_GB` falls back to `IVF_MEMORY_BUDGET_GB`, then 1.
+`IVF_ROUTER_BREADTH` overrides persisted query breadth without rebuilding.
+Query thread settings do not imply a mixed-workload worker split.
 
-Build settings use `IVF_` plus the uppercase CLI field: `IVF_NLIST` (required unless
-`IVF_COST_MODEL_REPORT` supplies a frozen choice to the Python harness; the shell
-prepare wrappers still require the matching explicit `IVF_NLIST`),
-`IVF_SAMPLE_RATE` (1), `IVF_MAX_REPS` (15), `IVF_SEED` (0), `IVF_BUILD_THREADS` (1),
-`IVF_MEMORY_BUDGET_GB` (1), `IVF_PAGE_SIZE` (4096), `IVF_BUFFER_FRAMES` (64),
-`IVF_ROUTER_DEGREE` (16), `IVF_CONSTRUCTION_BREADTH` (200), `IVF_QUERY_BREADTH` (128),
-`IVF_INSERT_BREADTH` (64) and `IVF_ROUTER_SEED` (100). CLI validates all settings.
-
-Run uses `IVF_NPROBE` (1), `IVF_RERANK_FACTOR` (2), `QUERY_THREADS` (1), profile
-`RECALL_AT` (normally 10), `IVF_BUFFER_FRAMES` (64), and
-`IVF_QUERY_MEMORY_BUDGET_GB` (falls back to `IVF_MEMORY_BUDGET_GB`, then 1).
-With no query override, persisted query breadth is used. `IVF_ROUTER_BREADTH`
-overrides it for queries without rebuilding. No mutable scheduling/8+8 split
-is implied by query thread settings.
-
-### Optimized centroid routing
-
-Set `IVF_OPTIMIZED_MODES=1` at build time to save the patched, refined and PCA
-artifacts alongside the ordinary HNSW router. Available query modes are `hnswlib`,
-`exact`, `patched-full`, `refined`, `pca`, and `pca-refined`. The latter four require
-that artifact family. `IVF_ASSIGNMENT_ROUTER_MODE` selects the frozen base/insert
-default; `IVF_ROUTER_MODE` overrides queries only.
-
-`IVF_REFINE_EF` (128), `IVF_PCA_VARIANCE` (.95) and
-`IVF_BUILD_ROUTER_RERANK_FACTOR` (3) configure final-router construction/search.
-`IVF_ROUTING_WORK_LIMIT` (1000000000) bounds refinement/PCA setup work.
-For query-only overrides use `IVF_ROUTER_RERANK_FACTOR` and `IVF_ROUTER_BREADTH`.
-These centroid rerank factors are distinct from `IVF_RERANK_FACTOR`, which controls
-full-vector candidates after PQ scanning.
-
-Construction and pruning use full coordinates. Refinement replaces bottom-layer
-out-edges from a frozen search/prune pass, then reinserts zero-in-degree nodes
-once; it does not guarantee global connectivity. PCA traversal uses compressed
-centroids followed by full-coordinate reranking. Final router/PCA artifacts are
-frozen across insert/delete/mixed workloads; they are not refit by query overrides.
-See [QUALIFICATION.md](QUALIFICATION.md#fixed-router-diagnostics) for centroid-only
-measurements, or [the patch description](../../dependencies/hnswlib-patches/README.md)
-for dependency mechanics.
+Query router modes are `hnswlib`, `exact`, `patched-full`, `refined`, `pca`,
+`pca-refined`; the latter four need `IVF_OPTIMIZED_MODES=1` artifacts.
+`IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert default (`hnswlib`);
+`IVF_ROUTER_MODE` overrides queries only and does not invalidate the build cache.
+`IVF_ROUTER_RERANK_FACTOR` is a query-only centroid-rerank override, distinct
+from `IVF_RERANK_FACTOR` (full-vector candidates after PQ scanning).
+Construction/pruning use full coordinates. Refinement replaces bottom out-edges
+from a frozen search/prune pass and reinserts zero-in-degree nodes once; global
+connectivity is not guaranteed. PCA traversal reranks in full coordinates.
+Final centroids/routers/PCA are frozen across mutations and query overrides.
 
 ### Sequential insert/delete
 
@@ -147,28 +124,15 @@ UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete_prepare.sh
 UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete.sh
 ```
 
-Use the same build/PQ/profile environment as above. Shared split/count helpers
-preserve SPFresh's initial base, insert-tail and delete-base-tail IDs. Optional
-`INSERT_POINTS`/`DELETE_POINTS` override only counts. Default GT is filtered for
-the final live prefix with the unchanged helper; `IVF_GT_FILE` must be matching
-**post-update** GT. Insufficient survivors fail, never pad truth.
-
-Each pair owns a distinct `.../IVF/{insert,delete}/` tree. Prepare caches/restores
-only a real immutable base family. Run updates a new private heap, saves a separate
-mutable checkpoint, then reopens a new private copy for post-update scoring.
-`mutation_result.json` (insert/delete loops) and `result.json` (final query) are
-separate canonical records cross-checked with shared extraction. `IVF_RUN_TAG`
-preserves repeated runs starting from the same base; no old work is reset/deleted.
-One sequential mutation worker is used; `QUERY_THREADS` controls only the later
-query pass, not queries during updates. Native `search_after_update` is also
-explicitly sequential, not mixed scheduling. Use `ivf_driver --help` for direct
-native flags.
-
-Posting lists use append/+16-slot growth and swap deletion with a locator; deleted
-IDs cannot be reused. Checkpoints preserve live IDs, tombstones and aborted heap
-records, require joined/quiescent workers, and reopen on new private files. They
-do not reclaim physical slots or provide coordinated WAL/crash recovery,
-atomic/fsync publication or transactional durability.
+Use the same build/PQ/profile environment. Shared split/count helpers preserve
+SPFresh's base, insert-tail and delete-base-tail IDs; `INSERT_POINTS`/`DELETE_POINTS`
+override counts only. GT must match the **post-update** live prefix; insufficient
+survivors fail. Each pair owns `.../IVF/{insert,delete}/`, restores only an immutable
+base, mutates a new private heap, checkpoints, then reopens another private copy
+for scoring. `mutation_result.json` and final-query `result.json` are separate,
+cross-checked canonical records. Tags preserve repeats from the same base.
+One sequential mutation worker is used; `QUERY_THREADS` controls later scoring,
+not concurrent queries. Native `search_after_update` is also sequential.
 
 ### Concurrent mixed rounds
 
@@ -180,72 +144,137 @@ UPDATE_PERCENT=10 UPDATE_BATCH=10000 IVF_SCHEDULER=fixed_8_8 NTHREADS=16 \
   IVF_RUN_TAG=fixed QUERY_THREADS=4 bash benchmark/IVF/sift/update.sh
 ```
 
-Caps/counts/round GT use the unchanged SPFresh/shared layout helpers, including
-equal insert/delete caps for paired scripts. Weighted mode reuses the shared
-remaining-operation scheduler; fixed mode has eight dedicated mutation and eight
-query workers, not graph-maintenance threads. `QUERY_THREADS` controls only
-post-round scoring. `QUERY_POINTS` uses the shared total/per-round policy; otherwise
-`QUERY_RATIO` defaults to 80. Every round joins, validates/checkpoints and scores
-against its matching GT; the next process reopens onto a new private heap.
-Concurrent query timing/overlap is separate from post-barrier recall. Root
-`result.json` is the final round record; `summary.json` retains all round records
-and always disclaims production qualification. Earlier work is never reset.
+Shared SPFresh layout helpers supply caps/counts/round GT, including equal
+insert/delete caps. Weighted mode uses the remaining-operation scheduler;
+fixed mode has eight mutation and eight query workers, not graph-maintenance
+threads. `QUERY_POINTS` follows the shared total/per-round policy; otherwise
+`QUERY_RATIO=80`. `QUERY_THREADS` controls post-round scoring only. Each round
+joins, validates/checkpoints and scores against matching GT; the next process
+reopens a new private heap. Concurrent query timing/overlap has no synchronized
+recall against a moving set; recall is measured separately after the barrier.
+Root `result.json` is the final round; `summary.json` retains all rounds.
+For direct native flags, see `ivf_driver --help` (`--workload mixed`).
 
-For direct native execution use `ivf_driver --workload mixed`; `--help` lists
-required inputs, scheduling and checkpoint flags. Concurrent query timings do
-not carry synchronized recall against a moving live set; recall is measured
-separately after each round's mutation/query workers have joined.
+Posting lists grow by append/+16 slots and use locator/swap deletion. Deleted
+IDs cannot be reused. Checkpoints retain tombstones/aborted physical records and
+require quiescent workers; they provide no slot reclamation, coordinated WAL,
+crash recovery, atomic/fsync publication or transactional durability.
 
-### Cache identity and costs
+### Cache and measurement scopes
 
-`eval_cached/<dataset>/IVF/<sha256-key>/` binds exact build settings/profile,
-streamed full vector/pivot/code identities, builder and BufANN library bytes,
-plus optional `IVF_CACHE_TAG`. Cached components/manifest are hashed before/after
-copying; checksum/identity failures refuse reuse rather than overwriting cache.
-`EVAL_CACHE_NO_STORE` (any nonempty value) disables new cache stores, not restores.
-Cache hits report restore events, **not** new build-time measurements.
+`eval_cached/<dataset>/IVF/<sha256-key>/` binds exact settings/profile, full
+vector/pivot/code identities, builder/library bytes and optional `IVF_CACHE_TAG`.
+Components are hashed before/after real copies; identity/checksum failures refuse
+reuse. Nonempty `EVAL_CACHE_NO_STORE` disables new stores, not restores. Hits
+measure restoration, **not** new builds. Identities are not authentication or
+external PQ-training provenance; keep inputs trusted/immutable. Artifacts are
+machine-local, and runtime-library/ABI/toolchain tracking is not exhaustive:
+advance `IVF_CACHE_TAG` or change cache roots when that environment changes.
 
-Identity is not authentication or external PQ-training provenance. Files must be
-trusted/immutable during operations; native artifacts are machine-local. External
-runtime-library/ABI/toolchain identity is not exhaustively tracked: advance
-`IVF_CACHE_TAG` (or use a new cache root) when that environment changes.
+Hashing/copies warm caches; native open hashes the entire heap. `build_time_s`
+spans native build and its post-build router reload, excluding Python hashing/cache work. `query_time_s`
+excludes preparation, checks, open, scoring and export. Lifetime peak RSS includes
+these phases. Backend heap-read counters are buffer-pool reads, not physical
+device I/O. Cache policy is uncontrolled (not cold-device throughput); heap
+pin/copy admission remains serialized. Memory budgets guard conservative workspace
+estimates, not hard RSS caps. Record machine/storage/compiler/runtime settings,
+including `OMP_NUM_THREADS`/`MKL_NUM_THREADS`, for performance measurements.
 
-Full-source hashes, heap/component hashing and real cache copies add startup I/O
-and warm caches. `build_time_s` measures the native API, not Python hashing/cache
-work; `query_time_s` excludes preparation, input/GT checks, open, scoring and
-export. Native open itself hashes the entire heap. Cache policy is uncontrolled,
-not cold-device throughput. Pin/copy admission remains serialized. Lifetime peak
-RSS includes startup/open/scoring/export, not just timed queries. Heap-read
-counters are backend buffer-pool reads, not proof of physical device I/O. Memory
-budgets check conservative workspace estimates rather than enforcing hard RSS caps.
+## Training and bounded ablations
 
-## Calibration and verification
+Select `IVF_TRAINER_MODE` (or native `--trainer_mode`):
 
-### Calibration and selection provenance
+| Mode | Assignment policy |
+|---|---|
+| `exact` | Scalar double-L2 enumeration, work-bounded; no GEMM requirement |
+| `hnsw` / `ann-rebuild` | Rebuilt full-coordinate HNSW, breadth-sized double rescoring (`hnsw` is a diagnostic alias) |
+| `ann-reuse` / `ann-reuse-seeded` | Reused full-coordinate graph, legacy rescoring; optional previous-assignment seed |
+| `ann-reuse-count` / `ann-reuse-seeded-count` | Reused full-coordinate graph returns nearest-one under its float metric; double assigned objective counted separately |
+| `lv` / `lv-plus` | Reused/refined graph, 95%-variance PCA assignment, bounded full-coordinate rerank; LV+ adds only previous-assignment seeding |
 
-`benchmark/IVF/cost_model.py` orchestrates the native paper-style `T1+T2` tool
-using only base rows and disjoint synthetic queries. It freezes source/PQ/tool
-identities, actual samples/GT/routers, eligible/excluded candidates and predictions.
-`IVF_COST_MODEL_REPORT=/path/report.json` supplies its chosen `nlist` to preparation;
-settings/source mismatches and conflicting manual choices fail. Preparation/cache
-metadata and adjacent run `nlist_selection.json` preserve the report path/hash.
-Model selection is orchestration metadata, not a new native index format;
-manual controls remain available. Trainer-specific formats are described below.
+CLI/harness defaults are in the settings table; programmatic `BuildConfig` keeps
+legacy `ann-rebuild`/`sample` defaults. `IVF_INIT=sample|random_partition` and
+`IVF_TRAINING_BREADTH` enter cache identity independently of final routing.
+LV/LV+ require `random_partition`: full-coordinate old-neighbor refresh, one
+initial bottom refinement/isolated-node reinsertion, PCA refit/reprojection at
+every joined assignment boundary (including the final one), and first/invalid-seed
+fallback. `IVF_TRAINING_RERANK_FACTOR=3` bounds returned full-rerank candidates;
+`IVF_TRAINING_REFINE_BREADTH=128` controls initial refinement. Matching native
+flags use lowercase underscores; nondefault overrides require LV/LV+.
+These are independent of final router settings and do not require optimized
+final-router artifacts. Fixed pass caps, hnswlib substitution and interpreted
+moving-PCA/initial-only-refinement schedules limit exact paper reproduction.
 
-This is functional implementation, **not** production calibration or the required
-SIFT10M prediction-validation study. Fetch/rerank are excluded; no end-to-end-QPS
-optimum is claimed. The estimator minimizes mean measured centroid routing (`T1`)
-plus radius occupancy scaled by `N/m` times a profiled scalar scan/selection
-coefficient (`T2`). Sample GT is exact double squared L2; repeated GT-cluster IDs
-and inclusive centroid-radius ties are retained. Profiling uses real base PQ
-codes; ADC-table construction, fetch and exact rerank are outside the model.
+`qualify.py train` uses identical deterministic base-only reservoirs, initialization,
+seed, ordered means, empty recovery and pass caps. Each mode runs in a fresh
+process with independent lifetime RSS. Example from the repository root:
 
-Example calibration from the repository root, using a **new** output directory:
+```bash
+source benchmark/datasets/sift1m.sh
+python3 benchmark/IVF/qualify.py train \
+  --data "$DATA_BIN" --dtype "$DATA_TYPE" --dim "$DIM" \
+  --full-count "$NPTS_FULL" --base-count "$NPTS_BASE" \
+  --trainer "$IVF_BUILD_DIR/tests/ivf_training_diagnostics" \
+  --output "$PWD/eval_training/sift1m-comparison-01" \
+  --modes exact,ann-rebuild,ann-reuse,ann-reuse-seeded,ann-reuse-count,ann-reuse-seeded-count,lv,lv-plus \
+  --init random_partition --training-breadth 64 \
+  --training-rerank-factor 3 --training-refine-breadth 128 \
+  --nlist 256 --sample-rate 0.01 --iterations 3 --seed 0 --threads 4 \
+  --memory-budget-gb 1 --exact-work-limit 20000000 \
+  --assignment-work-limit 100000 --evaluation-rows 1000 \
+  --evaluation-work-limit 300000 --routing-work-limit 1000000000 --timeout 1800
+```
+
+Omit `exact` at scales beyond its budget; bounded exact evaluation still runs
+but is **not** an exact-trained reference, so reference ratios remain null.
+Keep all settings except seeding identical for LV vs LV+; separate count-policy
+controls from PCA effects. Repeat training in separate output paths/processes.
+Training breadth falls back to diagnostic `--insert-breadth` if omitted;
+LV rerank/refinement arguments apply only to LV modes in a multi-mode run.
+
+Exact training costs `sample_count * (iterations + 1) * nlist` vector distances;
+exact evaluation costs `min(evaluation_rows, sample_count) * nlist`. Oversized
+reference work fails before modes launch. These limits count vector distances/
+searches, not coordinates or CPU time; `--routing-work-limit` separately bounds
+each refinement/PCA setup's coordinate/solver work. Do not bypass budget failures.
+`--max-sse-ratio` optionally gates evaluation SSE against a selected `exact`
+trainer (required): freeze the threshold first. Both-zero objectives give ratio 1;
+exact-only zero gives null and fails a supplied gate. `--max-peak-rss-mb` is a
+post-run lifetime-RSS gate, not an allocation limit.
+
+Plans/logs and `.sample_ids.bin`, `.centroids.bin`, `.assignments.bin`,
+`.occupancy.bin` are retained (two-uint32-header matrices; float centroids,
+uint32 other values). Sample hashes must match; source/executable identities are
+checked before/after modes. Exact double nearest-centroid SSE and tie-aware
+agreement use identical evenly spaced reservoir slots: **training-sample**, not
+holdout or base-list quality. Approximate assigned SSE is separate. Inspect
+occupancy/recovery and unrepaired connectivity, not timing alone. Graph-distance
+counts cover assignment traversal, exclude construction/reinsertion, and are
+unavailable for vanilla rebuilt HNSW. Returned/reranked/objective counts differ.
+All graph/PCA setup is inside `training_time_s`; setup fields are graph-time
+subsets, worker fields sum worker seconds rather than wall time.
+`evaluation_time_s` is separate; `process_wall_s` spans the child, not Python hashing.
+
+Legacy trainers write `IVFINDEX3` with trainer/init/breadth and an optimized flag;
+count/LV trainers write `IVFINDEX4`, also binding search policy and independent
+rerank/refinement settings. Existing v1/v2 bundles reopen with their actual legacy
+rebuilt/sample/insert-breadth identity. Mutable checkpoints preserve origin
+version/settings; model selection is metadata, not another native index format.
+
+## Base-only frozen calibration
+
+`cost_model.py` orchestrates native `T1+T2` using base rows and disjoint synthetic
+queries, never official queries. It freezes source/PQ/tool identities, samples,
+exact GT, routers, eligible/excluded candidates and predictions. `T1` is mean
+measured centroid routing; `T2` is radius occupancy scaled by `N/m` and a profiled
+scalar-PQ8 scan/selection coefficient using real base codes. Double-L2 sample GT
+retains repeated GT-cluster IDs and inclusive radius ties. ADC-table construction,
+fetch and exact rerank are excluded: this is not an end-to-end-QPS optimum or
+prediction-validation study. PQ4/SIMD small-list penalties are not modeled.
 
 ```bash
 python3 benchmark/IVF/cost_model.py \
-  --tool "$IVF_BUILD_DIR/tests/ivf_cost_model" \
-  --output /new/path/calibration-r10 \
+  --tool "$IVF_BUILD_DIR/tests/ivf_cost_model" --output /new/path/calibration-r10 \
   --data "$DATA_BIN" --pq-prefix "$IVF_PQ_PREFIX" \
   --data-type "$DATA_TYPE" --dim "$DIM" --base-count "$NPTS_BASE" \
   --sample-count 32768 --synthetic-queries 100 \
@@ -254,112 +283,139 @@ python3 benchmark/IVF/cost_model.py \
   --build-threads 4 --memory-budget-gb 4 --min-sample-per-centroid 32
 ```
 
-Choose sample/query counts that fit your base prefix. Eligibility requires
-`sample_count >= nlist * min_sample_per_centroid`. The default **32 is a project
-policy, not a Lindorm paper requirement or its SIMD batch size**. Positive minima
-down to 1 allow explicitly declared sampling-sensitivity work while enforcing
-`nlist <= sample_count`; they do not prove sparse-sample adequacy. Version-2
-reports record the minimum, ratios, exclusions and below-historical-32 warnings.
-Historical version-1 reports retain their implicit minimum 32. Existing reports
-must not be edited to admit excluded candidates or refit predictions.
+Choose counts that fit the base. Eligibility is
+`sample_count >= nlist * min_sample_per_centroid`. Default 32 is **project policy,
+not a paper requirement or SIMD batch size**. Declared positive minima down to 1
+permit sampling-sensitivity studies, not proof of adequacy. Version-2 reports
+record minima, ratios, exclusions, below-32 warnings and trainer search policy;
+version-1 reports retain implicit minimum 32 and legacy trainer contracts.
+Do not edit frozen reports to admit excluded candidates or refit predictions.
 
-After freezing a report, match its source/PQ and all trainer/router/resource
-settings through the build environment. Model-associated full builds require
-`IVF_SAMPLE_RATE=1`. The shell-wrapper workaround is:
+`IVF_COST_MODEL_REPORT` supplies the Python harness's chosen nlist, but shell
+prepare guards still require explicit matching `IVF_NLIST`. This remains a
+**workaround**, not report-only shell support:
 
 ```bash
 export IVF_COST_MODEL_REPORT=/new/path/calibration-r10/report.json
 export IVF_NLIST="$(python3 -c 'import json,os; print(json.load(open(os.environ["IVF_COST_MODEL_REPORT"]))["selected_nlist"])')"
-# Match the report's remaining build settings before preparation.
+# Match every report trainer/router/resource setting; full builds require sample rate 1.
+export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_INIT=random_partition
+export IVF_TRAINING_BREADTH=64 IVF_BUILD_THREADS=4 IVF_MEMORY_BUDGET_GB=4
 bash benchmark/IVF/sift/query_prepare.sh
 ```
 
-Freeze separate reports for different recall/top-k targets before validation.
-Compare predicted and measured routing/scan costs and report absolute-cost misses
-separately from selected-candidate ratios and end-to-end latency. Keep reserved
-final queries out of calibration/tuning. PQ4/SIMD scanning remains a deferred
-follow-up; current scalar-PQ8 coefficients do not reproduce SIMD small-list penalties.
+Source/PQ/settings mismatches and conflicting manual choices fail. Preparation/
+cache metadata and run `nlist_selection.json` bind report path/hash; preserve the
+report unchanged. Freeze separate reports per recall/top-k target before validation.
+Compare predicted/measured routing and scan costs, absolute misses and selected-
+candidate ratios separately from end-to-end latency. Manual builds need no report;
+manual sweeps do not validate predictive selection.
 
-`ivf_query_harness` covers actual build/run, canonical records/results, cache
-restore/config/source identity changes, no-store behavior, no overwrites, failed
-runs, corrupted caches, symlink refusal, changed GT and the unchanged incremental
-GT helper path. It now also tests insert/delete pairs for all dtypes, canonical
-IDs/count overrides, post-checkpoint scoring, underflow, fresh repeats and immutable
-source/base/cache preservation. `ivf_trained_helper_integration` is opt-in; it uses unmodified
-standalone helper sources to train/encode 4096 rows in 13 dimensions with three
-unequal chunks, then checks native encoder/ADC parity and exact script-run results
-for every dtype. Instrumenting only the IVF side with ASan/UBSan and leak detection
-does **not** instrument the standalone helpers or system libraries.
+## Fixed-router diagnostics
 
-Run the relevant CTest suites in your configured build; verification commands
-and fixture scopes are in [QUALIFICATION.md](QUALIFICATION.md#functional-verification).
-Production training, repeated recall/QPS/latency/memory/concurrency budgets,
-sampling adequacy and prediction accuracy require their own measurements.
-No production-performance result follows from fixtures.
+`ivf_router_diagnostics` and `router_sweep.py` compare frozen centroid routers,
+not end-to-end ANN recall/QPS. Prepare `IVF_OPTIMIZED_MODES=1` for all six modes;
+diagnostics do not rebuild/refit centroids/PCA. Ensure probes fit the index:
 
-Bounded exact/HNSW training comparisons and repeated query-sweep tooling now pass
-fixtures, including declared budgets, preservation and failure gates:
-[QUALIFICATION.md](QUALIFICATION.md). These collect evidence, not acceptance.
+```bash
+python3 benchmark/IVF/router_sweep.py \
+  --diagnostic "$IVF_BUILD_DIR/tests/ivf_router_diagnostics" \
+  --index-prefix /path/to/index/prefix --query-file /path/to/tuning-query.bin \
+  --data-type float --output /new/path/router-ablation --scope tuning \
+  --nprobes 1,10,32 --breadths 32,64,128 --recall-targets 0.90,0.95,0.99 \
+  --query-rows 100 --query-threads 1 --router-rerank-factor 3 \
+  --memory-budget-gb 4 --evaluation-work-limit 100000000 \
+  --repeats 3 --timeout-s 1800
+```
 
-## Training selection
+Exact reference enumeration costs `query_rows * nlist` distances. Records retain
+centroid recall, identities, projection/graph/rerank times, distance availability,
+PCA dimension/variance, connectivity and lifetime RSS. Timed worker search includes
+centroid-match scoring, excludes exact GT/load/checks. A mode-query warmup and prior
+validation warm caches. Repeats are averaged before selecting the fastest observed
+breadth meeting each **minimum** recall target: not identical-recall interpolation
+or exhaustive tuning. Preserve failures/missed targets; bottom reachability and
+zero in-degree do not establish strong connectivity.
 
-New native CLI and prepare/harness builds default to
-`ann-reuse-seeded`, `random_partition`, training breadth 64. Set
-`IVF_TRAINER_MODE=exact|ann-rebuild|ann-reuse|ann-reuse-seeded|ann-reuse-count|ann-reuse-seeded-count|lv|lv-plus`,
-`IVF_INIT=sample|random_partition`, `IVF_TRAINING_BREADTH=N`, or the matching
-`ivf_build --trainer_mode --init --training_breadth` flags. These settings enter
-build/cache identity; query router overrides do not change them. Programmatic
-`BuildConfig` retains legacy `ann-rebuild`/`sample` defaults for existing callers.
-Training breadth is independent of frozen base/insert routing breadth. Exact
-training remains scalar and work-bounded; GEMM is not required. A cost-model report
-is optional for a manually selected build, but manual sweeps do not validate
-predictive selection.
+## Repeated query sweeps
 
-Legacy ANN modes use full-coordinate assignment with breadth-sized double
-rescoring. The new full-coordinate `ann-reuse-count`/`ann-reuse-seeded-count`
-controls return nearest-one under the graph's float metric and compute the double
-assigned objective separately. They isolate candidate-count changes from PCA.
+On the prepared bundle, each trial invokes the unchanged single-run path:
 
-**LV and LV+ are designed to largely match the paper's training mechanisms.**
-Both require `random_partition`, reuse a full-coordinate centroid graph with
-old-neighbor reinsertion, apply one initial bottom refinement/isolated-node
-reinsertion pass, and traverse 95%-variance PCA centroids during assignment.
-LV+ adds only previous-assignment entry seeding, with first/invalid-seed fallback.
-PCA is refit/reprojected at each joined assignment boundary, including the final
-one. The moving-PCA and initial-only refinement schedules are disclosed
-interpretations; hnswlib substitution and a fixed pass cap differ from an exact
-reproduction of the authors' implementation/convergence experiment.
+```bash
+DATASET=sift1m IVF_BUILD_DIR="$PWD/build/ivf-benchmark" \
+  bash benchmark/IVF/sift/query_sweep.sh \
+  --tag repeated-01 --nprobes 8,16,32 --rerank-factors 2,4,8 --threads 1,4 \
+  --repeats 3 --warmups 1 --memory-budget-gb 4 --buffer-frames 64 --timeout 1800
+```
 
-`IVF_TRAINING_RERANK_FACTOR` (3) bounds returned full-rerank candidates independently
-of traversal breadth; `IVF_TRAINING_REFINE_BREADTH` (128) controls initial training
-refinement. Native equivalents are `--training_rerank_factor` and
-`--training_refine_breadth`. Nondefault overrides require LV/LV+. These settings
-are independent of final query/insert router settings; LV training does not
-require `IVF_OPTIMIZED_MODES=1` for the final router. Do not change other settings
-when comparing LV to LV+ if the intended ablation is seeding alone.
+`RECALL_AT` and profile/work resolution match `query.sh`; lists/centroids/PQ/GT
+and persisted breadth do not change. Explicit settings are checked against native
+records; unsupported settings fail. Maximum 4096 trials. Plans/orchestration logs,
+completion records and final summary live in `query/sweeps/<tag>/`; canonical
+records/logs/neighbors remain in unique `query/runs/` directories. Input/manifest/
+prepared/driver/script/profile identities must stay fixed; every trial validates
+components. Existing destinations, including failures, are never resumed/deleted.
 
-Legacy trainer builds write `IVFINDEX3`, persisting mode, initialization and
-training breadth with an explicit optimized-mode flag. New count-based/LV builds
-write `IVFINDEX4`, additionally binding training-search policy and independent
-rerank/refinement settings. Existing v1/v2 bundles reopen with their actual
-legacy rebuilt/sample/insert-breadth identity; mutable checkpoints preserve their
-origin version/settings. New builds expose per-pass graph/assignment/mean timing,
-assigned SSE, occupancy summaries, refresh and seeding counts. Graph-distance
-counts cover assignment traversal only, not graph construction/reinsertion, and
-are unavailable for the vanilla rebuilt control. Assigned SSE is not exact
-nearest-centroid SSE for approximate training. New per-pass diagnostics include
-PCA/refinement setup, retained dimensions/variance, requested/effective breadth,
-returned/reranked counts and connectivity measurements. Worker phase times are
-summed worker seconds, not wall time; setup subsets must not be added to total
-graph time again. Objective-distance work is counted separately from reranking.
+Warmups are separate discarded processes: they warm OS caches, not the next
+process's buffer pool. Ordered configurations/warmups/repeats can bias results;
+frequency, contention and other processes are uncontrolled. Optional `--cpus`
+pins descendants to comma-separated IDs within current affinity using installed
+`taskset`; it does not isolate CPUs. Small sets may use fewer active query workers.
+Aggregates are min/median/max across runs for recall/QPS, query/open time, mean/
+p50/p95/p99 latency, lifetime RSS, backend reads, workspace and active workers;
+medians of run percentiles are **not pooled-query percentiles**. `process_wall_s`
+includes the script's hashing/open/GT/scoring/export; orchestrator rehashes add
+untimed I/O. No cold-cache or device-I/O claim is made.
+`--min-recall` gates percent Recall@K (default 0, no meaningful target);
+`--max-peak-rss-mb` gates maximum measured RSS. Neither is matched-recall baseline
+selection or automatic acceptance; paired baseline studies need their own protocol.
 
-For bounded ablations, `qualify.py train` accepts
-`--modes exact,ann-rebuild,ann-reuse,ann-reuse-seeded --init random_partition
---training-breadth 64`. All modes use the same sample/init/seed/pass cap. At large
-scale omit `exact` to avoid a full exact training run; bounded exact evaluation
-still runs on the declared evaluation rows. The summary explicitly reports an
-absent exact-trained reference, rather than inventing an SSE ratio. Diagnostic
-artifacts include `.sample_ids.bin`, `.centroids.bin`, `.assignments.bin` (one
-centroid per sample slot) and `.occupancy.bin`, and exact evaluation reports
-tie-aware nearest-centroid assignment agreement on the sampled evaluation rows.
-This is a training-sample check, not holdout or final-query scoring.
+Training/query plans precede work; summaries are written last after required
+children/identity checks. Failures/timeouts preserve partial output without a final
+summary; timeouts terminate descendant process groups. Completed measurements
+failing declared gates retain `gates_passed: false` and exit nonzero. There is no
+rollback, atomic/fsync publication or resume guarantee. Summaries explicitly set
+`production_qualified: false`.
+
+## Functional verification
+
+Dependency-isolated checks need no native MKL/libaio/BufANN heap dependencies:
+
+```bash
+cmake -S tests/ivf -B build/ivf-contracts -DCMAKE_BUILD_TYPE=Release \
+  -DIVF_BUILD_ROUTING=ON
+cmake --build build/ivf-contracts -j4
+ctest --test-dir build/ivf-contracts --output-on-failure
+```
+
+Routing configuration fetches the checksum-pinned, unmodified hnswlib comparison
+into the build tree; the modified IVF implementation is checked in under
+`dependencies/hnswlib/include/ivf_patched/`. Earlier comparison measurements used
+a safety-corrected upstream copy; retain that distinction in new studies.
+Isolated `ivf_build`/`ivf_driver` validate only; native workloads/calibration require
+a full Linux build. Enable tests by adding `-DIVF_BUILD_CONTRACT_TESTS=ON` to the
+full build command above. Build all test executables before full CTest:
+
+```bash
+cmake --build "$IVF_BUILD_DIR" -j4
+ctest --test-dir "$IVF_BUILD_DIR" -N
+ctest --test-dir "$IVF_BUILD_DIR" --output-on-failure
+# Focused training/calibration/CLI subset:
+ctest --test-dir "$IVF_BUILD_DIR" --output-on-failure \
+  -R '^(ivf_ann_training|ivf_training_diagnostics|ivf_ann_training_cli|ivf_cost_model_cli|ivf_cli_execution)$'
+```
+
+Make MKL/Intel OpenMP runtime libraries discoverable via loader configuration or
+`LD_LIBRARY_PATH`. Fixtures cover dtypes, joined determinism, base-only sampling,
+LV/PCA/candidate oracles, bounded work/memory refusal, exact SSE/artifacts, report
+minima 32/20/1 and historical compatibility, frozen provenance, build/reopen,
+mutation/mixed scoring, caches/no-overwrite/identity failures, repeats and gates.
+Optional `ivf_trained_helper_integration` requires both existing standalone helpers
+configured with `IVF_PQ_PIVOT_HELPER` and `IVF_PQ_CODES_HELPER`; it checks trained
+encoder/ADC parity and script results for all dtypes (4096 rows, 13 dimensions,
+three unequal chunks). Retain configure/build/test logs and tool/runtime identities.
+Scoped scalar sanitizers avoid stock upstream's known SIMD prefetch lookahead
+issues; they do not qualify the unmodified SIMD comparison, instrument external
+helpers/system libraries or establish full-system race qualification.
+Production quality, latency/RSS/concurrency,
+sampling adequacy and prediction accuracy still require separate measurements.

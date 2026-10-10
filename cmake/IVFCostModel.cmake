@@ -1,8 +1,0 @@
-include("${CMAKE_CURRENT_LIST_DIR}/IVFLists.cmake")
-if(TARGET ivf_lists AND NOT TARGET ivf_cost_model_core)
-    add_library(ivf_cost_model_core STATIC "${IVF_ROOT}/src/bufann/ivf_cost_model.cpp")
-    target_link_libraries(ivf_cost_model_core PUBLIC ivf_lists)
-    if(NOT MSVC)
-        target_compile_options(ivf_cost_model_core PRIVATE -fno-fast-math)
-    endif()
-endif()

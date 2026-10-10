@@ -38,13 +38,15 @@ struct CentroidHit {
     bool operator==(const CentroidHit&) const = default;
 };
 
-// Immutable centroid-only HNSW. No vector-level graph or posting list ownership.
+// Immutable centroid router: HNSW/exact plus optional patched/refined/PCA modes.
+// No vector-level graph or posting list ownership.
 // Serial construction; concurrent search is supported, save requires quiescence.
 class CentroidRouter {
  public:
     static std::unique_ptr<CentroidRouter> build(uint32_t dim,
         std::span<const float> centroids, const RouterOptions& options = {});
-    // Three new files: prefix.centroids.bin, prefix.hnsw, prefix.router.
+    // New files: prefix.centroids.bin, prefix.hnsw, prefix.router; optimized modes
+    // also save prefix.patched.hnsw, prefix.refined.hnsw and prefix.pca.
     // Trusted, native 64-bit little-endian artifacts, not crash recovery.
     void save(const std::string& prefix) const;
     static std::unique_ptr<CentroidRouter> load(const std::string& prefix,
@@ -106,8 +108,9 @@ class CentroidRouter {
 // sample SSE; total graph distance evaluations are unavailable.
 CentroidTraining train_centroids_hnsw(const std::string& path, const BuildConfig& config,
     const RouterOptions& options = {}, const TrainerLimits& limits = {});
-// Select exact/rebuilt/reuse/reuse-seeded training. Training graphs are never
-// persisted or shared with the final frozen query/PCA routers.
+// Select exact, rebuilt/reused full-coordinate controls or LV/LV+ PCA assignment.
+// Training breadth/rerank/refinement settings are independent of final routing.
+// Training graphs/PCA are never persisted or shared with frozen query routers.
 CentroidTraining train_centroids_ann(const std::string& path, const BuildConfig& config,
     const RouterOptions& options = {}, const TrainerLimits& limits = {});
 } // namespace diskann::ivf

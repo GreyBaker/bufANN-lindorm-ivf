@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Actual bounded trainer comparison, artifacts, budgets and failure evidence."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,10 @@ def main():
             run(command)
             summary = json.loads((output / "summary.json").read_text())
             plan = json.loads((output / "plan.json").read_text())
+            assert set(plan["shared_module_identities"]) == {"python_common", "settings"}
+            for key, name in (("python_common", "common.py"), ("settings", "settings.py")):
+                raw = (repo / "benchmark/IVF" / name).read_bytes()
+                assert plan["shared_module_identities"][key] == {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
             assert summary["completed"] and summary["gates_passed"] and not summary["production_qualified"]
             assert plan["affinity"]["explicitly_pinned"]
             assert summary["hnsw_over_exact_evaluation_sse_ratio"] <= 1.000001

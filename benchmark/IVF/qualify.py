@@ -11,68 +11,13 @@ import math
 import os
 from pathlib import Path
 import re
-import signal
 import statistics
-import subprocess
 import sys
-import time
 
-from harness import digest, flags, header, read_json, require, write_json
+from common import (affinity, digest, execute, finite, flags, header, positive, read_json,
+                    require, runtime_environment, shared_module_paths, values, write_json)
 
 REPO = Path(__file__).resolve().parents[2]
-
-
-def positive(text):
-    value = int(text)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
-    return value
-
-
-def finite(text):
-    value = float(text)
-    if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("must be finite and positive")
-    return value
-
-
-def values(text, convert, minimum):
-    result = [convert(part) for part in text.split(",")]
-    require(result and all(math.isfinite(v) and v >= minimum for v in result), "invalid sweep values")
-    require(len(set(result)) == len(result), "duplicate sweep values")
-    return result
-
-
-def affinity(cpus):
-    available = sorted(os.sched_getaffinity(0))
-    selected = values(cpus, int, 0) if cpus else available
-    require(set(selected) <= set(available), "requested CPUs outside available affinity")
-    return {"available": available, "selected": selected, "explicitly_pinned": bool(cpus)}
-
-
-def execute(command, log, timeout, cpus, env=None):
-    # taskset applies before exec; all descendants inherit the selected affinity.
-    if cpus:
-        command = ["taskset", "--cpu-list", ",".join(str(v) for v in values(cpus, int, 0))] + command
-    start = time.monotonic()
-    with Path(log).open("x") as out:
-        out.write("Command: " + repr(command) + "\n")
-        out.flush()
-        with subprocess.Popen(command, env=env, stdout=out, stderr=subprocess.STDOUT,
-                              start_new_session=True) as process:
-            try:
-                code = process.wait(timeout=timeout)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                # Kill the entire script/driver group, not only its shell parent.
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-                raise ValueError(f"command timed out/interrupted; inspect {log}")
-    require(code == 0, f"command failed ({code}); inspect {log}")
-    return time.monotonic() - start
 
 
 def record_from_log(path):
@@ -94,11 +39,6 @@ def aggregate(records, fields):
         require(all(isinstance(v, (int, float)) and math.isfinite(v) for v in nums), f"invalid {field} measurement")
         result[field] = {"min": min(nums), "median": statistics.median(nums), "max": max(nums)}
     return result
-
-
-def runtime_environment():
-    return {name: os.environ.get(name) for name in
-            ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "LD_LIBRARY_PATH", "ASAN_OPTIONS", "UBSAN_OPTIONS")}
 
 
 def train(args):
@@ -135,6 +75,7 @@ def train(args):
         "optimized_training_settings": {"training_rerank_factor": args.training_rerank_factor,
             "training_refine_breadth": args.training_refine_breadth, "search_policy": "pca95_refit_each_pass_initial_refinement"},
         "source_identity": digest(data), "trainer_identity": digest(trainer), "orchestrator_identity": digest(__file__),
+        "shared_module_identities": {key: digest(path) for key, path in shared_module_paths().items()},
         "affinity": affinity(args.cpus), "runtime_environment": runtime_environment(), "timeout_s_per_mode": args.timeout,
         "process_wall_scope": "entire_diagnostic_child_including_evaluation_export_excludes_python_hashes",
         "gates": {"max_sse_ratio": args.max_sse_ratio, "max_peak_rss_mb": args.max_peak_rss_mb},
@@ -159,6 +100,8 @@ def train(args):
                           (".sample_ids.bin", ".centroids.bin", ".assignments.bin", ".occupancy.bin")}
         require(digest(data) == plan["source_identity"] and digest(trainer) == plan["trainer_identity"],
                 "source/trainer changed during comparison")
+        require({key: digest(path) for key, path in shared_module_paths().items()} == plan["shared_module_identities"],
+                "shared module changed during comparison")
     require(len({artifacts[mode][".sample_ids.bin"]["sha256"] for mode in modes}) == 1, "training sample IDs differ")
     require(len({records[mode]["evaluation_rows"] for mode in modes}) == 1, "evaluation samples differ")
     exact = records["exact"]["exact_evaluation_sse"] if "exact" in records else None
@@ -204,7 +147,7 @@ def sweep(args):
         "harness": REPO / "benchmark/IVF/harness.py", "common": REPO / "benchmark/IVF/common.sh",
         "utils": REPO / "benchmark/scripts/utils.sh", "profile_loader": REPO / "benchmark/datasets/_load.sh",
         "orchestrator": Path(__file__), "query": Path(prepared["query"]), "truth": Path(prepared["truth"]),
-        "manifest": work / "index" / (dataset + ".manifest")}
+        "manifest": work / "index" / (dataset + ".manifest"), **shared_module_paths()}
     identities = {name: digest(path) for name, path in inputs.items()}
     require(identities["query"] == prepared["query_identity"] and identities["truth"] == prepared["truth_identity"] and
             identities["manifest"] == prepared["manifest_identity"], "prepared input identity changed")

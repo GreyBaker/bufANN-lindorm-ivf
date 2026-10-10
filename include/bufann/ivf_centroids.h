@@ -54,8 +54,9 @@ struct CentroidTraining : TrainingStats {
     std::vector<uint32_t> assignments; // Final centroid per sampled_ids slot, not source-row labels.
 };
 
-// Deterministic reservoir sample of initial base only; exact, blocked Lloyd
-// assignment. Serial ordered reduction makes results independent of workers.
+// Exact-training seam: deterministic base-only reservoir and blocked Lloyd
+// assignment. ANN/LV training is selected through train_centroids_ann.
+// Serial ordered reduction makes results independent of workers.
 // memory_budget_gb bounds the preflight estimate, not measured process RSS.
 CentroidTraining train_centroids(const std::string& vectors_path,
                                 const BuildConfig& config,

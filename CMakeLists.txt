@@ -1,11 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT license.
 
-if(MSVC)
-	cmake_minimum_required(VERSION 3.15)
-else()
-	cmake_minimum_required(VERSION 2.8)
-endif()
+cmake_minimum_required(VERSION 3.16)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -134,7 +130,7 @@ else()
 	add_compile_options(-march=native -Wall -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_ACCELERATED_PQ -DUSE_AVX2)
 endif()
 
-option(IVF_BUILD_CONTRACT_TESTS "Build IVF input and PQ contract tests" OFF)
+option(IVF_BUILD_CONTRACT_TESTS "Build IVF contract, training, routing, storage, and integration tests" OFF)
 if(IVF_BUILD_CONTRACT_TESTS)
     enable_testing()
 endif()

@@ -56,5 +56,5 @@ target_link_libraries(bufann_gt_computer ${PROJECT_NAME} aio -ltcmalloc)
 add_executable(bufann_driver bufann_driver.cpp)
 target_link_libraries(bufann_driver ${PROJECT_NAME} aio -ltcmalloc)
 
-# IVF contracts and explicitly validation-only command scaffolds.
+# IVF contracts, diagnostics and CLIs (native execution in full Linux routing builds).
 add_subdirectory(ivf)

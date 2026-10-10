@@ -41,7 +41,7 @@ class HeapStorage {
     static std::unique_ptr<HeapStorage> reopen(const HeapOptions& options,
                                               const std::string& heap_path,
                                               const std::string& snapshot_path);
-    // S05 opt-in session: owns a NEW heap or an explicitly private copy of an
+    // Opt-in mutable session: owns a NEW heap or an explicitly private copy of an
     // immutable v1 heap. Mutable checkpoint composition is private to MutableIndex.
     static std::unique_ptr<HeapStorage> create_mutable(const HeapOptions& options, const std::string& heap_path);
     void prepare_insert(uint32_t id, std::span<const T> coordinates);

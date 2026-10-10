@@ -99,14 +99,10 @@ sequential inserts/deletes, and concurrent weighted or fixed 8+8 mixed rounds
 in full Linux routing-enabled builds. It uses centroid routing and existing
 global PQ8 codes; no DiskANN/Vamana graph conversion is required.
 
-See [benchmark/IVF/README.md](benchmark/IVF/README.md) for dependencies, input/PQ/GT
-contracts, trainer/router selection, calibration, caching and workload commands.
-The training options include full-coordinate ANN controls and paper-aligned
-LV/LV+ optimized assignment; LV+ adds previous-assignment seeding to LV.
-[benchmark/IVF/QUALIFICATION.md](benchmark/IVF/QUALIFICATION.md) describes bounded
-training comparisons, fixed-router diagnostics, repeated query sweeps and tests.
-Dependency-isolated `ivf_build`/`ivf_driver` validate inputs but do not execute
-native heap workloads.
+See [benchmark/IVF/README.md](benchmark/IVF/README.md) for build/input contracts,
+trainer/router selection, frozen calibration, workloads, bounded LV/LV+ ablations,
+fixed-router diagnostics, repeated query sweeps and tests. Dependency-isolated
+`ivf_build`/`ivf_driver` validate inputs but do not execute native heap workloads.
 
 Mutation checkpoints require a quiescent boundary and reopen on new private
 files. They are not crash-durable transactions: no coordinated WAL, fsync/atomic

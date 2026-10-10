@@ -70,6 +70,8 @@ def main():
             before = {p: harness.digest(p) for p in (data, Path(str(pq) + "_pq_pivots.bin"), Path(str(pq) + "_pq_compressed.bin"))}
             run(command)
             report = harness.read_cost_model_report(output / "report.json")
+            for key, name in (("python_common", "common.py"), ("settings", "settings.py")):
+                assert report["identities"][key] == harness.digest(repo / "benchmark/IVF" / name)
             assert report["profiled_codes"] == 64 * 2 * 4 and report["per_code_us"] > 0
             assert not report["production_qualified"] and not report["validation_completed"]
             assert report["affinity"]["explicitly_pinned"]

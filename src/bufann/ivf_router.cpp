@@ -4,7 +4,7 @@
 #include "bufann/ivf_pca.h"
 #include "ivf_centroids_internal.h"
 
-#include <ivf_vanilla/hnswlib.h>
+#include <hnswlib/hnswlib.h> // Pinned, unmodified upstream comparison.
 #include <algorithm>
 #include <bit>
 #include <cmath>

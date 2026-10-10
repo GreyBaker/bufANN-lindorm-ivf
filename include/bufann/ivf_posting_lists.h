@@ -32,9 +32,9 @@ struct MutableListCheckpointInfo {
     uint64_t missing_deletes = 0, estimated_bytes = 0;
 };
 
-// S05 component seam, NOT a heap transaction or persisted NativeIndex. Caller
+// Mutable list component seam, NOT a heap transaction or persisted NativeIndex. Caller
 // supplies already encoded global PQ8 bytes. MutableIndex composes readiness/
-// publication and quiescent checkpoints separately; benchmark mutations remain disabled.
+// publication and quiescent checkpoints separately for native mutation workloads.
 // Lists/locator storage is stable; IDs cannot be reused after a successful erase.
 class MutablePostingLists {
   public:

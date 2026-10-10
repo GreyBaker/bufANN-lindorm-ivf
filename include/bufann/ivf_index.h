@@ -25,7 +25,7 @@ struct IndexManifest {
     // training provenance/code-to-vector parity is NOT independently verified.
     std::array<ArtifactDigest, 3> sources{}; // vectors, pivots, codes
     std::array<ArtifactDigest, 8> components{};
-    std::array<ArtifactDigest, 3> native_components{}; // Optimized-mode bundles, version 2/3.
+    std::array<ArtifactDigest, 3> native_components{}; // Optimized-mode bundles, version 2/3/4.
     uint32_t pca_retained_dim = 0; // Actual fitted projection, digest-bound below.
 };
 struct IndexOpenOptions {
@@ -77,7 +77,7 @@ struct MutationLimits {
     bool exact_routing = false;
 };
 
-// S05 native session, forked onto a verified private heap file. Original bundle
+// Native mutable session, forked onto a verified private heap file. Original bundle
 // artifacts remain immutable. Mutable checkpoints are separate immutable families;
 // reopen copies onto a new private heap/PQ sidecar. CLI updates use this API.
 // Frozen router/codebook; logically deleted/aborted physical slots are retained.

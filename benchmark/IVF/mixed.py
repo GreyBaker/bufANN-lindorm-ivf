@@ -8,83 +8,85 @@ from pathlib import Path
 import re
 import struct
 import sys
-import harness as h
+from common import command_log, digest, header, query_truth_shapes, read_json, require, write_json
+from harness import component_digests, prepare as prepare_base
+from settings import prepared_selection, profile, query_router_flags
 
 
 def counted_identity(path, first, count):
-    h.require(path.stat().st_size == 4 + count * 4, "mixed counted-ID length mismatch")
+    require(path.stat().st_size == 4 + count * 4, "mixed counted-ID length mismatch")
     with path.open("rb") as source:
-        h.require(source.read(4) == struct.pack("<I", count), "mixed counted-ID count mismatch")
+        require(source.read(4) == struct.pack("<I", count), "mixed counted-ID count mismatch")
         for offset in range(0, count, 4096):
             n = min(4096, count - offset)
-            h.require(source.read(n * 4) == struct.pack("<" + "I" * n, *range(first + offset, first + offset + n)),
+            require(source.read(n * 4) == struct.pack("<" + "I" * n, *range(first + offset, first + offset + n)),
                       "mixed IDs differ from canonical SPFresh round ranges")
-    return h.digest(path)
+    return digest(path)
 
 
 def identity(args):
     w = args.work_dir.resolve()
-    h.require(args.metric == "l2" and 0 < args.rounds <= 4096 and args.insert_cap == args.delete_cap and
+    require(args.metric == "l2" and 0 < args.rounds <= 4096 and args.insert_cap == args.delete_cap and
               args.insert_count == args.rounds * args.insert_cap and args.delete_count == args.rounds * args.delete_cap and
               0 < args.insert_count <= args.full_count - args.base_count and 0 < args.delete_count < args.base_count,
               "invalid mixed layout/equal-cap SPFresh comparison contract")
-    h.header(w / "data/full.bin", args.dtype, args.full_count, args.dim)
-    result = {"version": 1, "profile": h.profile(args), "rounds": args.rounds,
+    header(w / "data/full.bin", args.dtype, args.full_count, args.dim)
+    result = {"version": 1, "profile": profile(args), "rounds": args.rounds,
         "insert_count": args.insert_count, "delete_count": args.delete_count,
         "insert_cap": args.insert_cap, "delete_cap": args.delete_cap,
-        "source": h.digest(w / "data/full.bin"), "inputs": []}
+        "source": digest(w / "data/full.bin"), "inputs": []}
     for r in range(args.rounds):
         gt = w / f"groundtruth/rounds/round_{r}_gt{args.recall_at}.bin"
-        h.query_truth_shapes(w / "data/query.bin", gt, args.dtype, args.dim, args.recall_at)
+        query_truth_shapes(w / "data/query.bin", gt, args.dtype, args.dim, args.recall_at)
         result["inputs"].append({"insert": counted_identity(w / f"ids/round_{r}_insert.bin", args.base_count + r * args.insert_cap, args.insert_cap),
             "delete": counted_identity(w / f"ids/round_{r}_delete.bin", args.base_count - args.delete_count + r * args.delete_cap, args.delete_cap),
-            "truth": h.digest(gt)})
+            "truth": digest(gt)})
     return result
 
 
 def prepare(args):
     expected = identity(args)
     base = copy.copy(args); base.workload = "query"; base.update_count = 0
-    h.prepare(base)  # Existing immutable base-only trainer/PQ/cache contract.
-    h.write_json(args.work_dir / "mixed_prepared.json", expected)
+    prepare_base(base)  # Existing immutable base-only trainer/PQ/cache contract.
+    write_json(args.work_dir / "mixed_prepared.json", expected)
 
 
 def extract_round(dest):
     # Reuse the unchanged shared canonical extractor before admitting the next
     # round or publishing a successful workload summary. Preserve failed output.
     target = dest / "result.json"
-    h.require(not target.exists() and not target.is_symlink(), f"mixed round result exists: {target}")
+    require(not target.exists() and not target.is_symlink(), f"mixed round result exists: {target}")
     repo = Path(__file__).resolve().parents[2]
-    h.command_log(["bash", "-c", 'set -euo pipefail\nREPO_DIR="$1"\n'
+    command_log(["bash", "-c", 'set -euo pipefail\nREPO_DIR="$1"\n'
         'source "$REPO_DIR/benchmark/scripts/utils.sh"\n'
         'write_ann_bench_metrics_json "$2" "$3"', "ivf-mixed-extract", str(repo),
         str(dest / "run.log"), str(target)], dest / "extract.log")
-    h.require(target.read_bytes() == (dest / "native_result.json").read_bytes(), "mixed canonical extraction mismatch")
+    require(target.read_bytes() == (dest / "native_result.json").read_bytes(), "mixed canonical extraction mismatch")
 
 
 def run(args):
     w = args.work_dir.resolve()
     path = w / "mixed_prepared.json"
-    h.require(path.stat().st_size <= 8 << 20, "oversized mixed preparation metadata")
+    require(path.stat().st_size <= 8 << 20, "oversized mixed preparation metadata")
     prepared = json.loads(path.read_text())
-    h.require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
-    base = h.read_json(w / "prepared.json")
-    selection = h.prepared_selection(base)
-    h.require(base["profile"] == h.profile(args) and h.digest(base["query"]) == base["query_identity"], "mixed query/profile changed")
+    require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
+    base = read_json(w / "prepared.json")
+    selection = prepared_selection(base)
+    require(base["profile"] == profile(args) and digest(base["query"]) == base["query_identity"], "mixed query/profile changed")
     prefix = w / "index" / args.dataset
-    h.require(h.digest(Path(str(prefix) + ".manifest")) == base["manifest_identity"], "mixed base manifest changed")
-    base_components = h.component_digests(w / "index", args.dataset)
+    require(digest(Path(str(prefix) + ".manifest")) == base["manifest_identity"], "mixed base manifest changed")
+    base_components = component_digests(w / "index", args.dataset)
     output = args.output_dir.resolve()
-    h.require(output == w or w in output.parents, "mixed outputs must stay under prepared work")
+    require(output == w or w in output.parents, "mixed outputs must stay under prepared work")
     for name in ("rounds", "result.json", "summary.json", "nlist_selection.json"):
         dest = output / name
-        h.require(not dest.exists() and not dest.is_symlink(), f"mixed output exists: {dest}")
+        require(not dest.exists() and not dest.is_symlink(), f"mixed output exists: {dest}")
     scheduler = os.environ.get("IVF_SCHEDULER", "weighted")
     threads = os.environ.get("NTHREADS", "16")
-    h.require(scheduler in ("weighted", "fixed_8_8") and threads.isdigit() and 0 < int(threads) <= 256 and
+    require(scheduler in ("weighted", "fixed_8_8") and threads.isdigit() and 0 < int(threads) <= 256 and
               (scheduler != "fixed_8_8" or int(threads) == 16), "invalid mixed scheduler/foreground allocation")
     output.mkdir(parents=True, exist_ok=True)
-    h.write_json(output / "nlist_selection.json", selection)
+    write_json(output / "nlist_selection.json", selection)
     (output / "rounds").mkdir()
     records = []
     for r in range(args.rounds):
@@ -107,20 +109,20 @@ def run(args):
             "--result_file", str(dest / "native_result.json"), "--search_result_file", str(dest / "neighbors.bin")]
         if args.query_count is not None:
             command += ["--query_count", str(args.query_count)]
-        command += h.query_router_flags()
-        h.command_log(command, dest / "run.log")
-        record = h.read_json(dest / "native_result.json")
-        h.require(record["workload"] == "mixed" and record["insert_count"] == args.insert_cap and
+        command += query_router_flags()
+        command_log(command, dest / "run.log")
+        record = read_json(dest / "native_result.json")
+        require(record["workload"] == "mixed" and record["insert_count"] == args.insert_cap and
                   record["delete_count"] == args.delete_cap and "recall" in record and
                   record["live_count"] == args.base_count + (r + 1) * (args.insert_cap - args.delete_cap),
                   "mixed round execution count/live-set/scoring mismatch")
         extract_round(dest)
         records.append(record); prefix = saved
-    h.require(h.component_digests(w / "index", args.dataset) == base_components and prepared == identity(args),
+    require(component_digests(w / "index", args.dataset) == base_components and prepared == identity(args),
               "mixed source/base/input identity changed during run")
     with (output / "result.json").open("xb") as final:
         final.write((output / f"rounds/round_{args.rounds - 1}/native_result.json").read_bytes())
-    h.write_json(output / "summary.json", {"version": 1, "production_qualified": False, "round_records": records,
+    write_json(output / "summary.json", {"version": 1, "production_qualified": False, "round_records": records,
         "final_recall": records[-1]["recall"], "mixed_wall_s": sum(r["mixed_wall_s"] for r in records),
         "concurrent_query_count": sum(r["concurrent_query_count"] for r in records),
         "overlapping_query_count": sum(r["overlapping_query_count"] for r in records),
@@ -140,7 +142,7 @@ def main():
         p.add_argument("--" + field, type=Path, required=field == "work-dir")
     args = p.parse_args()
     try:
-        h.require(re.fullmatch(r"[a-zA-Z0-9_-]+", args.dataset) and (args.query_count is None or args.query_count > 0), "invalid dataset/query count")
+        require(re.fullmatch(r"[a-zA-Z0-9_-]+", args.dataset) and (args.query_count is None or args.query_count > 0), "invalid dataset/query count")
         (prepare if args.command == "prepare" else run)(args)
     except (ValueError, OSError, KeyError, TypeError) as error:
         print(f"ERROR: {error}", file=sys.stderr); return 1
