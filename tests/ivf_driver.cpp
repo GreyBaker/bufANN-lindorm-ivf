@@ -71,10 +71,15 @@ int main(int argc, char** argv) {
                    "search_after_update deletes then inserts,\n"
                    "checkpoints and queries the final live set; no concurrent "
                    "mixed scheduling.\n";
-      std::cout << "Mixed: --workload mixed --scheduler weighted|fixed_8_8 "
+      std::cout << "Mixed: --workload mixed --scheduler "
+                   "update_driven|weighted|fixed_8_8 "
                    "(default weighted)\n"
                    "  [--pool_threads N] [--query_ratio 1..99] [--query_count "
                    "N] [--scheduler_seed N]\n"
+                   "update_driven: dedicated half mutation/half query workers; "
+                   "queries run until updates finish.\n"
+                   "  Requires at least 2 pool workers; query ratio/count/seed "
+                   "overrides are not used.\n"
                    "One quiescent round per call; GT/results apply only to the "
                    "post-round query pass.\n";
       std::cout << "Query-only overrides among persisted modes (assignments "

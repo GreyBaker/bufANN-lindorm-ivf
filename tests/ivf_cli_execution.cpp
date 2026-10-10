@@ -373,13 +373,17 @@ namespace ivf_cli {
               artifact_digest(source) == m.sources[0],
           "Mixed full-source identity mismatch");
       const auto scheduler = args.get("--scheduler", "weighted");
-      check(scheduler == "weighted" || scheduler == "fixed_8_8",
+      check(scheduler == "weighted" || scheduler == "fixed_8_8" ||
+                scheduler == "update_driven",
             "Unknown mixed scheduler");
-      const auto ratio = args.u32("--query_ratio", 80);
-      check(ratio > 0 && ratio < 100, "Mixed query_ratio must be in [1,99]");
       MixedPlan plan;
       plan.fixed_8_8 = scheduler == "fixed_8_8";
+      plan.update_driven = scheduler == "update_driven";
       plan.pool_threads = args.u32("--pool_threads", 16);
+      if (plan.update_driven)
+        args.reject_present(
+            {"--query_ratio", "--query_count", "--scheduler_seed"},
+            "update_driven queries run until mutations complete");
       plan.seed = args.integer("--scheduler_seed", plan.seed);
       UpdateStats s;
       s.bytes = resident_bytes;
@@ -396,9 +400,13 @@ namespace ivf_cli {
       // multiplication.
       check(plan.inserts + plan.deletes <= UINT64_MAX / 99,
             "Mixed query-count overflow");
-      plan.queries = args.integer("--query_count",
-                                  ann_bench::mixed_update_query_count(
-                                      inserts.size(), deletes.size(), ratio));
+      if (!plan.update_driven) {
+        const auto ratio = args.u32("--query_ratio", 80);
+        check(ratio > 0 && ratio < 100, "Mixed query_ratio must be in [1,99]");
+        plan.queries = args.integer("--query_count",
+                                    ann_bench::mixed_update_query_count(
+                                        inserts.size(), deletes.size(), ratio));
+      }
       plan.validate();
       auto sorted = deletes;
       std::sort(sorted.begin(), sorted.end());
@@ -415,7 +423,7 @@ namespace ivf_cli {
       const auto query_bytes = index.estimated_query_bytes(config),
                  mutation_bytes = index.estimated_mutation_bytes();
       add(s.bytes, plan.inserts * m.training.dim, sizeof(T));
-      add(s.bytes, plan.queries, 2 * sizeof(double));
+      add(s.bytes, plan.latency_capacity(), 2 * sizeof(double));
       uint64_t worker_bytes = 8ull * 1024 * 1024;
       add(worker_bytes, query_bytes);
       add(worker_bytes, mutation_bytes);
@@ -671,20 +679,30 @@ namespace ivf_cli {
              "post_update_query");
       } else {
         const auto fixed = args.get("--scheduler", "weighted") == "fixed_8_8";
+        const auto driven =
+            args.get("--scheduler", "weighted") == "update_driven";
         const auto threads = args.u32("--pool_threads", 16);
-        emit("scheduler", fixed ? "fixed_8_8" : "weighted_remaining_ops");
+        emit("scheduler", driven  ? "update_driven"
+                          : fixed ? "fixed_8_8"
+                                  : "weighted_remaining_ops");
         emit("foreground_workers", threads);
-        emit("mutation_workers", fixed ? 8u : threads);
-        emit("concurrent_query_workers", fixed ? 8u : threads);
-        emit("worker_allocation", fixed ? "dedicated_8_mutation_8_query"
-                                        : "shared_pool_not_additive");
-        emit("scheduler_seed",
-             args.integer("--scheduler_seed",
-                          ann_bench::WeightedUpdatePool::kDefaultSeed));
-        emit("query_ratio", args.u32("--query_ratio", 80));
+        emit("mutation_workers", driven ? threads / 2 : fixed ? 8u : threads);
+        emit("concurrent_query_workers", driven  ? threads - threads / 2
+                                         : fixed ? 8u
+                                                 : threads);
+        emit("worker_allocation", driven  ? "dedicated_half_mutation_half_query"
+                                  : fixed ? "dedicated_8_mutation_8_query"
+                                          : "shared_pool_not_additive");
+        if (!driven) {
+          emit("scheduler_seed",
+               args.integer("--scheduler_seed",
+                            ann_bench::WeightedUpdatePool::kDefaultSeed));
+          emit("query_ratio", args.u32("--query_ratio", 80));
+        }
         emit("mixed_wall_s", mixed->wall_s);
         emit("concurrent_query_count_policy",
-             args.has("--query_count")
+             driven ? "until_all_mutations_complete_join_admitted_queries"
+             : args.has("--query_count")
                  ? "explicit_finite_count"
                  : "floor_ratio_times_updates_over_100_minus_ratio");
         emit("concurrent_query_count", mixed->completed[2]);
@@ -699,10 +717,23 @@ namespace ivf_cli {
         auto latencies = mixed->query_latency_us;
         std::sort(latencies.begin(), latencies.end());
         emit("concurrent_query_lat_avg_us",
-             std::accumulate(latencies.begin(), latencies.end(), 0.0) /
-                 latencies.size());
+             driven ? bufann_bench::safe_div(mixed->callback_us[2],
+                                             mixed->completed[2])
+                    : std::accumulate(latencies.begin(), latencies.end(), 0.0) /
+                          latencies.size());
         emit("concurrent_query_lat_p99_us",
-             latencies[size_t(0.99 * (latencies.size() - 1))]);
+             latencies.empty()
+                 ? 0.0
+                 : latencies[size_t(0.99 * (latencies.size() - 1))]);
+        if (driven) {
+          emit("concurrent_query_latency_sample_count", latencies.size());
+          emit("concurrent_query_latency_sample_limit",
+               MixedPlan::latency_sample_limit);
+          emit("concurrent_query_latency_sample_policy",
+               "completion_order_reservoir_seeded");
+          emit("concurrent_query_latency_sample_seed",
+               ann_bench::WeightedUpdatePool::kDefaultSeed);
+        }
         emit("mutation_timing_scope",
              "full_mixed_foreground_wall_includes_launch_join_excludes_setup_"
              "checkpoint_post_round_query");

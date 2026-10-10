@@ -112,7 +112,7 @@ def mutation_identity(args, work):
             require(
                 source.read(4 * length)
                 == struct.pack("<" + "I" * length, *range(first + offset, first + offset + length)),
-                "prepared update IDs differ from SPFresh source-row range",
+                "prepared update IDs differ from IVF source-row range",
             )
     return {
         "workload": args.workload,

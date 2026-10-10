@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""All-dtype weighted/fixed mixed CLI + shared two-round prepare/run/GT parity."""
+"""All-dtype update-driven/weighted/fixed CLI + two-round prepare/run/GT parity."""
 import argparse
 import hashlib
 import json
@@ -122,6 +122,7 @@ def main():
                 IVF_RERANK_FACTOR="32",
                 QUERY_THREADS="2",
                 NTHREADS="16",
+                IVF_SCHEDULER="weighted",
                 INCREMENTAL_GT_BIN=str(helper),
             )
             prepare, execute = (
@@ -194,6 +195,64 @@ def main():
                     assert (dest / "checkpoint" / (dataset + ".heap.state")).is_file()
                 assert all(digest(p) == value for p, value in initial.items())
                 run(execute, env, False)  # Cannot overwrite evidence.
+            # Default shell path is update-driven, with no hidden ratio/count.
+            driven_env = env.copy()
+            del driven_env["IVF_SCHEDULER"]
+            del driven_env["QUERY_POINTS"]
+            driven_env.update(IVF_RUN_TAG="update_driven", NTHREADS="4")
+            # Preparation must also admit the default mode without a quota.
+            default_prepare_env = driven_env.copy()
+            default_prepare_env.pop("IVF_RUN_TAG")
+            default_prepare_env["EVAL_TEMPFILES"] = str(root / "default_prepare")
+            run(prepare, default_prepare_env)
+            default_work = Path(default_prepare_env["EVAL_TEMPFILES"]) / f"{dataset}/IVF/update"
+            assert json.loads((default_work / "mixed_prepared.json").read_text())["rounds"] == 2
+            assert (default_work / "prepared.json").is_file()
+            run(execute, driven_env)
+            output = work / "runs/update_driven"
+            summary = json.loads((output / "summary.json").read_text())
+            assert summary["final_recall"] == 100 and not summary["production_qualified"]
+            for r in range(2):
+                dest = output / f"rounds/round_{r}"
+                record = json.loads((dest / "result.json").read_text())
+                assert record["scheduler"] == "update_driven"
+                assert record["insert_count"] == record["delete_count"] == 8
+                assert record["recall"] == 100 and record["live_count"] == 48
+                assert record["mutation_workers"] == record["concurrent_query_workers"] == 2
+                assert "query_ratio" not in record and "scheduler_seed" not in record
+                assert (
+                    record["concurrent_query_count_policy"]
+                    == "until_all_mutations_complete_join_admitted_queries"
+                )
+                assert record["concurrent_query_latency_sample_count"] == min(
+                    record["concurrent_query_count"],
+                    record["concurrent_query_latency_sample_limit"],
+                )
+                log = (dest / "run.log").read_text()
+                assert "--query_ratio" not in log and "--query_count" not in log
+                assert "--scheduler_seed" not in log
+            assert summary["concurrent_query_count"] == sum(
+                record["concurrent_query_count"] for record in summary["round_records"]
+            )
+            assert all(digest(p) == value for p, value in initial.items())
+            for key, value in (
+                ("QUERY_RATIO", "80"),
+                ("QUERY_POINTS", "128"),
+                ("UPDATE_QUERY_BATCH", "64"),
+                ("IVF_SCHEDULER_SEED", "1"),
+                ("NTHREADS", "1"),
+            ):
+                refused_env = driven_env.copy()
+                refused_env.update({key: value, "IVF_RUN_TAG": "driven_bad_" + key})
+                run(execute, refused_env, False)
+                assert not (work / "runs" / refused_env["IVF_RUN_TAG"]).exists()
+                if key != "NTHREADS":
+                    refused_prepare = default_prepare_env.copy()
+                    refused_prepare.update(
+                        {key: value, "EVAL_TEMPFILES": str(root / ("refused_prepare_" + key))}
+                    )
+                    run(prepare, refused_prepare, False)
+                    assert not Path(refused_prepare["EVAL_TEMPFILES"]).exists()
             env["IVF_RUN_TAG"] = "invalid_split"
             env["NTHREADS"] = "8"
             run(execute, env, False)
@@ -274,6 +333,10 @@ def main():
                     ["--scheduler", "bogus"],
                     ["--scheduler", "fixed_8_8", "--pool_threads", "8"],
                     ["--query_count", str(1 << 63)],
+                    ["--scheduler", "update_driven", "--query_ratio", "80"],
+                    ["--scheduler", "update_driven", "--query_count", "1"],
+                    ["--scheduler", "update_driven", "--scheduler_seed", "1"],
+                    ["--scheduler", "update_driven", "--pool_threads", "1"],
                 )
             ):
                 private, checkpoint = (
@@ -295,7 +358,7 @@ def main():
                 ), (p.stdout, p.stderr)
                 assert not any(line.startswith('{"baseline":') for line in p.stdout.splitlines())
     print(
-        "All-dtype weighted/fixed mixed rounds, checkpoint/GT/reopen/script/oracle fixtures passed"
+        "All-dtype update-driven/weighted/fixed rounds, checkpoint/GT/reopen/script/oracle fixtures passed"
     )
 
 

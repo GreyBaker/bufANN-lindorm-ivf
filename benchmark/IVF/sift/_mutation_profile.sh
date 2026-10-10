@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sequential mutation profile arithmetic, matching SPFresh without its runtime.
+# Sequential IVF mutation profile arithmetic over source-row IDs.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 DATASET="${DATASET:-sift1m}"

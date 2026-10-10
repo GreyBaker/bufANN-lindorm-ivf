@@ -5,13 +5,17 @@ DATASET="${DATASET:-sift1m}"
 WORKLOAD=update
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 source "$REPO_DIR/benchmark/IVF/common.sh"
+if [[ "${IVF_SCHEDULER:-update_driven}" == update_driven ]]; then
+    [[ -z "${QUERY_RATIO:-}${QUERY_POINTS:-}${UPDATE_QUERY_BATCH:-}${IVF_SCHEDULER_SEED:-}" ]] || \
+        error "update_driven searches until updates finish; unset query ratio/count/seed overrides or select a bounded scheduler"
+fi
 UPDATE_PERCENT="${UPDATE_PERCENT:-10}"
 if [[ -n "${UPDATE_BATCH:-}" ]]; then
     INSERT_CAP="${INSERT_CAP:-$UPDATE_BATCH}"
     DELETE_CAP="${DELETE_CAP:-$UPDATE_BATCH}"
 fi
 compute_update_layout
-(( INSERT_CAP == DELETE_CAP )) || error "SPFresh paired mixed layout requires equal insert/delete caps"
+(( INSERT_CAP == DELETE_CAP )) || error "IVF mixed layout requires equal insert/delete caps"
 (( UPDATE_ROUNDS <= 4096 )) || error "mixed preparation supports at most 4096 rounds"
 NPTS_BASE="$BASE_POINTS"
 ivf_profile_args

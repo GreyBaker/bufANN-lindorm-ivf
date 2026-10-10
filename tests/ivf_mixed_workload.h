@@ -39,9 +39,19 @@ namespace ivf_cli {
     uint32_t pool_threads = 16;
     uint64_t inserts = 0, deletes = 0, queries = 0;
     uint64_t seed = ann_bench::WeightedUpdatePool::kDefaultSeed;
-    void     validate() const {
+    bool     update_driven = false;
+    // Unknown query volume must not turn a long update into unbounded latency
+    // storage. Reservoir percentiles are labeled separately from all-query
+    // means.
+    static constexpr uint64_t latency_sample_limit = 65536;
+    uint64_t                  latency_capacity() const {
+      return update_driven ? latency_sample_limit : queries;
+    }
+    void validate() const {
       if (!pool_threads || pool_threads > 256 || !inserts || !deletes ||
-          !queries || inserts > UINT64_MAX - deletes ||
+          (update_driven ? (queries != 0 || fixed_8_8 || pool_threads < 2)
+                         : !queries) ||
+          inserts > UINT64_MAX - deletes ||
           queries > UINT64_MAX - inserts - deletes ||
           queries > SIZE_MAX / sizeof(double) ||
           (fixed_8_8 && pool_threads != 16))
@@ -74,7 +84,11 @@ namespace ivf_cli {
         throw std::invalid_argument("Missing mixed callback");
     using Clock = std::chrono::steady_clock;
     MixedStats result;
-    result.query_latency_us.resize(size_t(plan.queries));
+    if (plan.update_driven)
+      result.query_latency_us.reserve(size_t(plan.latency_capacity()));
+    else
+      result.query_latency_us.resize(size_t(plan.queries));
+    std::mt19937_64    latency_rng(plan.seed);
     std::mutex         mutex;
     std::atomic<bool>  cancelled{false};
     std::exception_ptr failure;
@@ -85,8 +99,10 @@ namespace ivf_cli {
       bool     overlaps = false;
       {
         std::lock_guard lock(mutex);
-        if (cancelled.load())
-          return;
+        if (cancelled.load() || (op == 2 && plan.update_driven &&
+                                 result.completed[0] == plan.inserts &&
+                                 result.completed[1] == plan.deletes))
+          return false;
         if (op == 2) {
           epoch = mutation_epoch;
           overlaps = active_mutations != 0;
@@ -113,7 +129,18 @@ namespace ivf_cli {
           --active_queries;
           result.overlapping_queries +=
               overlaps || active_mutations || epoch != mutation_epoch;
-          result.query_latency_us[size_t(id)] = elapsed;
+          if (plan.update_driven) {
+            const auto seen = result.completed[2];
+            if (seen < plan.latency_capacity())
+              result.query_latency_us.push_back(elapsed);
+            else {
+              const auto slot =
+                  std::uniform_int_distribution<uint64_t>(0, seen)(latency_rng);
+              if (slot < plan.latency_capacity())
+                result.query_latency_us[size_t(slot)] = elapsed;
+            }
+          } else
+            result.query_latency_us[size_t(id)] = elapsed;
         } else {
           --active_mutations;
           ++mutation_epoch;
@@ -126,9 +153,10 @@ namespace ivf_cli {
           ++result.completed[op];
         result.callback_us[op] += elapsed;
       }
+      return !error;
     };
     const auto start = Clock::now();
-    if (!plan.fixed_8_8) {
+    if (!plan.fixed_8_8 && !plan.update_driven) {
       const uint64_t counts[]{plan.inserts, plan.deletes, plan.queries};
       const std::function<void(uint64_t)> wrapped[]{
           [&](uint64_t i) { invoke(0, i); }, [&](uint64_t i) { invoke(1, i); },
@@ -136,19 +164,22 @@ namespace ivf_cli {
       ann_bench::WeightedUpdatePool::run(plan.pool_threads, counts, wrapped,
                                          plan.seed);
     } else {
-      // All 16 workers are created before admission. No extra scheduler thread;
-      // the calling thread orchestrates/joins. Fixed mutation claims alternate
-      // insert/delete while both streams remain, not serial mutation phases.
+      // All workers are created before admission. No extra scheduler thread;
+      // the calling thread orchestrates/joins. Dedicated mutation claims
+      // alternate insert/delete while both streams remain, not serial mutation
+      // phases.
       std::atomic<uint64_t>     next_mutation{0}, next_query{0};
       detail::MixedStartGate    gate;
       std::vector<std::jthread> workers;
-      workers.reserve(16);
+      const auto                mutation_threads =
+          plan.update_driven ? plan.pool_threads / 2 : 8u;
+      workers.reserve(plan.pool_threads);
       try {
-        for (uint32_t w = 0; w < 16; ++w)
+        for (uint32_t w = 0; w < plan.pool_threads; ++w)
           workers.emplace_back([&, w] {
             if (!gate.wait())
               return;
-            if (w < 8) {
+            if (w < mutation_threads) {
               const auto common = std::min(plan.inserts, plan.deletes);
               while (!cancelled.load()) {
                 const auto n = next_mutation.fetch_add(1);
@@ -163,9 +194,12 @@ namespace ivf_cli {
             } else
               while (!cancelled.load()) {
                 const auto n = next_query.fetch_add(1);
-                if (n >= plan.queries)
+                if (!plan.update_driven && n >= plan.queries)
                   break;
-                invoke(2, n);
+                // Admission checks completion under the same mutex used to
+                // retire mutations. Already admitted queries finish and join.
+                if (!invoke(2, n))
+                  break;
               }
           });
         gate.release();
@@ -181,8 +215,9 @@ namespace ivf_cli {
     result.wall_s = std::chrono::duration<double>(Clock::now() - start).count();
     if (failure)
       std::rethrow_exception(failure);
-    if (result.completed !=
-        std::array<uint64_t, 3>{plan.inserts, plan.deletes, plan.queries})
+    if (result.completed[0] != plan.inserts ||
+        result.completed[1] != plan.deletes ||
+        (!plan.update_driven && result.completed[2] != plan.queries))
       throw std::runtime_error("Mixed scheduler lost operations");
     return result;
   }

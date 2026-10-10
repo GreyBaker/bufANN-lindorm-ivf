@@ -288,19 +288,23 @@ namespace {
     };
     const auto         query = row(60);
     const SearchConfig config{4, 5, 32, 2};
-    // Real frozen IVF composition under both schedulers, three matching
+    // Real frozen IVF composition under all schedulers, three matching
     // round barriers/checkpoint reopens. All inserts target the SAME centroid,
     // overlapping its +16 growth/swap deletion and rerank with eight queries.
-    for (bool fixed : {false, true}) {
-      const auto label = fixed ? "fixed" : "weighted";
+    for (uint32_t policy : {0u, 1u, 2u}) {
+      const bool fixed = policy == 1, driven = policy == 2;
+      const auto label = driven  ? "update_driven"
+                         : fixed ? "fixed"
+                                 : "weighted";
       auto       mixed = MutableIndex<T>::fork(
           prefix, (root / (std::string(label) + " mixed.heap")).string(), {2});
       for (uint32_t round = 0; round < 3; ++round) {
-        ivf_cli::MixedPlan    plan{fixed, 16, 8, 8, 64};
+        ivf_cli::MixedPlan plan{fixed, 16, 8, 8, driven ? 0u : 64u};
+        plan.update_driven = driven;
         std::barrier          overlap_gate(16);
         std::atomic<uint32_t> first_mutations{0};
         auto                  mutation_gate = [&] {
-          if (fixed && first_mutations.fetch_add(1) < 8)
+          if ((fixed || driven) && first_mutations.fetch_add(1) < 8)
             overlap_gate.arrive_and_wait();
         };
         const auto stats = ivf_cli::run_mixed_round(
@@ -315,7 +319,7 @@ namespace {
                        "mixed delete lost a base ID");
              },
              [&](uint64_t i) {
-               if (fixed && i < 8)
+               if ((fixed || driven) && i < 8)
                  overlap_gate.arrive_and_wait();
                auto foreground_config = config;
                if (routing.native_modes)
@@ -340,10 +344,14 @@ namespace {
                          "mixed query returned mismatched/stale coordinates");
                }
              }});
-        if (fixed)
+        if (fixed || driven)
           require(stats.overlapping_queries >= 8 && stats.peak_queries == 8 &&
                       stats.peak_mutations == 8,
-                  "fixed native fixture failed dedicated 8+8 overlap");
+                  "native fixture failed dedicated 8+8 overlap");
+        require(stats.completed[0] == 8 && stats.completed[1] == 8 &&
+                    stats.query_latency_us.size() ==
+                        std::min(stats.completed[2], plan.latency_capacity()),
+                "native mixed operation/sample counts changed");
         std::vector<uint8_t> seen(capacity, 0);
         uint32_t             entries = 0;
         for (uint32_t c = 0; c < training.nlist; ++c) {

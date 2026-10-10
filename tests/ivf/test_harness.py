@@ -360,7 +360,7 @@ def main():
             env["IVF_RUN_TAG"] = "changed_ids"
             saved_ids = ids.read_bytes()
             ids.write_bytes(struct.pack("<II", 1, 0))
-            assert "SPFresh source-row range" in run(mutation_run, env, False).stderr
+            assert "IVF source-row range" in run(mutation_run, env, False).stderr
             assert not (mutation_work / "runs/changed_ids").exists()
             ids.write_bytes(saved_ids)
             env["IVF_RUN_TAG"] = "changed_source"

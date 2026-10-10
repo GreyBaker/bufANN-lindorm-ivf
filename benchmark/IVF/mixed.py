@@ -22,7 +22,7 @@ def counted_identity(path, first, count):
             require(
                 source.read(n * 4)
                 == struct.pack("<" + "I" * n, *range(first + offset, first + offset + n)),
-                "mixed IDs differ from canonical SPFresh round ranges",
+                "mixed IDs differ from prepared IVF source-row ranges",
             )
     return digest(path)
 
@@ -37,7 +37,7 @@ def identity(args):
         and args.delete_count == args.rounds * args.delete_cap
         and 0 < args.insert_count <= args.full_count - args.base_count
         and 0 < args.delete_count < args.base_count,
-        "invalid mixed layout/equal-cap SPFresh comparison contract",
+        "invalid IVF mixed layout/equal-cap round contract",
     )
     header(w / "data/full.bin", args.dtype, args.full_count, args.dim)
     result = {
@@ -130,15 +130,22 @@ def run(args):
     for name in ("rounds", "result.json", "summary.json", "nlist_selection.json"):
         dest = output / name
         require(not dest.exists() and not dest.is_symlink(), f"mixed output exists: {dest}")
-    scheduler = os.environ.get("IVF_SCHEDULER", "weighted")
+    scheduler = os.environ.get("IVF_SCHEDULER", "update_driven")
     threads = os.environ.get("NTHREADS", "16")
     require(
-        scheduler in ("weighted", "fixed_8_8")
+        scheduler in ("update_driven", "weighted", "fixed_8_8")
         and threads.isdigit()
         and 0 < int(threads) <= 256
         and (scheduler != "fixed_8_8" or int(threads) == 16),
         "invalid mixed scheduler/foreground allocation",
     )
+    if scheduler == "update_driven":
+        require(
+            int(threads) >= 2
+            and args.query_count is None
+            and not any(os.environ.get(key) for key in ("QUERY_RATIO", "IVF_SCHEDULER_SEED")),
+            "update_driven needs at least two workers and no query ratio/count/seed overrides",
+        )
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "nlist_selection.json", selection)
     (output / "rounds").mkdir()
@@ -170,10 +177,6 @@ def run(args):
             scheduler,
             "--pool_threads",
             threads,
-            "--query_ratio",
-            os.environ.get("QUERY_RATIO", "80"),
-            "--scheduler_seed",
-            os.environ.get("IVF_SCHEDULER_SEED", str(0xA5A5A5A5)),
             "--full_data_file",
             str(w / "data/full.bin"),
             "--query_file",
@@ -205,6 +208,13 @@ def run(args):
             "--search_result_file",
             str(dest / "neighbors.bin"),
         ]
+        if scheduler != "update_driven":
+            command += [
+                "--query_ratio",
+                os.environ.get("QUERY_RATIO", "80"),
+                "--scheduler_seed",
+                os.environ.get("IVF_SCHEDULER_SEED", str(0xA5A5A5A5)),
+            ]
         if args.query_count is not None:
             command += ["--query_count", str(args.query_count)]
         command += query_router_flags()
@@ -215,6 +225,7 @@ def run(args):
             and record["insert_count"] == args.insert_cap
             and record["delete_count"] == args.delete_cap
             and "recall" in record
+            and (scheduler != "update_driven" or record["scheduler"] == "update_driven")
             and record["live_count"]
             == args.base_count + (r + 1) * (args.insert_cap - args.delete_cap),
             "mixed round execution count/live-set/scoring mismatch",

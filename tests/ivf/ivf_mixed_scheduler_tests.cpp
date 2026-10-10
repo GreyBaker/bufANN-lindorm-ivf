@@ -84,6 +84,102 @@ int main() {
                                 [&](uint64_t) { gate.arrive_and_wait(); }});
     require(overlap.overlapping_queries == 8 && overlap.peak_mutations == 8 &&
             overlap.peak_queries == 8);
+    // Update-driven admission has no query quota. Hold the first callbacks of
+    // each dedicated role until all workers enter, proving overlap without
+    // sleeps.
+    for (uint32_t workers : {2u, 3u, 6u}) {
+      MixedPlan plan{false, workers, 12, 12, 0};
+      plan.update_driven = true;
+      std::barrier          entered(workers);
+      std::atomic<uint32_t> first_mutations{0}, first_queries{0};
+      std::atomic<uint64_t> queries{0};
+      std::array<std::array<std::atomic<uint32_t>, 12>, 2> seen{};
+      auto mutation = [&](size_t op, uint64_t i) {
+        if (first_mutations.fetch_add(1) < workers / 2)
+          entered.arrive_and_wait();
+        ++seen[op][size_t(i)];
+      };
+      auto stats = run_mixed_round(
+          plan, {[&](uint64_t i) { mutation(0, i); },
+                 [&](uint64_t i) { mutation(1, i); },
+                 [&](uint64_t) {
+                   if (first_queries.fetch_add(1) < workers - workers / 2)
+                     entered.arrive_and_wait();
+                   ++queries;
+                 }});
+      require(stats.completed[0] == 12 && stats.completed[1] == 12 &&
+              stats.completed[2] == queries &&
+              queries >= workers - workers / 2 &&
+              stats.overlapping_queries >= workers - workers / 2 &&
+              stats.query_latency_us.size() ==
+                  std::min(uint64_t(queries), plan.latency_capacity()));
+      for (const auto& stream : seen)
+        for (const auto& count : stream)
+          require(count == 1);
+    }
+    // Query volume can exceed retained latency storage; completion means and
+    // counts must still cover every callback. A predicate, not timing, ends
+    // work.
+    {
+      MixedPlan plan{false, 2, 1, 1, 0};
+      plan.update_driven = true;
+      std::mutex              mutex;
+      std::condition_variable ready;
+      uint64_t                queries = 0;
+      const auto              threshold = plan.latency_capacity() + 1024;
+      auto                    stats = run_mixed_round(
+          plan, {[&](uint64_t) {
+                   std::unique_lock lock(mutex);
+                   ready.wait(lock, [&] { return queries >= threshold; });
+                 },
+                                    [](uint64_t) {},
+                                    [&](uint64_t) {
+                   {
+                     std::lock_guard lock(mutex);
+                     ++queries;
+                   }
+                   ready.notify_one();
+                 }});
+      require(stats.completed[2] == queries && queries >= threshold &&
+              stats.query_latency_us.size() == plan.latency_capacity());
+      for (auto latency : stats.query_latency_us)
+        require(latency >= 0);
+    }
+    // Failure in either role cancels admissions and joins both worker groups.
+    for (bool fail_query : {false, true}) {
+      MixedPlan plan{false, 2, 1, 1, 0};
+      plan.update_driven = true;
+      std::barrier entered(2);
+      bool         refused = false;
+      try {
+        (void) run_mixed_round(
+            plan, {[&](uint64_t) {
+                     entered.arrive_and_wait();
+                     if (!fail_query)
+                       throw std::runtime_error("mutation failure");
+                   },
+                   [](uint64_t) {},
+                   [&](uint64_t) {
+                     entered.arrive_and_wait();
+                     throw std::runtime_error("query failure");
+                   }});
+      } catch (const std::runtime_error&) {
+        refused = true;
+      }
+      require(refused);
+    }
+    for (auto plan :
+         {MixedPlan{false, 1, 1, 1, 0}, MixedPlan{true, 16, 1, 1, 0},
+          MixedPlan{false, 2, 1, 1, 1}}) {
+      plan.update_driven = true;
+      bool refused = false;
+      try {
+        plan.validate();
+      } catch (const std::invalid_argument&) {
+        refused = true;
+      }
+      require(refused);
+    }
     for (auto plan :
          {MixedPlan{false, 0, 1, 1, 1}, MixedPlan{true, 8, 1, 1, 1},
           MixedPlan{false, 4, 0, 1, 1}, MixedPlan{false, 4, UINT64_MAX, 1, 1},
@@ -97,7 +193,8 @@ int main() {
       require(refused);
     }
     require(ann_bench::mixed_update_query_count(8, 8, 80) == 64);
-    std::cout << "Mixed weighted/fixed allocation, dense dispatch, overlap and "
+    std::cout << "Mixed update-driven/weighted/fixed allocation, bounded "
+                 "latency storage, dense dispatch, overlap and "
                  "joined failure fixtures passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

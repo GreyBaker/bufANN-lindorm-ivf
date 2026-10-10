@@ -92,7 +92,7 @@ NTHREADS=16 MERGE_THREADS=8 bash benchmark/BufANN/sift/update.sh
 
 The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
 
-## Single-node IVF backend
+# Single-node IVF backend
 
 The Lindorm-inspired IVF backend supports native build/reload, queries,
 sequential inserts/deletes, and concurrent weighted or fixed 8+8 mixed rounds
@@ -103,13 +103,3 @@ See [benchmark/IVF/README.md](benchmark/IVF/README.md) for build/input contracts
 trainer/router selection, frozen calibration, workloads, bounded LV/LV+ ablations,
 fixed-router diagnostics, repeated query sweeps and tests. Dependency-isolated
 `ivf_build`/`ivf_driver` validate inputs but do not execute native heap workloads.
-
-Mutation checkpoints require a quiescent boundary and reopen on new private
-files. They are not crash-durable transactions: no coordinated WAL, fsync/atomic
-commit or physical slot reclamation is provided. Mixed-query timing is separate
-from post-round recall scoring. Scripts preserve the existing source-row IDs,
-dataset splits and scoring contracts; BufANN/SPFresh remain separate baselines.
-
-Functional fixtures are not production qualification or evidence of paper
-speedups. Configure your own inputs and dependencies, declare training/resource
-budgets, and reserve final queries until calibration/tuning are complete.
