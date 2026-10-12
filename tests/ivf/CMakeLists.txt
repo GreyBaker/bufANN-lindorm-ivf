@@ -121,6 +121,15 @@ if(IVF_BUILD_CONTRACT_TESTS)
     add_test(NAME ivf_sift_download
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_sift_download.py")
     set_tests_properties(ivf_sift_download PROPERTIES TIMEOUT 30)
+    add_test(NAME ivf_gt_coverage
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_gt_coverage.py")
+    set_tests_properties(ivf_gt_coverage PROPERTIES TIMEOUT 60)
+    add_test(NAME ivf_gt_depth
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_gt_depth.py")
+    set_tests_properties(ivf_gt_depth PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_test(NAME ivf_gt_management
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_gt_management.py")
+    set_tests_properties(ivf_gt_management PROPERTIES TIMEOUT 120)
     set(IVF_DEPENDENCY_TEST_SOURCE_ARGS)
     if(TARGET ivf_hnswlib_headers)
         get_target_property(IVF_DEPENDENCY_TEST_SOURCE ivf_hnswlib_headers IVF_UPSTREAM_SOURCE_DIR)

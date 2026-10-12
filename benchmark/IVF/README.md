@@ -37,6 +37,11 @@ requirement to use the same files or download pipeline as SPFresh.
 
 ## 3. Generate ground truth
 
+For uint8 squared-L2 prefix/tail-update workloads, use the
+[one-command GT workflow](#4-configure-and-run-all-four-workloads) after configuring the
+actual update plan. The SIFT quickstart below integrates it in step 4. The legacy
+helper below remains available for independently generated inputs:
+
 ```bash
 bash benchmark/gen_deep_gt.sh sift1m
 ```
@@ -422,8 +427,7 @@ You'll want at least the eval and data drives to have significant disk space.
 
 Once generated, these artifacts could be uploaded and downloaded instead of regenerated. `DATASET=sift10m` is also valid.
 ```bash
-set -euo pipefail
-export DATASET=sift100m; export DATA_ROOT="$HOME/project/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin" GT_BIN_KCACHED="$DATA_ROOT/full-query.gt100.bin"
+export DATASET=sift100m; export DATA_ROOT="$HOME/project/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin"
 source "benchmark/datasets/$DATASET.sh"
 printf 'Dataset=%s total=%s base=%s updates=%s\n' \
   "$DATASET" "$NPTS_FULL" "$NPTS_BASE" "$UPDATE_POINTS"
@@ -432,19 +436,14 @@ export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
 
 (
   set -euo pipefail
-  # Helpers can overwrite outputs; refuse existing GT/PQ before downloading.
-  for output in "$GT_BIN_KCACHED" "${IVF_PQ_PREFIX}"_*; do
+  # PQ helpers can overwrite outputs; refuse existing PQ before downloading.
+  for output in "${IVF_PQ_PREFIX}"_*; do
     [[ ! -e "$output" && ! -L "$output" ]] || {
       echo "ERROR: input artifact exists; reuse it or choose a fresh prefix: $output" >&2; exit 1;
     }
   done
   python3 benchmark/IVF/download_sift.py \
     --rows "$NPTS_FULL" --base "$DATA_BIN" --query "$QUERY_BIN"
-
-  # Full-source top-100 GT for every query.
-  "$IVF_BUILD_DIR/tests/bufann_gt_computer" \
-    --data_type uint8 --base_file "$DATA_BIN" --query_file "$QUERY_BIN" \
-    --gt_file "$GT_BIN_KCACHED" --K 100 --num_threads 8
 
   # Full-source PQ, including the insertion tail; no DiskANN graph.
   mkdir -p "$DATA_ROOT/pq"
@@ -455,7 +454,8 @@ export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
 )
 ```
 
-Download, GT and PQ generation can take substantial time. The downloader checks
+Download and PQ generation can take substantial time. GT is handled automatically
+in step 4, after the workload plan is configured. The downloader checks
 headers/ranges, refuses existing outputs and retains partial files; it does not
 resume. Reuse completed inputs unchanged across runs; skip their generation when
 using an existing verified dataset. The PQ helper's final `0` encodes all rows.
@@ -535,12 +535,54 @@ df -h "$DATA_ROOT" "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
 # Each workload gets an independent prepared base; stop on any failure.
 (
   set -euo pipefail
+  # Reuse covered GT; recommend/generate only if needed. Failure stops the loop.
+  GT_BIN_KCACHED="$(python3 benchmark/scripts/ensure_gt.py \
+    --cache-dir "$DATA_ROOT" --base-file "$DATA_BIN" --query-file "$QUERY_BIN" \
+    --full-count "$NPTS_FULL" --base-count "$NPTS_BASE" \
+    --insert-count "$UPDATE_POINTS" --delete-count "$UPDATE_POINTS" \
+    --mixed-rounds 10 --mixed-insert-cap "$UPDATE_BATCH" --mixed-delete-cap "$UPDATE_BATCH" \
+    --expected-queries 10000 --k-out "$RECALL_AT" --generate)"
+  export GT_BIN_KCACHED
   for workload in query insert delete update; do
     bash "benchmark/IVF/sift/${workload}_prepare.sh"
     bash "benchmark/IVF/sift/${workload}.sh"
   done
 )
 ```
+
+`ensure_gt.py` ignores nonexistent shell paths, finds
+existing caches, and checks every query against every declared live population.
+It reuses a passing cache unchanged. Otherwise it recommends a sufficient depth,
+generates exact full-source GT with the existing helper, and checks the new file
+before returning its path. With no cache, it starts at K=1000; that is a starting
+depth, not a coverage guarantee. Remove `--generate` to check/recommend without
+allowing expensive generation. `IVF_BUILD_DIR` locates the generator; override
+with `--gt-generator`. Use `--cached-gt` to prefer a custom existing cache.
+
+No timestamps, manual K extraction, or report-path bookkeeping are needed.
+Caches, reports and generator logs are preserved under `$DATA_ROOT/.gt/run-0001/`,
+`run-0002/`, etc.; rerunning rechecks and reuses completed caches (underflowing ones
+can seed recommendation). Failed/partial generation outputs are never selected.
+Existing GT, PQ and index files are never overwritten. A malformed cache is an
+error, not permission to bypass validation. On failure, inspect that run's
+`error.json` and `generate-k*.log`, fix the cause, and rerun the same command.
+Exit 3 means generation is needed; 1/2 means an error. No failure returns a GT path.
+Keep the shell assignment and `export` separate as shown: combining them can mask
+failure and allow preparation to proceed without validated GT.
+
+Recommendation scans require NumPy and original uint8 squared-L2 inputs in at most
+128 dimensions. Defaults admit 32 scan queries and 256 MiB estimated scan workspace;
+adjust with `--max-scan-queries`, `--chunk-rows`, or `--memory-budget-mb` if needed.
+These are not limits on the native GT generator's RAM. Generation may take substantial
+time/memory. Tagged 10K-query K=1000 GT is **120,000,008 bytes**; larger K needs more
+space. If other wrappers score intermediate insert/delete states, add the actual
+`--insert-round-cap`/`--delete-round-cap`. Inputs and counts must match the intended
+workload; existing exact-cache provenance remains your responsibility.
+
+GT runs entirely before index preparation and QPS measurement, without changing
+ANN settings, timing or scoring policy. Deeper shared GT does not make ten-column
+derived GT fully tie-aware. Preserve completed results; retry failed workloads in
+a fresh `EVAL_TEMPFILES` root with the same verified `EVAL_CACHED` bundle.
 
 Memory budgets check workspace estimates, not hard RAM caps. Keep these settings
 fixed across preparation and execution. Cache hits restore an index, not measure
