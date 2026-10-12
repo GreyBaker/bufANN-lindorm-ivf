@@ -2212,10 +2212,22 @@ uint32_t InPlaceGraphStore::allocate_node() {
 }
 
 void InPlaceGraphStore::allocate_node(uint32_t node_id) {
+    allocate_node_with_policy(node_id, false);
+}
+
+void InPlaceGraphStore::allocate_node_sequential(uint32_t node_id) {
+    allocate_node_with_policy(node_id, true);
+}
+
+void InPlaceGraphStore::allocate_node_with_policy(uint32_t node_id, bool sequential) {
     uint32_t pid;
     {
         std::lock_guard<std::mutex> lk(_pages_mtx);
         pid = claim_page();
+        // claim_page advances round-robin by default. Bulk loading revisits this
+        // page until it is full (then erased from _pages_with_space). The next
+        // claim naturally advances to the next page without touching its data.
+        if (sequential) _alloc_page_rr_cursor = pid;
     }
     RID rid = allocate_slot_on_page(pid);
     materialize_node(node_id, rid);

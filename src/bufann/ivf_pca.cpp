@@ -6,6 +6,7 @@
 #include <numeric>
 #include <ostream>
 #include <stdexcept>
+#include <string>
 
 namespace diskann::ivf {
   namespace {
@@ -57,6 +58,18 @@ namespace diskann::ivf {
           "PCA estimate overflow");
     return 65536 + cells * 80 + rows * 16;
   }
+  void CentroidPCA::preflight_work(uint32_t dim, uint32_t count,
+                                   uint64_t limit) {
+    check(dim && count && limit, "Invalid PCA work preflight configuration");
+    const uint64_t per_row = uint64_t(dim) * (uint64_t(dim) + 1) / 2;
+    check(count <= UINT64_MAX / per_row, "PCA covariance work count overflow");
+    const uint64_t minimum = uint64_t(count) * per_row;
+    if (minimum > limit)
+      throw std::runtime_error(
+          "PCA work limit exceeded: covariance requires " +
+          std::to_string(minimum) +
+          " counted operations; limit=" + std::to_string(limit));
+  }
   std::vector<float> CentroidPCA::project(std::span<const float> v) const {
     check(v.size() == dim_, "PCA query dimension mismatch");
     std::vector<float> out(retained_, 0);
@@ -80,6 +93,7 @@ namespace diskann::ivf {
           "Invalid PCA fit configuration");
     check(estimate_bytes(dim, uint32_t(v.size() / dim)) <= budget,
           "PCA fit exceeds allowance");
+    preflight_work(dim, uint32_t(v.size() / dim), limit);
     CentroidPCA p;
     p.dim_ = dim;
     p.target_ = target;

@@ -1,11 +1,14 @@
 #include "bufann/ivf_index.h"
+#include "bufann/ivf_pca.h"
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <locale>
 #include <sstream>
@@ -409,6 +412,30 @@ namespace diskann::ivf {
     check(!prefix.empty(), "Empty IVF index prefix");
     training.validate();
     check(training.data_type == type<T>(), "IVF index build dtype mismatch");
+    // Reject output collisions and impossible covariance allowances before
+    // hashing full-scale inputs, reserving outputs, or starting training.
+    check(!std::filesystem::exists(
+              std::filesystem::symlink_status(prefix + ".manifest")),
+          "IVF index manifest exists");
+    for (auto suffix : index_component_suffixes)
+      check(!std::filesystem::exists(
+                std::filesystem::symlink_status(prefix + suffix)),
+            "IVF index component exists");
+    if (routing.native_modes)
+      for (auto suffix : native_router_suffixes)
+        require_new_artifact(prefix + suffix);
+    if (routing.native_modes || trainer_optimized_search(training.trainer_mode))
+      CentroidPCA::preflight_work(training.dim, training.nlist,
+                                  routing.native_work_limit);
+    const auto progress_start = std::chrono::steady_clock::now();
+    auto       progress = [&](const char* phase) {
+      std::clog << "[IVF build] phase=" << phase << " elapsed_s="
+                << std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - progress_start)
+                       .count()
+                << std::endl;
+    };
+    progress("input_identity");
     IndexManifest m;
     m.training = training;
     m.heap = heap;
@@ -454,28 +481,19 @@ namespace diskann::ivf {
     add(router_peak, uint64_t(training.dim) * training.nlist, sizeof(float));
     check(peak <= budget && router_peak <= budget,
           "IVF composed build exceeds workspace allowance");
-    // Refuse every existing artifact before claiming anything. Keep partial
-    // owned files on failure; an empty/partial manifest is not a loadable
-    // index.
-    check(!std::filesystem::exists(
-              std::filesystem::symlink_status(prefix + ".manifest")),
-          "IVF index manifest exists");
-    for (auto suffix : index_component_suffixes)
-      check(!std::filesystem::exists(
-                std::filesystem::symlink_status(prefix + suffix)),
-            "IVF index component exists");
-    if (routing.native_modes)
-      for (auto suffix : native_router_suffixes)
-        require_new_artifact(prefix + suffix);
+    // Keep partial owned files on failure; an empty/partial manifest is not a
+    // loadable index. Exclusive claims still protect actual publication.
     claim_artifact(
         prefix + ".manifest");  // Reserves the prefix against another builder.
     std::vector<float> centroids;
+    progress("training");
     {
       auto trained = train_centroids_ann(vectors, training, routing);
       if (training_stats)
         *training_stats = std::move(static_cast<TrainingStats&>(trained));
       centroids = std::move(trained.centroids);
     }
+    progress("final_router");
     auto router = CentroidRouter::build(training.dim, centroids, routing);
     if (routing.native_modes)
       m.pca_retained_dim = router->projected_dim();
@@ -484,11 +502,20 @@ namespace diskann::ivf {
     ListBuildOptions list_options{training.base_count, first_id,
                                   heap.id_capacity, m.chunks,
                                   budget - retained};
-    auto lists = PostingLists::build<T>(vectors, codes, *router, list_options);
-    lists.save(prefix + ".lists");
+    progress("posting_lists");
+    {
+      auto lists =
+          PostingLists::build<T>(vectors, codes, *router, list_options);
+      lists.save(prefix + ".lists");
+    }  // Release IDs/PQ codes before heap population (6.12GB at 90M/PQ64).
+    router.reset();  // No more routing in this build; CLI reload stays timed.
+    progress("coordinate_heap");
     auto storage = HeapStorage<T>::create(heap, prefix + ".heap");
     storage->load_vectors(vectors, first_id, training.base_count);
+    progress("heap_checkpoint");
     storage->checkpoint(prefix + ".heap.meta");
+    storage.reset();  // Release locator arrays before final hashing/cache work.
+    progress("artifact_verification");
     copy_component(pivots, prefix + ".pq.bin");
     check(m.sources == std::array<ArtifactDigest, 3>{artifact_digest(vectors),
                                                      artifact_digest(pivots),
@@ -502,6 +529,7 @@ namespace diskann::ivf {
             artifact_digest(prefix + native_router_suffixes[i]);
     write_manifest(
         prefix, m);  // Last successful operation; not an atomic/fsync commit.
+    progress("complete");
   }
 
   template<typename T>

@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <locale>
 #include <stdexcept>
@@ -275,7 +277,7 @@ namespace diskann::ivf {
   template<typename T>
   void HeapStorage<T>::write_coordinates(uint32_t           id,
                                          std::span<const T> coordinates,
-                                         bool               allocate) {
+                                         bool allocate, bool sequential) {
     check(coordinates.size() == _options.dim,
           "IVF coordinate dimension mismatch");
     if constexpr (std::is_same_v<T, float>)
@@ -284,8 +286,12 @@ namespace diskann::ivf {
     std::vector<T> padded(aligned_dim(), T{});
     std::copy(coordinates.begin(), coordinates.end(), padded.begin());
     try {
-      if (allocate)
-        _store.allocate_node(id);
+      if (allocate) {
+        if (sequential)
+          _store.allocate_node_sequential(id);
+        else
+          _store.allocate_node(id);
+      }
       {
         inplace::NodeRID rid;
         auto frame = _store.pin_page_for_node(id, inplace::WRITE, &rid);
@@ -404,10 +410,24 @@ namespace diskann::ivf {
                 little_u32(header + 4) == metadata.cols,
             "IVF input header changed");
       std::vector<T> row(_options.dim);
+      const auto     progress_start = std::chrono::steady_clock::now();
       for (uint32_t r = 0; r < rows; ++r) {
         in.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
         check(bool(in), "Truncated IVF vector stream");
-        append(first_id + r, row);
+        // Finish each physical page before moving on. Round-robin append would
+        // cycle across 256 allocation pages even with only 64 buffer frames,
+        // repeatedly reading/writing every partially filled page. Source IDs,
+        // validation, publication and framing stay unchanged; mutable append
+        // retains its existing placement policy.
+        std::lock_guard lock(_copy_mutex);
+        write_coordinates(first_id + r, row, true, true);
+        if (rows >= 1000000 && ((r + 1) % 1000000 == 0 || r + 1 == rows))
+          std::clog << "[IVF heap] rows=" << r + 1 << '/' << rows
+                    << " elapsed_s="
+                    << std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - progress_start)
+                           .count()
+                    << std::endl;
       }
       if (rows == metadata.rows)
         check(in.peek() == std::char_traits<char>::eof() && !in.bad(),

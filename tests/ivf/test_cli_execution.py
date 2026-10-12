@@ -35,6 +35,11 @@ def run(command, phase=None):
     assert result.returncode == 0, (command, result.stdout, result.stderr)
     assert len(records) == 1 and records[0]["phase"] == phase, result.stdout
     assert records[0]["baseline"] == "IVF"
+    if phase == "build":
+        phases = [line.split("phase=", 1)[1].split()[0]
+                  for line in result.stderr.splitlines() if line.startswith("[IVF build]")]
+        assert phases == ["input_identity", "training", "final_router", "posting_lists",
+                          "coordinate_heap", "heap_checkpoint", "artifact_verification", "complete"], phases
     return records[0]
 
 

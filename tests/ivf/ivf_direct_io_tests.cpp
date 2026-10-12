@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <sys/syscall.h>
@@ -103,6 +104,73 @@ namespace {
         require(got[d] == (id + d) % 251, "wrong persisted coordinates");
     }
   }
+  template<typename T>
+  void bulk_persistence(const std::filesystem::path& root, const char* label) {
+    using namespace diskann::ivf;
+    constexpr uint32_t rows = 4096, first = 17;
+    const HeapOptions  options{128, first + rows + 1, 4096, 64};
+    const auto         source = (root / (std::string(label) + ".bin")).string();
+    {
+      std::ofstream  out(source, std::ios::binary);
+      const uint32_t header[]{rows, 128};
+      out.write(reinterpret_cast<const char*>(header), sizeof(header));
+      std::array<T, 128> row{};
+      for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t d = 0; d < row.size(); ++d)
+          row[d] = T((r + d) % 31);
+        out.write(reinterpret_cast<const char*>(row.data()), sizeof(row));
+      }
+      out.close();
+      require(bool(out), "bulk fixture source write failed");
+    }
+    unsigned legacy_writes = 0, bulk_writes = 0;
+    for (bool bulk : {false, true}) {
+      const auto prefix =
+          (root / (std::string(label) + (bulk ? "-bulk" : "-legacy"))).string();
+      const auto before = writes.load();
+      auto       heap = HeapStorage<T>::create(options, prefix + ".heap");
+      if (bulk) {
+        heap->load_vectors(source, first);
+      } else {
+        std::array<T, 128> row{};
+        for (uint32_t r = 0; r < rows; ++r) {
+          for (uint32_t d = 0; d < row.size(); ++d)
+            row[d] = T((r + d) % 31);
+          heap->append(first + r, row);
+        }
+      }
+      heap->checkpoint(prefix + ".meta");
+      const auto total = writes.load() - before;
+      (bulk ? bulk_writes : legacy_writes) = total;
+      heap.reset();
+      heap =
+          HeapStorage<T>::reopen(options, prefix + ".heap", prefix + ".meta");
+      require(heap->size() == rows && !heap->contains(first - 1) &&
+                  !heap->contains(first + rows),
+              "bulk external-ID bounds changed");
+      alignas(64) std::array<T, 128> got{};
+      for (uint32_t r = 0; r < rows; ++r) {
+        require(heap->copy_coordinates(first + r, got),
+                "missing bulk row after reopen");
+        for (uint32_t d = 0; d < got.size(); ++d)
+          require(got[d] == T((r + d) % 31), "bulk coordinates changed");
+      }
+    }
+    // Measure actual direct-write calls, not wall time or assumed device IOPS.
+    require(bulk_writes > 0 && bulk_writes * 5 < legacy_writes,
+            "bulk loading did not remove partial-page write amplification");
+    std::cout << label << ": legacy_direct_writes=" << legacy_writes
+              << " bulk_direct_writes=" << bulk_writes << '\n';
+    const auto failed = (root / (std::string(label) + "-bulk-failed")).string();
+    auto       heap = HeapStorage<T>::create(options, failed + ".heap");
+    failure = EIO;
+    diagnostic(rejects([&] { heap->load_vectors(source, first); }));
+    failure = 0;
+    rejects([&] { heap->checkpoint(failed + ".meta"); });
+    require(!std::filesystem::exists(failed + ".meta.ivf"),
+            "failed bulk load published a checkpoint");
+  }
+
   void foreground_failures(const std::filesystem::path& root) {
     for (int code : {EINVAL, ENOSPC, EIO, short_write, zero_write}) {
       BufferPool pool;
@@ -251,6 +319,9 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now().time_since_epoch().count());
     std::filesystem::create_directories(root);
     persistence(root);
+    bulk_persistence<float>(root, "float");
+    bulk_persistence<int8_t>(root, "int8");
+    bulk_persistence<uint8_t>(root, "uint8");
     foreground_failures(root);
     background_failure(root, false);
     background_failure(root, true);

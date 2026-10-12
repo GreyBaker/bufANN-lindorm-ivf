@@ -23,9 +23,11 @@ namespace {
     try {
       f();
     } catch (const std::exception& error) {
-      require(!expected ||
-                  std::string(error.what()).find(expected) != std::string::npos,
-              "Unexpected refusal reason");
+      if (expected &&
+          std::string(error.what()).find(expected) == std::string::npos)
+        throw std::runtime_error(
+            std::string("Unexpected refusal reason: expected '") + expected +
+            "', got '" + error.what() + "'");
       return;
     }
     throw std::runtime_error("Expected refusal");
@@ -35,6 +37,40 @@ namespace {
     return {std::istreambuf_iterator<char>(in), {}};
   }
   void pca_tests() {
+    rejects([] { CentroidPCA::preflight_work(128, 200000, 1000000000); },
+            "covariance requires 1651200000");
+    CentroidPCA::preflight_work(128, 200000, 1651200000);
+    CentroidPCA::preflight_work(128, 200000, 3000000000);
+    rejects(
+        [] { CentroidPCA::preflight_work(UINT32_MAX, UINT32_MAX, UINT64_MAX); },
+        "overflow");
+    rejects([] { CentroidPCA::preflight_work(0, 1, 1000); });
+    rejects([] { CentroidPCA::preflight_work(1, 0, 1000); });
+    RouterOptions admission;
+    admission.native_modes = true;
+    admission.memory_budget_bytes = 4ull << 30;
+    rejects(
+        [&] { CentroidRouter::estimate_build_bytes(128, 200000, admission); },
+        "covariance requires 1651200000");
+    admission.native_work_limit = 3000000000;
+    require(CentroidRouter::estimate_build_bytes(128, 200000, admission) > 0,
+            "valid PCA allowance rejected by router estimate");
+    BuildConfig training;
+    training.dim = 128;
+    training.base_count = 90000000;
+    training.nlist = 200000;
+    training.max_reps = 10;
+    training.trainer_mode = TrainerMode::LVPlus;
+    training.init = CentroidInit::RandomPartition;
+    admission.native_modes = false;
+    admission.native_work_limit = 1000000000;
+    // A nonexistent source proves rejection before sampling or graph work.
+    rejects(
+        [&] {
+          train_centroids_ann("missing-preflight-input.bin", training,
+                              admission);
+        },
+        "covariance requires 1651200000");
     std::vector<float> rank_one;
     for (int r = -20; r <= 20; ++r)
       for (float axis : {1.f, 2.f, -3.f, 4.f})

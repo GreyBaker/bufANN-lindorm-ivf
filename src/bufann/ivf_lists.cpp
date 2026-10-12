@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <filesystem>
 #include <limits>
 #include <numeric>
@@ -115,6 +116,17 @@ namespace diskann::ivf {
     std::ifstream input(vectors, std::ios::binary);
     header(input, metadata);
     std::vector<T> row(router.dim());
+    const auto     progress_start = std::chrono::steady_clock::now();
+    auto           progress = [&](const char* phase, uint32_t done) {
+      if (options.base_count >= 1000000 &&
+          (done % 1000000 == 0 || done == options.base_count))
+        std::clog << "[IVF lists] phase=" << phase << " rows=" << done << '/'
+                  << options.base_count << " elapsed_s="
+                  << std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - progress_start)
+                         .count()
+                  << std::endl;
+    };
     for (uint32_t r = 0; r < options.base_count; ++r) {
       input.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
       check(bool(input), "Truncated IVF list vector stream");
@@ -123,6 +135,7 @@ namespace diskann::ivf {
       check(label < router.nlist(), "Invalid IVF list assignment");
       labels[r] = label;
       ++result._offsets[size_t(label) + 1];
+      progress("routing", r + 1);
     }
     for (size_t i = 1; i < result._offsets.size(); ++i)
       result._offsets[i] += result._offsets[i - 1];
@@ -139,6 +152,7 @@ namespace diskann::ivf {
       result._ids[position] = options.first_id + r;
       std::copy(code.begin(), code.end(),
                 result._codes.begin() + position * options.chunks);
+      progress("pq_grouping", r + 1);
     }
     return result;
   }

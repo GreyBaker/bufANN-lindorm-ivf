@@ -54,6 +54,7 @@ namespace diskann::ivf {
             "Router memory estimate overflow");
       uint64_t result = uint64_t(count) * per_node + fixed;
       if (options.native_modes) {
+        CentroidPCA::preflight_work(dim, count, options.native_work_limit);
         const auto graph =
             result + uint64_t(count) * (uint64_t(options.degree) * 16 + 256);
         const auto pca = CentroidPCA::estimate_bytes(dim, count);
@@ -837,6 +838,8 @@ namespace diskann::ivf {
           "Training snapshot estimate overflow");
     workspace += snapshot;
     if (optimized) {
+      CentroidPCA::preflight_work(config.dim, config.nlist,
+                                  options.native_work_limit);
       const uint64_t pca =
           CentroidPCA::estimate_bytes(config.dim, config.nlist);
       const uint64_t refinement_scratch =

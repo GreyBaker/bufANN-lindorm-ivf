@@ -163,17 +163,43 @@ namespace {
     constexpr size_t                      stride = 64 / sizeof(T);
     alignas(64) std::array<T, 3 * stride> copied_coordinates{};
     const std::array<uint32_t, 3>         duplicates{first, first, first + 1};
-    // The backend's 256-page round-robin allocator puts adjacent input IDs on
-    // distinct pages. Duplicate first ID must still contribute only one read.
+    // Streaming loads now place adjacent rows on one page, for every fixture
+    // dtype. Neither duplicate IDs nor distinct slots should duplicate reads.
     const auto cold_copy =
         heap->copy_coordinates_batch(duplicates, copied_coordinates, stride);
     require(cold_copy.present == std::vector<uint8_t>({1, 1, 1}) &&
                 cold_copy.backend_batch_calls == 1 &&
-                cold_copy.heap_pages_read == 2,
-            "cold duplicate/two-page batch was not deduplicated");
+                cold_copy.heap_pages_read == 1,
+            "cold duplicate/same-page batch was not deduplicated");
     require(heap->copy_coordinates_batch(duplicates, copied_coordinates, stride)
                     .heap_pages_read == 0,
             "resident page batch reported physical reads");
+    // Preserve explicit two-page coverage using the unchanged individual-append
+    // allocator, rather than assuming that streamed IDs occupy distinct pages.
+    const auto two_path = (root / "two_page.heap").string();
+    const auto two_meta = (root / "two_page.meta").string();
+    auto       two_pages = HeapStorage<T>::create(options, two_path);
+    two_pages->append(first, std::span<const T>(data).first(dim));
+    two_pages->append(first + 1, std::span<const T>(data).subspan(dim, dim));
+    two_pages->checkpoint(two_meta);
+    two_pages.reset();
+    two_pages = HeapStorage<T>::reopen(read_options, two_path, two_meta);
+    const auto two_copy = two_pages->copy_coordinates_batch(
+        duplicates, copied_coordinates, stride);
+    require(two_copy.present == std::vector<uint8_t>({1, 1, 1}) &&
+                two_copy.backend_batch_calls == 1 &&
+                two_copy.heap_pages_read == 2,
+            "cold duplicate/two-page batch was not deduplicated");
+    for (size_t i = 0; i < duplicates.size(); ++i)
+      for (uint32_t d = 0; d < dim; ++d)
+        require(copied_coordinates[i * stride + d] ==
+                    data[(duplicates[i] - first) * dim + d],
+                "two-page batch changed coordinates");
+    require(
+        two_pages
+                ->copy_coordinates_batch(duplicates, copied_coordinates, stride)
+                .heap_pages_read == 0,
+        "resident two-page batch reported physical reads");
     const auto reopened = search(*router, lists, pq, *heap, query, config);
     require(reopened.hits == all.hits && reopened.backend_batch_calls == 3,
             "reopen/batch split changed exact results");
@@ -338,6 +364,17 @@ namespace {
     });
     require(!std::filesystem::exists(refused_prefix + ".manifest"),
             "workspace refusal wrote manifest");
+    auto pca_budget = routing;
+    pca_budget.native_work_limit = 1;
+    auto optimized_training = training;
+    optimized_training.trainer_mode = TrainerMode::LVPlus;
+    optimized_training.init = CentroidInit::RandomPartition;
+    rejects([&] {
+      NativeIndex<T>::build(refused_prefix, vectors, pivot_path, codes_path,
+                            optimized_training, options, pca_budget);
+    });
+    require(!std::filesystem::exists(refused_prefix + ".manifest"),
+            "impossible PCA allowance claimed manifest");
     if constexpr (std::is_same_v<T, int8_t>)
       rejects([&] { NativeIndex<uint8_t>::open(prefix); });
     const auto collision_prefix = (root / "collision").string();

@@ -28,6 +28,10 @@ namespace diskann::ivf {
       return projected_;
     }
     static uint64_t estimate_bytes(uint32_t dim, uint32_t count);
+    // Necessary covariance-only lower bound; solver/validation retain their
+    // runtime guards. Call before expensive sampling or graph construction.
+    static void preflight_work(uint32_t dim, uint32_t count,
+                               uint64_t work_limit);
 
    private:
     uint32_t            dim_ = 0, retained_ = 0;

@@ -129,7 +129,7 @@ namespace diskann::ivf {
     void            require_writable() const;
     bool            contains_unlocked(uint32_t id) const;
     void write_coordinates(uint32_t id, std::span<const T> coordinates,
-                           bool allocate);
+                           bool allocate, bool sequential = false);
     enum class MutableState : uint8_t {
       Absent,
       Prepared,

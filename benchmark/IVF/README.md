@@ -65,7 +65,14 @@ Choose a centroid count and resource budget (illustrative values below):
 ```bash
 export DATASET=sift1m
 export IVF_PQ_PREFIX=/absolute/path/to/existing-full-source-pq/prefix
-export IVF_NLIST=1024 IVF_MEMORY_BUDGET_GB=4 IVF_BUILD_THREADS=4
+export IVF_NLIST=1024 IVF_MEMORY_BUDGET_GB=4 IVF_BUILD_THREADS=20
+export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS=15
+export IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0
+export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
+export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined
+export IVF_BUILD_ROUTER_RERANK_FACTOR=3 IVF_PCA_VARIANCE=0.95 IVF_REFINE_EF=128
+export IVF_QUERY_BREADTH=128 IVF_INSERT_BREADTH=64
+export IVF_ROUTER_MODE=pca-refined IVF_ROUTER_RERANK_FACTOR=3 IVF_ROUTER_BREADTH=128
 
 bash benchmark/IVF/sift/query_prepare.sh
 IVF_NPROBE=16 IVF_RERANK_FACTOR=4 QUERY_THREADS=4 \
@@ -89,7 +96,9 @@ Recall is scored after workers join, separately from concurrent query timing.
 
 Query defaults: `IVF_NPROBE=1`,
 `IVF_RERANK_FACTOR=2`, `QUERY_THREADS=1` and the profile's `RECALL_AT`.
-See the ablation settings below for training and router overrides.
+The example explicitly selects full-base LV+ training and optimized final routing;
+it does not change CLI/harness defaults. See the ablation settings below for other
+training and router choices. The full-scale quickstart handles SIFT100M's pass cap.
 
 Work files live in `eval_tempfiles/<dataset>/IVF/<workload>/`; reusable immutable
 bundles live in `eval_cached/<dataset>/IVF/`. Runs retain logs, `result.json` and
@@ -135,6 +144,9 @@ before checkpointing and scoring.
 CLI/harness training defaults are `IVF_TRAINER_MODE=ann-reuse-seeded`,
 `IVF_INIT=random_partition`, `IVF_TRAINING_BREADTH=64`, `IVF_SAMPLE_RATE=1`,
 `IVF_MAX_REPS=15` and `IVF_SEED=0`.
+The operational examples and quickstart explicitly override the trainer to
+`lv-plus` while keeping `IVF_SAMPLE_RATE=1`: every initial-base row participates
+in training. Sampling examples below are optional ablations, not quickstart steps.
 
 `IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert router (default `hnswlib`);
 `IVF_ROUTER_MODE` overrides queries. `exact` enumerates centroids; `patched-full`,
@@ -142,6 +154,11 @@ CLI/harness training defaults are `IVF_TRAINER_MODE=ann-reuse-seeded`,
 Centroids, routers and final PCA stay frozen across updates. Centroid controls
 `IVF_ROUTER_BREADTH`/`IVF_ROUTER_RERANK_FACTOR` are distinct from full-vector
 `IVF_RERANK_FACTOR`. See native `--help` for more settings.
+`IVF_BUILD_ROUTER_RERANK_FACTOR` sets the persisted base/insert centroid factor;
+`IVF_ROUTER_RERANK_FACTOR` overrides the query centroid factor. Selecting LV+
+alone does not enable optimized final routing; the recipe selects `pca-refined`
+for both base/insertion assignment and queries, with optimized artifacts enabled
+before preparation.
 
 ### Training ablations
 
@@ -266,6 +283,23 @@ matched-recall baseline comparisons.
   is confirmed by a read-only inspection of the heap, preserve the failed
   artifacts and reconstruct into fresh work/cache roots after fixing the cause.
   Rebuilding the driver does not repair an already inconsistent heap.
+- Immutable streaming heap construction fills each page before advancing, rather
+  than cycling over 256 partially filled pages with the default 64 buffer frames.
+  This avoids bulk-load page thrashing without enlarging the query buffer budget.
+  Individual appends and mutable insertions retain their existing allocation
+  policy. Source-row IDs and file framing are unchanged; physical slot placement
+  can differ. Rebuild the builder and its library for new preparations; this
+  cannot accelerate a process already running, and there is no partial-build
+  resume or supported heap-only reconstruction command.
+- Native builds log `[IVF build]` phase boundaries. At one million or more rows,
+  training also logs graph/PCA, assignment and mean timings per pass, and list/
+  heap streaming reports every million completed rows. These diagnostics are
+  included in build wall time; row counters are not durable checkpoints.
+- Saved posting-list buffers and the final router are released before heap
+  population. The finished heap's locator arrays are released before final
+  hashing. Workspace admission remains conservative; these are not hard RSS
+  limits. See the [build audit](build-audit-20261012.md) for remaining
+  bottlenecks and safe ways to avoid repeated preparation.
 
 Dependency-isolated functional checks:
 
@@ -333,8 +367,8 @@ these versions when comparing performance with other builds.
 For remote work, start a persistent terminal before continuing.
 
 ```bash
-git clone --recurse-submodules https://github.com/GreyBaker/bufANN-lindorm-ivf.git "$HOME/ivf-project"
-cd "$HOME/ivf-project"
+git clone --recurse-submodules https://github.com/GreyBaker/bufANN-lindorm-ivf.git "$HOME/project/ivf-project"
+cd "$HOME/project/ivf-project"
 
 # Only needed if IVF is inside a larger repository.
 if [ -d ivf-only ]; then cd ivf-only; fi
@@ -357,12 +391,15 @@ commands from this directory.
     -DMKL_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu \
     -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
   cmake --build "$IVF_BUILD_DIR" --target bufann_gt_computer -j4
-  cmake -S baselines/DiskANN -B baselines/DiskANN/build -DCMAKE_BUILD_TYPE=Release
 )
 ```
 
-This one will be angry, but it will complete.
+Only build the PQ helpers if generating new PQ inputs; skip this and step 3's
+generation commands when reusing already verified inputs. The helper build is
+separate from IVF and does not build a DiskANN graph. Warnings may occur; a
+nonzero exit is a failure, not a guaranteed successful build.
 ```bash
+cmake -S baselines/DiskANN -B baselines/DiskANN/build -DCMAKE_BUILD_TYPE=Release
 cmake --build baselines/DiskANN/build \
   --target build_pq_pivot_standalone build_pq_codes_standalone -j4
 ```
@@ -380,15 +417,22 @@ You'll want at least the eval and data drives to have significant disk space.
 
 Once generated, these artifacts could be uploaded and downloaded instead of regenerated. `DATASET=sift10m` is also valid.
 ```bash
-export DATASET=sift100m; export DATA_ROOT="$HOME/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin" GT_BIN_KCACHED="$DATA_ROOT/full-query.gt100.bin"
+set -euo pipefail
+export DATASET=sift100m; export DATA_ROOT="$HOME/project/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin" GT_BIN_KCACHED="$DATA_ROOT/full-query.gt100.bin"
 source "benchmark/datasets/$DATASET.sh"
 printf 'Dataset=%s total=%s base=%s updates=%s\n' \
   "$DATASET" "$NPTS_FULL" "$NPTS_BASE" "$UPDATE_POINTS"
 
-export OMP_NUM_THREADS=8 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
+export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
 
 (
   set -euo pipefail
+  # Helpers can overwrite outputs; refuse existing GT/PQ before downloading.
+  for output in "$GT_BIN_KCACHED" "${IVF_PQ_PREFIX}"_*; do
+    [[ ! -e "$output" && ! -L "$output" ]] || {
+      echo "ERROR: input artifact exists; reuse it or choose a fresh prefix: $output" >&2; exit 1;
+    }
+  done
   python3 benchmark/IVF/download_sift.py \
     --rows "$NPTS_FULL" --base "$DATA_BIN" --query "$QUERY_BIN"
 
@@ -411,6 +455,14 @@ headers/ranges, refuses existing outputs and retains partial files; it does not
 resume. Reuse completed inputs unchanged across runs; skip their generation when
 using an existing verified dataset. The PQ helper's final `0` encodes all rows.
 
+The recipe uses 64 eight-bit chunks: 64 bytes (512 bits) per vector. Lindorm's SIFT setting uses 128 four-bit chunks, also 64 bytes/vector;
+equal storage does not make the quantizer/scanner implementations equivalent.
+
+For this recipe, SIFT100M's initial base remains **90M**, not 900K. A GT log with
+`base_trunc=900000` indicates a different indexed population, not training-only
+sampling. Correct the loaded profile and choose a fresh work root instead of
+expanding GT to compensate for an accidentally reduced base.
+
 IVF filters GT for each live set and rejects insufficient surviving candidates.
 This recipe measures **Recall@10**; Recall@100 needs deeper GT and fresh preparation.
 Keep final queries out of tuning: freeze settings using base-only calibration or
@@ -421,24 +473,59 @@ a separate tuning set before scoring them.
 **Training limit:** SIFT100M uses **10 passes on all 90M base rows**, plus final
 assignment: 990M searches, below the native 1B guard. The default 15 passes would
 need 1.44B and fail; there is no environment override. SIFT10M fits with 15 passes.
+This guard applies to **LV+ as well as the other trainers**. These are fixed pass
+caps, not convergence-based stopping or paper-mandated iteration counts. Full
+training can be expensive; LV+ does not reduce the number of sampled rows here.
+
+**Separate PCA/routing allowance:** at 200K centroids and 128 dimensions, one
+PCA covariance calculation counts `200000 * 128 * 129 / 2 = 1651200000`
+operations, already above the inherited 1B routing-work default. The recipe
+declares a finite 3B allowance for covariance plus solver/validation headroom.
+It applies to training PCA and optimized final-router work; it does **not**
+raise the separate 1B training-assignment cap or guarantee that every graph
+operation fits. Keep guards enabled and retain any subsequent work-limit failure.
 
 ```bash
+# Reload the same profile the workload scripts will use, before deriving counts.
+source "benchmark/datasets/$DATASET.sh"
+# Refuse a modified/smaller profile rather than silently training/indexing it.
+case "$DATASET" in
+  sift100m) expected_full=100000000; expected_base=90000000; expected_updates=10000000 ;;
+  sift10m) expected_full=10000000; expected_base=9000000; expected_updates=1000000 ;;
+  *) echo "ERROR: quickstart requires sift10m or sift100m" >&2; exit 1 ;;
+esac
+[[ "$DATA_TYPE" = uint8 && "$DIM" = 128 && "$METRIC" = l2 &&
+   "$NPTS_FULL" = "$expected_full" && "$NPTS_BASE" = "$expected_base" &&
+   "$UPDATE_POINTS" = "$expected_updates" ]] || {
+  echo "ERROR: loaded profile does not match the full-scale quickstart" >&2; exit 1;
+}
 # Remove any smaller-workload overrides from earlier experiments.
 unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO INSERT_CAP DELETE_CAP IVF_RUN_TAG IVF_COST_MODEL_REPORT IVF_SCHEDULER_SEED
 
-# Train on every initial-base row.
+# Train on every initial-base row; keep the indexed population unchanged.
 if [ "$DATASET" = sift100m ]; then
   export IVF_MAX_REPS=10
 else
   export IVF_MAX_REPS=15
 fi
-export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=ann-reuse-seeded IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0 IVF_BUILD_THREADS=8 IVF_MEMORY_BUDGET_GB=96
+export IVF_SAMPLE_RATE=1
+export IVF_TRAINER_MODE=lv-plus IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0 IVF_BUILD_THREADS=20 IVF_MEMORY_BUDGET_GB=96
+export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
 
 # Explicit starting configuration, not a qualified recall optimum.
-export IVF_NLIST=10000 IVF_NPROBE=32 IVF_RERANK_FACTOR=4 QUERY_THREADS=8 RECALL_AT=10
+export IVF_NLIST=200000 IVF_NPROBE=32 IVF_RERANK_FACTOR=3 QUERY_THREADS=8 RECALL_AT=10
+export IVF_ROUTING_WORK_LIMIT=3000000000
+# Enable optimized final routing separately from LV+ training.
+export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined IVF_BUILD_ROUTER_RERANK_FACTOR=3 IVF_PCA_VARIANCE=0.95 IVF_REFINE_EF=128 IVF_QUERY_BREADTH=128 IVF_INSERT_BREADTH=64
+export IVF_ROUTER_MODE=pca-refined IVF_ROUTER_RERANK_FACTOR=3 IVF_ROUTER_BREADTH=128
 
 # Full profile update counts; ten mixed rounds in either dataset.
-export UPDATE_PERCENT=10 UPDATE_BATCH=$((UPDATE_POINTS / 10)) IVF_SCHEDULER=update_driven NTHREADS=16 EVAL_TEMPFILES="$HOME/ann-eval/run01" EVAL_CACHED="$HOME/ann-eval/cache"
+export UPDATE_PERCENT=10 UPDATE_BATCH=$((UPDATE_POINTS / 10)) IVF_SCHEDULER=update_driven NTHREADS=16 EVAL_TEMPFILES="$HOME/project/ann-eval/run01" EVAL_CACHED="$HOME/project/ann-eval/cache"
+export IVF_BUFFER_FRAMES=64
+# Inspect the actual destinations; a large data volume does not ensure space
+# on a work/cache filesystem mounted elsewhere. No existing evidence is deleted.
+mkdir -p "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
+df -h "$DATA_ROOT" "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
 
 # Each workload gets an independent prepared base; stop on any failure.
 (
@@ -453,6 +540,14 @@ export UPDATE_PERCENT=10 UPDATE_BATCH=$((UPDATE_POINTS / 10)) IVF_SCHEDULER=upda
 Memory budgets check workspace estimates, not hard RAM caps. Keep these settings
 fixed across preparation and execution. Cache hits restore an index, not measure
 a new build; use a fresh cache root when measuring fresh construction.
+Keep cache storage enabled for the normal four-workload loop: identical source,
+PQ, builder/library and build settings allow insert/delete/update preparation to
+restore the immutable base instead of repeating training. Restoration uses real
+verified copies, not shared writable heaps; it still takes I/O and disk space.
+`EVAL_CACHE_NO_STORE=1` prevents storing a new bundle but does **not** disable cache
+hits. Use an unused cache root (or a new `IVF_CACHE_TAG`) for a deliberately fresh
+build. Do not rebuild binaries or change build settings between those workload
+preparations if the goal is reuse.
 
 Each workload starts independently from the same profile base. Insertions
 from the insert test do **not** carry into the delete test.
@@ -477,7 +572,7 @@ For three query repetitions at the same frozen settings:
 ```bash
 bash benchmark/IVF/sift/query_sweep.sh \
   --tag full-scale-repeated \
-  --nprobes 32 --rerank-factors 4 --threads 8 \
+  --nprobes 32 --rerank-factors 3 --threads 8 \
   --repeats 3 --warmups 1 \
   --memory-budget-gb 96 --buffer-frames 64 --timeout 86400
 ```
@@ -487,7 +582,7 @@ without changing the frozen settings:
 
 ```bash
 unset IVF_RUN_TAG
-export EVAL_TEMPFILES="$HOME/ann-eval/run02"
+export EVAL_TEMPFILES="/project/ann-eval/run02"
 # Repeat only the workload loop from step 4.
 ```
 

@@ -154,6 +154,45 @@ namespace {
                 std::all_of(empty.centroids.begin(), empty.centroids.end(),
                             [](float x) { return x == 7; }),
             "identical-sample empty recovery invalid");
+    // Force all rows into one cluster; independently full-sort distances and
+    // source IDs to check that partial selection recovers the identical prefix.
+    struct OneCluster : detail::AssignmentIndex {
+      uint32_t assign(std::span<const float>, uint32_t,
+                      uint64_t&) const override {
+        return 0;
+      }
+    };
+    std::vector<float>              initial;
+    const detail::AssignmentFactory one_cluster =
+        [&](std::span<const float> c) {
+          if (initial.empty())
+            initial.assign(c.begin(), c.end());
+          return std::make_unique<OneCluster>();
+        };
+    auto recovery_config = config;
+    recovery_config.init = CentroidInit::Sample;
+    recovery_config.max_reps = 1;
+    const auto recovered = detail::train_centroids_impl(
+        path.string(), recovery_config, {}, &one_cluster, 0);
+    std::vector<double>   recovery_distances(120);
+    std::vector<uint32_t> recovery_order(120);
+    std::iota(recovery_order.begin(), recovery_order.end(), 0);
+    for (uint32_t r = 0; r < 120; ++r)
+      for (uint32_t d = 0; d < 13; ++d) {
+        const double delta = double(value<T>(r, d)) - initial[d];
+        recovery_distances[r] += delta * delta;
+      }
+    std::sort(recovery_order.begin(), recovery_order.end(),
+              [&](uint32_t a, uint32_t b) {
+                return recovery_distances[a] != recovery_distances[b]
+                           ? recovery_distances[a] > recovery_distances[b]
+                           : a < b;
+              });
+    for (uint32_t c = 1; c < 4; ++c)
+      for (uint32_t d = 0; d < 13; ++d)
+        require(recovered.centroids[c * 13 + d] ==
+                    float(value<T>(recovery_order[c - 1], d)),
+                "partial empty recovery differs from full-sort oracle");
     if constexpr (std::is_same_v<T, float>) {
       const auto bad = path.string() + ".nonfinite";
       fixture<float>(bad, false, true);

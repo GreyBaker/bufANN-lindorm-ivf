@@ -642,6 +642,9 @@ class InPlaceGraphStore {
     // Allocation
     uint32_t allocate_node();                  // reserve a fresh id + materialize its slot
     void     allocate_node(uint32_t node_id);  // materialize a caller-supplied id
+    // Quiescent bulk construction only: finish the current page before advancing.
+    // Existing allocation/mutation callers retain round-robin placement.
+    void     allocate_node_sequential(uint32_t node_id);
     void     allocate_nodes_batch(const uint32_t* node_ids, size_t count);
     void     publish_node(uint32_t node_id);
     void     publish_nodes_batch(const uint32_t* node_ids, size_t count);
@@ -780,6 +783,7 @@ class InPlaceGraphStore {
                                      FixedChunkPQTable<T>* pq_table);
 
     uint32_t claim_page();           // Phase 1: reserve a slot on a page (under _pages_mtx)
+    void allocate_node_with_policy(uint32_t node_id, bool sequential);
     RID allocate_slot_on_page(uint32_t pid);  // Phase 2: write bitmap + header (frame lock)
     bool node_present(uint32_t node_id) const;
     bool lookup_node_rid(uint32_t node_id, RID& rid) const;

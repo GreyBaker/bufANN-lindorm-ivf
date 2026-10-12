@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <iostream>
 #include <exception>
 #include <limits>
 #include <numeric>
@@ -186,7 +187,12 @@ namespace diskann::ivf {
     auto                             assign = [&] {
       result.passes.emplace_back();
       auto& pass = result.passes.back();
-      auto  phase = std::chrono::steady_clock::now();
+      if (count >= 1000000)
+        std::clog << "[IVF training] pass=" << result.passes.size() << '/'
+                  << uint64_t(config.max_reps) + 1
+                  << " phase=graph_pca rows=" << count << " workers=" << workers
+                  << std::endl;
+      auto phase = std::chrono::steady_clock::now();
       if (factory) {
         if (reuse && index) {
           index->refresh(result.centroids);
@@ -205,6 +211,10 @@ namespace diskann::ivf {
       pass.graph_seconds = std::chrono::duration<double>(
                                std::chrono::steady_clock::now() - phase)
                                .count();
+      if (count >= 1000000)
+        std::clog << "[IVF training] pass=" << result.passes.size()
+                  << " phase=assignment graph_s=" << pass.graph_seconds
+                  << " pca_s=" << pass.pca_seconds << std::endl;
       phase = std::chrono::steady_clock::now();
       std::atomic<uint64_t> cursor{0};
       std::atomic<uint64_t> graph_work{0}, seed_count{0}, fallback_count{0};
@@ -291,6 +301,10 @@ namespace diskann::ivf {
       result.candidate_rerank_distances += pass.candidate_rerank_distances;
       result.seeded_searches += seed_count.load();
       result.seed_fallbacks += fallback_count.load();
+      if (count >= 1000000)
+        std::clog << "[IVF training] pass=" << result.passes.size()
+                  << " phase=assignment_complete assignment_s="
+                  << pass.assignment_seconds << std::endl;
     };
     for (uint32_t iteration = 0; iteration < config.max_reps; ++iteration) {
       assign();
@@ -308,16 +322,19 @@ namespace diskann::ivf {
       }
       result.objective_history.push_back(objective);
       result.passes.back().assigned_sse = objective;
-      const bool empty =
-          std::find(result.occupancy.begin(), result.occupancy.end(), 0) !=
-          result.occupancy.end();
-      if (empty) {
+      const auto empty_count =
+          std::count(result.occupancy.begin(), result.occupancy.end(), 0);
+      if (empty_count) {
         std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-          if (distances[a] != distances[b])
-            return distances[a] > distances[b];
-          return result.sampled_ids[a] < result.sampled_ids[b];
-        });
+        // Only the first empty_count rows are consumed. Preserve the exact
+        // full-sort prefix/tie order without sorting every training row.
+        std::partial_sort(order.begin(), order.begin() + empty_count,
+                          order.end(), [&](uint32_t a, uint32_t b) {
+                            if (distances[a] != distances[b])
+                              return distances[a] > distances[b];
+                            return result.sampled_ids[a] <
+                                   result.sampled_ids[b];
+                          });
       }
       uint32_t recovery = 0;
       for (uint32_t c = 0; c < config.nlist; ++c) {
@@ -336,6 +353,10 @@ namespace diskann::ivf {
           std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                         mean_start)
               .count();
+      if (count >= 1000000)
+        std::clog << "[IVF training] pass=" << iteration + 1
+                  << " phase=means_complete mean_s="
+                  << result.passes.back().mean_seconds << std::endl;
     }
     assign();  // Occupancy and objective must describe the returned centroids.
     std::fill(result.occupancy.begin(), result.occupancy.end(), 0);
