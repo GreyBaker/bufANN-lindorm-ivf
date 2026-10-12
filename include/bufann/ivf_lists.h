@@ -18,6 +18,10 @@ namespace diskann::ivf {
         false;  // Small-fixture oracle, not the production default.
     uint64_t max_assignment_searches = 1000000000;
     uint64_t max_exact_distance_evaluations = 1000000000;
+    // Standalone callers remain serial. Native builds use BuildConfig's worker
+    // budget. A single sequential reader feeds bounded, joined routing waves.
+    uint32_t build_threads = 1;
+    uint32_t routing_block_rows = 4096;
   };
   struct PQCandidate {
     uint32_t id;
@@ -40,6 +44,13 @@ namespace diskann::ivf {
   // loading.
   class PostingLists {
    public:
+    static uint32_t routing_workers(const ListBuildOptions& options);
+    // Shared composed/standalone preflight; includes bounded input buffers,
+    // per-worker search scratch and thread-stack allowances, not measured RSS.
+    static uint64_t estimate_build_bytes(uint32_t dim, uint32_t nlist,
+                                         DataType                type,
+                                         const RouterOptions&    routing,
+                                         const ListBuildOptions& options);
     template<typename T>
     static PostingLists build(const std::string&      vectors,
                               const std::string&      codes,

@@ -165,6 +165,16 @@ namespace ivf_cli {
       emit("nlist", config.nlist);
       emit("pq_chunks", pq.chunks);
       emit("build_threads", config.build_threads);
+      ListBuildOptions list_options;
+      list_options.base_count = config.base_count;
+      list_options.build_threads = config.build_threads;
+      const auto list_workers = PostingLists::routing_workers(list_options);
+      emit("list_routing_workers", list_workers);
+      emit("list_routing_block_rows", list_options.routing_block_rows);
+      emit("list_routing_buffer_rows",
+           std::min<uint64_t>(
+               config.base_count,
+               uint64_t(list_workers) * list_options.routing_block_rows));
       emit("sample_rate", config.sample_rate);
       emit("max_reps", config.max_reps);
       emit("seed", config.seed);

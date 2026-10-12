@@ -468,13 +468,12 @@ namespace diskann::ivf {
     uint64_t retained = router_bytes;
     add(retained, heap_bytes);
     add(retained, pq_allowance(m));
-    // Build lists need row labels and a cursor in addition to retained storage.
-    uint64_t list_build = list_allowance(m);
-    add(list_build, training.base_count, 4);
-    add(list_build, uint64_t(training.nlist) + 1, 8);
-    add(list_build, training.nlist, 66);
-    add(list_build, training.dim, sizeof(T) + sizeof(float));
-    add(list_build, m.chunks);
+    ListBuildOptions list_options{training.base_count, first_id,
+                                  heap.id_capacity, m.chunks};
+    list_options.build_threads = training.build_threads;
+    const auto list_build = PostingLists::estimate_build_bytes(
+        training.dim, training.nlist, training.data_type, routing,
+        list_options);
     uint64_t peak = retained;
     add(peak, list_build);
     uint64_t router_peak = router_bytes;
@@ -499,9 +498,7 @@ namespace diskann::ivf {
       m.pca_retained_dim = router->projected_dim();
     std::vector<float>().swap(centroids);
     router->save(prefix);
-    ListBuildOptions list_options{training.base_count, first_id,
-                                  heap.id_capacity, m.chunks,
-                                  budget - retained};
+    list_options.memory_budget_bytes = budget - retained;
     progress("posting_lists");
     {
       auto lists =

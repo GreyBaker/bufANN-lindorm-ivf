@@ -43,5 +43,5 @@ if(IVF_BUILD_ROUTING)
 
     add_library(ivf_lists STATIC "${IVF_ROOT}/src/bufann/ivf_lists.cpp"
                                  "${IVF_ROOT}/src/bufann/ivf_posting_lists.cpp")
-    target_link_libraries(ivf_lists PUBLIC ivf_router)
+    target_link_libraries(ivf_lists PUBLIC ivf_router Threads::Threads)
 endif()

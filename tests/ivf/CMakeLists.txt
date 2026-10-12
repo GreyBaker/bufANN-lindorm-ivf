@@ -24,6 +24,10 @@ if(IVF_BUILD_CONTRACT_TESTS)
     target_link_libraries(ivf_mixed_scheduler_tests PRIVATE ivf_numeric_policy Threads::Threads)
     add_test(NAME ivf_mixed_scheduler COMMAND ivf_mixed_scheduler_tests)
     set_tests_properties(ivf_mixed_scheduler PROPERTIES TIMEOUT 30)
+    add_executable(ivf_list_routing_tests ivf_list_routing_tests.cpp)
+    target_link_libraries(ivf_list_routing_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_list_routing_schedule COMMAND ivf_list_routing_tests)
+    set_tests_properties(ivf_list_routing_schedule PROPERTIES TIMEOUT 30)
     add_executable(ivf_centroid_tests ivf_centroid_tests.cpp)
     target_link_libraries(ivf_centroid_tests PRIVATE ivf_centroids)
     add_test(NAME ivf_centroid_training COMMAND ivf_centroid_tests
@@ -157,6 +161,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
                                         "${IVF_ROOT}/src/ann_exception.cpp")
     target_link_libraries(ivf_pq_helper_parity PRIVATE ivf_contracts)
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_parallel_list_build
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_list_parallel_build.py"
+                         --build $<TARGET_FILE:ivf_build>
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/parallel_list_fixtures")
+        set_tests_properties(ivf_parallel_list_build PROPERTIES TIMEOUT 180)
         add_test(
             NAME ivf_cost_model_cli
             COMMAND

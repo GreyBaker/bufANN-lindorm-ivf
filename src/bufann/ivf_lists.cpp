@@ -1,6 +1,7 @@
 #include "bufann/ivf_lists.h"
 #include "bufann/ivf_io.h"
 #include "bufann/ivf_artifacts.h"
+#include "ivf_lists_internal.h"
 
 #include <algorithm>
 #include <bit>
@@ -59,6 +60,50 @@ namespace diskann::ivf {
     }
   }  // namespace
 
+  uint32_t PostingLists::routing_workers(const ListBuildOptions& options) {
+    check(options.base_count && options.build_threads &&
+              options.build_threads <= 256 && options.routing_block_rows,
+          "Invalid IVF list routing worker/block settings");
+    const uint64_t blocks =
+        (uint64_t(options.base_count) + options.routing_block_rows - 1) /
+        options.routing_block_rows;
+    return uint32_t(std::min<uint64_t>(options.build_threads, blocks));
+  }
+
+  uint64_t PostingLists::estimate_build_bytes(uint32_t dim, uint32_t nlist,
+                                              DataType                type,
+                                              const RouterOptions&    routing,
+                                              const ListBuildOptions& options) {
+    check(dim && nlist && options.chunks && options.chunks <= dim &&
+              uint64_t(options.first_id) + options.base_count <=
+                  options.id_capacity,
+          "Invalid IVF list build options");
+    const auto workers = routing_workers(options);
+    check(options.max_assignment_searches &&
+              options.base_count <= options.max_assignment_searches,
+          "IVF list assignment exceeds search count allowance");
+    if (options.exact_assignment || routing.mode == RouterMode::Exact)
+      check(mul(options.base_count, nlist) <=
+                options.max_exact_distance_evaluations,
+            "Exact IVF list assignment exceeds distance count allowance");
+    uint64_t bytes = mul(options.base_count, uint64_t(options.chunks) + 8);
+    add(bytes, mul(uint64_t(nlist) + 1, 16));
+    const auto buffered_rows = std::min<uint64_t>(
+        options.base_count, uint64_t(workers) * options.routing_block_rows);
+    add(bytes, mul(mul(buffered_rows, dim), element_size(type)));
+    // Conservative heaps/results/visited allowance per active reader, including
+    // exact enumeration and arbitrarily large declared centroid rerank factors.
+    uint64_t scratch = mul(nlist, 66);
+    add(scratch, mul(dim, 2 * sizeof(float)));
+    add(scratch, 65536);
+    add(bytes, mul(workers, scratch));
+    if (workers > 1)
+      add(bytes, mul(workers, 8ull * 1024 * 1024));
+    add(bytes, options.chunks);
+    add(bytes, 65536);
+    return bytes;
+  }
+
   template<typename T>
   PostingLists PostingLists::build(const std::string&      vectors,
                                    const std::string&      codes_path,
@@ -71,18 +116,11 @@ namespace diskann::ivf {
             : (std::is_same_v<T, int8_t> ? DataType::Int8 : DataType::UInt8);
     static_assert(std::is_same_v<T, float> || std::is_same_v<T, int8_t> ||
                   std::is_same_v<T, uint8_t>);
-    check(options.base_count > 0 && options.chunks > 0 &&
-              options.chunks <= router.dim() && options.id_capacity > 0 &&
-              uint64_t(options.first_id) + options.base_count <=
-                  options.id_capacity,
-          "Invalid IVF list build options");
-    check(options.max_assignment_searches > 0 &&
-              options.base_count <= options.max_assignment_searches,
-          "IVF list assignment exceeds search count allowance");
-    if (options.exact_assignment)
-      check(mul(options.base_count, router.nlist()) <=
-                options.max_exact_distance_evaluations,
-            "Exact IVF list assignment exceeds distance count allowance");
+    const auto workers = routing_workers(options);
+    const auto bytes = estimate_build_bytes(router.dim(), router.nlist(), type,
+                                            router.options(), options);
+    check(bytes <= options.memory_budget_bytes && bytes <= SIZE_MAX,
+          "IVF list build exceeds workspace allowance");
     const auto metadata = inspect_vectors(vectors, type, router.dim());
     check(options.base_count <= metadata.rows,
           "IVF list base prefix exceeds input rows");
@@ -93,33 +131,15 @@ namespace diskann::ivf {
     result._type = type;
     result._first_id = options.first_id;
     result._id_capacity = options.id_capacity;
-    // Final IDs/codes, row labels, offsets + cursor, typed/converted row,
-    // one code row, serial router candidates/visited table and stream
-    // allowance.
-    uint64_t bytes = mul(options.base_count, uint64_t(options.chunks) + 8);
-    add(bytes, mul(uint64_t(router.nlist()) + 1, 16));
-    add(bytes, mul(router.dim(), sizeof(T) + sizeof(float)));
-    add(bytes, options.chunks);
-    add(bytes, mul(router.nlist(), 2));
-    add(bytes,
-        mul(options.exact_assignment
-                ? router.nlist()
-                : std::min(router.nlist(), router.options().insert_breadth),
-            64));
-    add(bytes, 65536);
-    check(bytes <= options.memory_budget_bytes && bytes <= SIZE_MAX,
-          "IVF list build exceeds workspace allowance");
     result._estimated_bytes =
         bytes;  // Excludes the caller-owned router/heap/codebook.
     std::vector<uint32_t> labels(options.base_count);
     result._offsets.resize(size_t(router.nlist()) + 1, 0);
     std::ifstream input(vectors, std::ios::binary);
     header(input, metadata);
-    std::vector<T> row(router.dim());
-    const auto     progress_start = std::chrono::steady_clock::now();
-    auto           progress = [&](const char* phase, uint32_t done) {
-      if (options.base_count >= 1000000 &&
-          (done % 1000000 == 0 || done == options.base_count))
+    const auto progress_start = std::chrono::steady_clock::now();
+    auto       progress = [&](const char* phase, uint32_t done) {
+      if (options.base_count >= 1000000)
         std::clog << "[IVF lists] phase=" << phase << " rows=" << done << '/'
                   << options.base_count << " elapsed_s="
                   << std::chrono::duration<double>(
@@ -127,16 +147,44 @@ namespace diskann::ivf {
                          .count()
                   << std::endl;
     };
-    for (uint32_t r = 0; r < options.base_count; ++r) {
-      input.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
-      check(bool(input), "Truncated IVF list vector stream");
-      const auto label =
-          router.assign(std::span<const T>(row), options.exact_assignment);
-      check(label < router.nlist(), "Invalid IVF list assignment");
-      labels[r] = label;
-      ++result._offsets[size_t(label) + 1];
-      progress("routing", r + 1);
+    {
+      const auto buffered_rows = std::min<uint64_t>(
+          options.base_count, uint64_t(workers) * options.routing_block_rows);
+      const auto cells = mul(buffered_rows, router.dim());
+      check(mul(cells, sizeof(T)) <=
+                uint64_t(std::numeric_limits<std::streamsize>::max()),
+            "IVF list input block exceeds streamsize");
+      std::vector<T> buffer(size_t(cells), T{});
+      uint64_t       next_report = 1000000;
+      std::clog << "[IVF lists] phase=routing_start workers=" << workers
+                << " block_rows=" << options.routing_block_rows
+                << " buffered_rows=" << buffered_rows << std::endl;
+      detail::route_list_blocks(
+          options.base_count, options.routing_block_rows, workers,
+          [&](uint32_t, uint32_t count) {
+            input.read(
+                reinterpret_cast<char*>(buffer.data()),
+                std::streamsize(uint64_t(count) * router.dim() * sizeof(T)));
+            check(bool(input), "Truncated IVF list vector stream");
+          },
+          [&](uint32_t r, uint32_t local) {
+            const auto row = std::span<const T>(buffer).subspan(
+                size_t(local) * router.dim(), router.dim());
+            const auto label = router.assign(row, options.exact_assignment);
+            check(label < router.nlist(), "Invalid IVF list assignment");
+            labels[r] = label;
+          },
+          [&](uint32_t done) {
+            if (done >= next_report || done == options.base_count) {
+              progress("routing", done);
+              next_report = (uint64_t(done) / 1000000 + 1) * 1000000;
+            }
+          });
     }
+    // Joined labels only. Histogram and source-order PQ grouping remain serial,
+    // independent of worker completion order and without shared offset writes.
+    for (auto label : labels)
+      ++result._offsets[size_t(label) + 1];
     for (size_t i = 1; i < result._offsets.size(); ++i)
       result._offsets[i] += result._offsets[i - 1];
     auto cursor = result._offsets;
@@ -152,7 +200,8 @@ namespace diskann::ivf {
       result._ids[position] = options.first_id + r;
       std::copy(code.begin(), code.end(),
                 result._codes.begin() + position * options.chunks);
-      progress("pq_grouping", r + 1);
+      if ((r + 1) % 1000000 == 0 || r + 1 == options.base_count)
+        progress("pq_grouping", r + 1);
     }
     return result;
   }

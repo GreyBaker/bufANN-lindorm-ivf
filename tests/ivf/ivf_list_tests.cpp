@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -33,6 +34,11 @@ namespace {
   bool nearer(PQCandidate a, PQCandidate b) {
     return a.squared_distance < b.squared_distance ||
            (a.squared_distance == b.squared_distance && a.id < b.id);
+  }
+  std::vector<char> file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    require(bool(in), "cannot read comparison artifact");
+    return {std::istreambuf_iterator<char>(in), {}};
   }
   template<typename T>
   void patch(const std::filesystem::path& path, uint64_t offset, T value) {
@@ -161,6 +167,53 @@ namespace {
     lists.save(second.string());
     require(artifact_digest(second.string()) == artifact_digest(saved.string()),
             "list persistence not deterministic");
+    // Every router shares immutable centroids/graphs while workers write only
+    // disjoint labels. Persisted list ordering and checksums must be identical.
+    for (auto mode :
+         {RouterMode::Hnswlib, RouterMode::Exact, RouterMode::PatchedFull,
+          RouterMode::Refined, RouterMode::PCA, RouterMode::PCARefined}) {
+      RouterOptions routing;
+      routing.native_modes = true;
+      routing.mode = mode;
+      auto frozen = CentroidRouter::build(dim, centroids, routing);
+      auto serial_options = options;
+      serial_options.routing_block_rows = 7;
+      const auto serial =
+          PostingLists::build<T>(vectors, codes, *frozen, serial_options);
+      const auto prefix = (root / router_mode_name(mode)).string();
+      serial.save(prefix + "-serial.lists");
+      const auto reference = artifact_digest(prefix + "-serial.lists");
+      const auto reference_bytes = file_bytes(prefix + "-serial.lists");
+      for (uint32_t workers : {2u, 4u, 20u}) {
+        auto parallel_options = serial_options;
+        parallel_options.build_threads = workers;
+        parallel_options.routing_block_rows = workers == 4    ? 11
+                                              : workers == 20 ? 5
+                                                              : 7;
+        const auto parallel =
+            PostingLists::build<T>(vectors, codes, *frozen, parallel_options);
+        const auto path = prefix + "-" + std::to_string(workers) + ".lists";
+        parallel.save(path);
+        require(artifact_digest(path) == reference &&
+                    file_bytes(path) == reference_bytes,
+                "routing workers/blocking changed persisted lists");
+        require(parallel.estimated_build_bytes() ==
+                    PostingLists::estimate_build_bytes(
+                        dim, frozen->nlist(), serial.data_type(), routing,
+                        parallel_options),
+                "standalone/composed parallel estimates disagree");
+        parallel_options.memory_budget_bytes =
+            parallel.estimated_build_bytes() - 1;
+        rejects([&] {
+          PostingLists::build<T>(vectors, codes, *frozen, parallel_options);
+        });
+        ++parallel_options.memory_budget_bytes;
+        require(
+            PostingLists::build<T>(vectors, codes, *frozen, parallel_options)
+                    .size() == base,
+            "parallel routing exact memory boundary refused");
+      }
+    }
     auto       moved_from = PostingLists::load(saved.string());
     auto       moved = std::move(moved_from);
     const auto refused_save = (root / "moved_from.bin").string();
@@ -276,6 +329,15 @@ namespace {
     invalid.id_capacity = 0;
     rejects([&] { PostingLists::build<T>(vectors, codes, *router, invalid); });
     invalid = options;
+    invalid.build_threads = 0;
+    rejects([&] { PostingLists::build<T>(vectors, codes, *router, invalid); });
+    invalid = options;
+    invalid.build_threads = 257;
+    rejects([&] { PostingLists::build<T>(vectors, codes, *router, invalid); });
+    invalid = options;
+    invalid.routing_block_rows = 0;
+    rejects([&] { PostingLists::build<T>(vectors, codes, *router, invalid); });
+    invalid = options;
     invalid.max_assignment_searches = base - 1;
     rejects([&] { PostingLists::build<T>(vectors, codes, *router, invalid); });
     invalid = options;
@@ -288,6 +350,19 @@ namespace {
         PostingLists::build<T>(vectors, codes, *router, invalid).size() == base,
         "ANN list assignment reused exact work cap");
     if constexpr (std::is_same_v<T, float>) {
+      auto parallel = options;
+      parallel.build_threads = 4;
+      parallel.routing_block_rows = 7;
+      parallel.memory_budget_bytes = 128ull << 20;
+      patch(vectors, 8 + 5 * dim * sizeof(T),
+            std::numeric_limits<float>::quiet_NaN());
+      rejects(
+          [&] { PostingLists::build<T>(vectors, codes, *router, parallel); });
+      patch(vectors, 8 + 5 * dim * sizeof(T), T(16));
+      require(
+          PostingLists::build<T>(vectors, codes, *router, parallel).size() ==
+              base,
+          "failed worker left router unusable after joined return");
       options.base_count = rows;
       rejects(
           [&] { PostingLists::build<T>(vectors, codes, *router, options); });

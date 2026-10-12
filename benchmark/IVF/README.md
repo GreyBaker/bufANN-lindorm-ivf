@@ -295,11 +295,16 @@ matched-recall baseline comparisons.
   training also logs graph/PCA, assignment and mean timings per pass, and list/
   heap streaming reports every million completed rows. These diagnostics are
   included in build wall time; row counters are not durable checkpoints.
+- `IVF_BUILD_THREADS` controls both training assignments and final posting-list
+  routing. A sequential reader feeds bounded blocks to frozen-router workers;
+  histogram/PQ grouping and heap construction remain serial. Completed row logs
+  occur at joined block boundaries (approximately every million routing rows).
+  Effective routing workers are capped by available blocks and reported in build
+  JSON. Worker scratch, input buffers and stack allowances are included in memory
+  admission. Standalone list-library callers remain serial.
 - Saved posting-list buffers and the final router are released before heap
   population. The finished heap's locator arrays are released before final
-  hashing. Workspace admission remains conservative; these are not hard RSS
-  limits. See the [build audit](build-audit-20261012.md) for remaining
-  bottlenecks and safe ways to avoid repeated preparation.
+  hashing.
 
 Dependency-isolated functional checks:
 
