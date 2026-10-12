@@ -5,19 +5,23 @@ workloads on Linux/WSL. Run the commands below from the repository root.
 
 ## 1. Compile the IVF tools
 
-Use a separate build tree and adjust dependency paths for your installation:
+For the Ubuntu-packaged dependencies installed by the [quickstart](#quickstart-sift),
+use a separate build tree and these paths:
 
 ```bash
 export IVF_BUILD_DIR="$PWD/build/ivf-benchmark"
 bash benchmark/IVF/build.sh \
-  -DMKL_ROOT=/opt/intel/oneapi/mkl/2026.1 \
-  -DMKL_LIBRARY_DIR=/opt/intel/oneapi/mkl/2026.1/lib \
-  -DINTEL_OMP_LIBRARY_DIR=/opt/intel/oneapi/compiler/2026.1/lib
+  -DMKL_ROOT=/usr \
+  -DMKL_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu \
+  -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
 ```
 
 The build uses installed MKL, Intel OpenMP and libaio, and writes the drivers and
 diagnostic tools to `$IVF_BUILD_DIR/tests/`. Make runtime libraries discoverable
 through the loader or `LD_LIBRARY_PATH`. `IVF_BUILD_JOBS` defaults to 4.
+Ubuntu packages install under `/usr`; an empty `/opt` is normal. Only use
+`/opt/intel/oneapi/...` paths if you separately installed Intel oneAPI, substituting
+its actual MKL/OpenMP directories rather than a presumed version.
 Routing fetches a pinned upstream comparison; the modified IVF headers are
 vendored. See the [dependency guide](../../dependencies/hnswlib/README.md).
 
@@ -256,6 +260,12 @@ matched-recall baseline comparisons.
 - Timeouts retain partial evidence; failed gates exit nonzero. No resume or crash
   recovery is provided. Checkpoints require joined workers and are not durable
   transactions; deleted IDs cannot be reused.
+- Heap writes retain direct I/O, use aligned page snapshots and require complete
+  page writes. A failed/short write makes that session unusable and prevents a
+  successful checkpoint; it is not automatically repaired. If a slot mismatch
+  is confirmed by a read-only inspection of the heap, preserve the failed
+  artifacts and reconstruct into fresh work/cache roots after fixing the cause.
+  Rebuilding the driver does not repair an already inconsistent heap.
 
 Dependency-isolated functional checks:
 
@@ -272,6 +282,12 @@ and run CTest there. Scalar sanitizer results establish neither SIMD safety
 (upstream has known prefetch issues) nor full-system race safety. Sampling,
 prediction accuracy and comparisons with external SPFresh results still need
 separate studies.
+
+The full Linux build includes `ivf_direct_io`, a synthetic persistence/fault test
+that enforces strict write alignment even on permissive filesystems. It checks
+eviction, explicit/background flushing, reopen, failed-checkpoint admission,
+write errors, short writes and interruption retries without requiring an ext3
+server. These fixtures do not establish crash durability or full-scale results.
 
 # Quickstart: SIFT
 SIFT IVF testing from a new Linux computer.
@@ -296,7 +312,7 @@ for SIFT100M. Expect long-running jobs, especially training and mixed updates.
 Run commands in order, in the **same Bash terminal**. Stop if any command fails.
 Use fresh paths rather than overwriting existing or failed runs.
 
-## 1. Install dependencies
+## 1. Install dependencies and get the project
 
 ```bash
 sudo apt update
@@ -316,8 +332,6 @@ these versions when comparing performance with other builds.
 
 For remote work, start a persistent terminal before continuing.
 
-## 2. Download the project
-
 ```bash
 git clone --recurse-submodules https://github.com/GreyBaker/bufANN-lindorm-ivf.git "$HOME/ivf-project"
 cd "$HOME/ivf-project"
@@ -331,243 +345,119 @@ export IVF_BUILD_DIR="$PWD/build/ivf-benchmark"
 You should now see `CMakeLists.txt` and `benchmark/IVF/`. Run the remaining
 commands from this directory.
 
-## 3. Compile the tools
+## 2. Compile the tools
 
 ```bash
-bash benchmark/IVF/build.sh \
-  -DCMAKE_C_COMPILER=/usr/bin/gcc \
-  -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
-  -DMKL_ROOT=/usr \
-  -DMKL_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu \
-  -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
+(
+  set -euo pipefail
+  bash benchmark/IVF/build.sh \
+    -DCMAKE_C_COMPILER=/usr/bin/gcc \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+    -DMKL_ROOT=/usr \
+    -DMKL_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu \
+    -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
+  cmake --build "$IVF_BUILD_DIR" --target bufann_gt_computer -j4
+  cmake -S baselines/DiskANN -B baselines/DiskANN/build -DCMAKE_BUILD_TYPE=Release
+)
+```
 
-cmake --build "$IVF_BUILD_DIR" --target bufann_gt_computer -j4
-
-cmake -S baselines/DiskANN -B baselines/DiskANN/build \
-  -DCMAKE_BUILD_TYPE=Release
-
+This one will be angry, but it will complete.
+```bash
 cmake --build baselines/DiskANN/build \
   --target build_pq_pivot_standalone build_pq_codes_standalone -j4
 ```
 
-The DiskANN helpers provide PQ data. **No DiskANN graph is needed.** These paths
-use Ubuntu's packaged MKL layout; they are not paths for a oneAPI installation.
+These paths assume Ubuntu's packaged MKL layout.
 
-## 4. Select and download IVF inputs
+## 3. Prepare the inputs once
 
 Choose either profile. This recipe takes the **first 10M or 100M uint8 vectors
-from BIGANN/SIFT1B**, not a random sample. This is an IVF dataset choice, not a
-requirement on the external SPFresh tester. Other valid subsets can be supplied
+from BIGANN/SIFT1B**, not a random sample. Other valid subsets can be supplied
 through the dataset profile; regenerate matching GT and PQ for their exact row
-order. Keep IVF data and GT outside the workload work directories.
+order. 
 
-Choose an SSD location; change the path below if necessary:
+You'll want at least the eval and data drives to have significant disk space.
 
+Once generated, these artifacts could be uploaded and downloaded instead of regenerated. `DATASET=sift10m` is also valid.
 ```bash
-export DATASET=sift100m                 # Or sift10m.
-export DATA_ROOT="$HOME/ann-data/$DATASET"
-export DATA_BIN="$DATA_ROOT/base.bin"
-export QUERY_BIN="$DATA_ROOT/query.10K.bin"
-export GT_BIN_KCACHED="$DATA_ROOT/full-query.gt100.bin"
-source "benchmark/datasets/$DATASET.sh"
-export NPTS_FULL
-mkdir -p "$DATA_ROOT"
-```
-
-This downloads the selected prefix and writes the correct `.bin` header.
-It refuses a server that ignores the range request and preserves partial files
-on failure. It does not resume an interrupted download.
-
-```bash
-python3 - <<'PY'
-import os
-import struct
-import urllib.request
-from pathlib import Path
-
-rows, dim = int(os.environ["NPTS_FULL"]), 128
-if rows not in (10_000_000, 100_000_000):
-    raise RuntimeError("Choose sift10m or sift100m")
-size = 8 + rows * dim
-url = (
-    "https://dl.fbaipublicfiles.com/"
-    "billion-scale-ann-benchmarks/bigann/base.1B.u8bin"
-    f"?subset={rows}"
-)
-path = Path(os.environ["DATA_BIN"])
-request = urllib.request.Request(url, headers={
-    "Range": f"bytes=0-{size - 1}",
-    "Accept-Encoding": "identity",
-})
-
-with urllib.request.urlopen(request, timeout=120) as response:
-    expected = f"bytes 0-{size - 1}/128000000008"
-    if response.status != 206 or response.headers.get("Content-Range") != expected:
-        raise RuntimeError("Server did not return the requested subset range")
-    if struct.unpack("<II", response.read(8)) != (1_000_000_000, dim):
-        raise RuntimeError("Unexpected source header")
-    with path.open("xb") as output:
-        output.write(struct.pack("<II", rows, dim))
-        remaining = rows * dim
-        while remaining:
-            block = response.read(min(8 * 1024 * 1024, remaining))
-            if not block:
-                raise RuntimeError("Incomplete download; partial file retained")
-            output.write(block)
-            remaining -= len(block)
-
-print("Downloaded:", path)
-
-query_url = (
-    "https://dl.fbaipublicfiles.com/"
-    "billion-scale-ann-benchmarks/bigann/query.public.10K.u8bin"
-)
-with urllib.request.urlopen(query_url, timeout=120) as response:
-    queries = response.read(8 + 10_000 * dim + 1)
-if len(queries) != 8 + 10_000 * dim or struct.unpack("<II", queries[:8]) != (10_000, dim):
-    raise RuntimeError("Unexpected query header/length")
-query_path = Path(os.environ["QUERY_BIN"])
-with query_path.open("xb") as output:
-    output.write(queries)
-print("Downloaded:", query_path)
-PY
-```
-
-Keep final queries out of parameter tuning: freeze settings using base-only calibration
-or a separately designated tuning set before scoring the final set.
-
-## 5. Configure the dataset
-
-The preceding exports select IVF's input paths without editing the dataset
-profile. Confirm the selected profile before continuing:
-
-```bash
+export DATASET=sift100m; export DATA_ROOT="$HOME/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin" GT_BIN_KCACHED="$DATA_ROOT/full-query.gt100.bin"
 source "benchmark/datasets/$DATASET.sh"
 printf 'Dataset=%s total=%s base=%s updates=%s\n' \
   "$DATASET" "$NPTS_FULL" "$NPTS_BASE" "$UPDATE_POINTS"
 
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
+
+(
+  set -euo pipefail
+  python3 benchmark/IVF/download_sift.py \
+    --rows "$NPTS_FULL" --base "$DATA_BIN" --query "$QUERY_BIN"
+
+  # Full-source top-100 GT for every query.
+  "$IVF_BUILD_DIR/tests/bufann_gt_computer" \
+    --data_type uint8 --base_file "$DATA_BIN" --query_file "$QUERY_BIN" \
+    --gt_file "$GT_BIN_KCACHED" --K 100 --num_threads 8
+
+  # Full-source PQ, including the insertion tail; no DiskANN graph.
+  mkdir -p "$DATA_ROOT/pq"
+  baselines/DiskANN/build/tests/build_pq_pivot_standalone \
+    uint8 "$DATA_BIN" "$IVF_PQ_PREFIX" 64
+  baselines/DiskANN/build/tests/build_pq_codes_standalone \
+    uint8 "$DATA_BIN" "$IVF_PQ_PREFIX" 64 0
+)
 ```
 
-## 6. Generate ground truth
+Download, GT and PQ generation can take substantial time. The downloader checks
+headers/ranges, refuses existing outputs and retains partial files; it does not
+resume. Reuse completed inputs unchanged across runs; skip their generation when
+using an existing verified dataset. The PQ helper's final `0` encodes all rows.
 
-Compute top-100 neighbors for every query against **the selected full-source file**:
+IVF filters GT for each live set and rejects insufficient surviving candidates.
+This recipe measures **Recall@10**; Recall@100 needs deeper GT and fresh preparation.
+Keep final queries out of tuning: freeze settings using base-only calibration or
+a separate tuning set before scoring them.
 
-```bash
-"$IVF_BUILD_DIR/tests/bufann_gt_computer" \
-  --data_type uint8 \
-  --base_file "$DATA_BIN" \
-  --query_file "$QUERY_BIN" \
-  --gt_file "$GT_BIN_KCACHED" \
-  --K 100 \
-  --num_threads 8
-```
+## 4. Configure and run all four workloads
 
-This can take substantial time. This helper uses smaller batches than the general
-deep-GT script. IVF filters this GT for each workload's live IDs;
-insufficient surviving candidates fail rather than inventing recall.
-
-This recipe measures **Recall@10**. For Recall@100, generate a deeper GT cache
-and use fresh preparation paths: top-100 full-source GT may not retain 100
-candidates after filtering for the base or deleted IDs.
-
-## 7. Generate full-source PQ data
-
-```bash
-mkdir -p "$DATA_ROOT/pq"
-export IVF_PQ_PREFIX="$DATA_ROOT/pq/pq32"
-
-baselines/DiskANN/build/tests/build_pq_pivot_standalone \
-  uint8 "$DATA_BIN" "$IVF_PQ_PREFIX" 32
-
-baselines/DiskANN/build/tests/build_pq_codes_standalone \
-  uint8 "$DATA_BIN" "$IVF_PQ_PREFIX" 32 0
-```
-
-The final `0` encodes **all source rows**, including the insertion tail. PQ generation
-can take substantial time. Reuse these pivots and codes unchanged across IVF
-tests on this source file. External SPFresh testing does not need to consume
-these artifacts.
-
-## 8. Set full-scale options
-
-**Current training limit:** the native index builder permits at most one billion
-assignment searches. All 90M training rows with the default 15 passes would need
-1.44 billion and are rejected. This recipe uses **10 mean-update passes on all
-90M rows**, plus a final assignment: 990 million searches. Using 15 passes requires a
-separate change to expose an explicit work allowance; no environment variable
-currently overrides this guard. SIFT10M's 9M base fits the guard with 15 passes.
+**Training limit:** SIFT100M uses **10 passes on all 90M base rows**, plus final
+assignment: 990M searches, below the native 1B guard. The default 15 passes would
+need 1.44B and fail; there is no environment override. SIFT10M fits with 15 passes.
 
 ```bash
 # Remove any smaller-workload overrides from earlier experiments.
-unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO
-unset INSERT_CAP DELETE_CAP IVF_RUN_TAG IVF_COST_MODEL_REPORT
-unset IVF_SCHEDULER_SEED
+unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO INSERT_CAP DELETE_CAP IVF_RUN_TAG IVF_COST_MODEL_REPORT IVF_SCHEDULER_SEED
 
 # Train on every initial-base row.
-export IVF_SAMPLE_RATE=1
 if [ "$DATASET" = sift100m ]; then
   export IVF_MAX_REPS=10
 else
   export IVF_MAX_REPS=15
 fi
-export IVF_TRAINER_MODE=ann-reuse-seeded
-export IVF_INIT=random_partition
-export IVF_TRAINING_BREADTH=64
-export IVF_SEED=0
-export IVF_BUILD_THREADS=8
-export IVF_MEMORY_BUDGET_GB=96
+export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=ann-reuse-seeded IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0 IVF_BUILD_THREADS=8 IVF_MEMORY_BUDGET_GB=96
 
 # Explicit starting configuration, not a qualified recall optimum.
-export IVF_NLIST=10000
-export IVF_NPROBE=32
-export IVF_RERANK_FACTOR=4
-export QUERY_THREADS=8
-export RECALL_AT=10
+export IVF_NLIST=10000 IVF_NPROBE=32 IVF_RERANK_FACTOR=4 QUERY_THREADS=8 RECALL_AT=10
 
 # Full profile update counts; ten mixed rounds in either dataset.
-export UPDATE_PERCENT=10
-export UPDATE_BATCH=$((UPDATE_POINTS / 10))
-export IVF_SCHEDULER=update_driven
-export NTHREADS=16
+export UPDATE_PERCENT=10 UPDATE_BATCH=$((UPDATE_POINTS / 10)) IVF_SCHEDULER=update_driven NTHREADS=16 EVAL_TEMPFILES="$HOME/ann-eval/run01" EVAL_CACHED="$HOME/ann-eval/cache"
 
-export EVAL_TEMPFILES="$HOME/ann-eval/run01"
-export EVAL_CACHED="$HOME/ann-eval/cache"
+# Each workload gets an independent prepared base; stop on any failure.
+(
+  set -euo pipefail
+  for workload in query insert delete update; do
+    bash "benchmark/IVF/sift/${workload}_prepare.sh"
+    bash "benchmark/IVF/sift/${workload}.sh"
+  done
+)
 ```
 
 Memory budgets check workspace estimates, not hard RAM caps. Keep these settings
 fixed across preparation and execution. Cache hits restore an index, not measure
 a new build; use a fresh cache root when measuring fresh construction.
 
-## 9. Run query, insert and delete
-
 Each workload starts independently from the same profile base. Insertions
 from the insert test do **not** carry into the delete test.
-
-```bash
-# Query the initial base with all 10,000 queries.
-bash benchmark/IVF/sift/query_prepare.sh
-bash benchmark/IVF/sift/query.sh
-
-# Insert the entire reserved tail, then score the full live dataset.
-bash benchmark/IVF/sift/insert_prepare.sh
-bash benchmark/IVF/sift/insert.sh
-
-# Delete the profile update count from the base tail, then score survivors.
-bash benchmark/IVF/sift/delete_prepare.sh
-bash benchmark/IVF/sift/delete.sh
-```
-
 IVF sequential insert/delete use one mutation worker; `QUERY_THREADS` controls later
 scoring. Centroids and routers stay frozen across updates.
-
-## 10. Run mixed updates
-
-```bash
-bash benchmark/IVF/sift/update_prepare.sh
-bash benchmark/IVF/sift/update.sh
-```
 
 These settings run **10 rounds**: each inserts/deletes 100K rows for SIFT10M or
 1M rows for SIFT100M. There is **no required query ratio or total query quota**.
@@ -576,7 +466,11 @@ joins admitted queries, then scores all 10,000 queries after each round. Record
 the actual query count and overlap. This workload does not require reproducing
 the external SPFresh tester's scheduler or scoring cadence.
 
-## 11. Repeat measurements
+## 5. Read results and repeat
+
+Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
+`delete/` and `update/`. Retain logs, structured results and input identities.
+
 
 For three query repetitions at the same frozen settings:
 
@@ -588,21 +482,16 @@ bash benchmark/IVF/sift/query_sweep.sh \
   --memory-budget-gb 96 --buffer-frames 64 --timeout 86400
 ```
 
-For IVF mutation repetitions, use
-a fresh work root and rerun the same prepare/run pairs from steps 9 and 10:
+For another complete run, choose a fresh work root and repeat the loop in step 4
+without changing the frozen settings:
 
 ```bash
 unset IVF_RUN_TAG
 export EVAL_TEMPFILES="$HOME/ann-eval/run02"
-# Repeat the IVF prepare/run pairs from steps 9 and 10.
+# Repeat only the workload loop from step 4.
 ```
 
 Choose a new root for each repetition so preparation starts from the same IVF
 base. Do not delete failed evidence or change settings in response to final-set
 results. Tagged reruns from an existing IVF prepared base are also supported;
 the fresh-root recipe makes each repetition explicit.
-
-## 12. Read the results
-
-Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
-`delete/` and `update/`. Retain logs, structured results and input identities.

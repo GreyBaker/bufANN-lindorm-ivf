@@ -301,6 +301,36 @@ struct BufferPool::ResidencySegment {
 
 BufferPool::BufferPool() = default;
 
+void BufferPool::AlignedPage::Deleter::operator()(char* data) const noexcept {
+    free(data);
+}
+
+BufferPool::AlignedPage::AlignedPage(const char* source, size_t size)
+    : bytes(static_cast<char*>(checked_aligned_alloc(4096, size, "flush snapshot"))) {
+    memcpy(bytes.get(), source, size);
+}
+
+void BufferPool::check_io_failure() const {
+    if (!_io_failed.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(_io_failure_mutex);
+    std::rethrow_exception(_io_failure);
+}
+
+void BufferPool::record_io_failure(std::exception_ptr error) {
+    {
+        std::lock_guard<std::mutex> lock(_io_failure_mutex);
+        if (!_io_failure) _io_failure = error;
+        _io_failed.store(true, std::memory_order_release);
+    }
+    _flush_running.store(false, std::memory_order_release);
+    // Pair with waiter mutexes so a failure cannot race between predicate
+    // evaluation and sleep. All waits also test _io_failed.
+    for (auto& waiter : _frame_waiters) {
+        std::lock_guard<std::mutex> lock(waiter->mtx);
+        waiter->cv.notify_all();
+    }
+}
+
 BufferPool::~BufferPool() {
     stop_bg_flush();
     reset_residency_directory();
@@ -325,6 +355,9 @@ void BufferPool::init(uint32_t page_size, uint32_t num_frames,
                       uint32_t flush_budget_pages_per_cycle,
                       uint32_t flush_wakeup_ms,
                       bool truncate_heap) {
+    check_io_failure();
+    if (page_size == 0 || page_size % 4096 != 0)
+        throw std::invalid_argument("BufferPool page size must be a multiple of 4096 for direct I/O");
     _page_size  = page_size;
     _num_frames = num_frames;
     _stats      = stats;
@@ -525,13 +558,34 @@ void BufferPool::read_page(uint32_t page_id, char* buf) {
 }
 
 void BufferPool::write_page(uint32_t page_id, const char* buf) {
-    ssize_t n = ::pwrite(_heap_fd, buf, _page_size,
-                         (off_t)page_id * _page_size);
-    (void)n;
+    check_io_failure();
+    const uint64_t offset = uint64_t(page_id) * _page_size;
+    ssize_t n = -1;
+    int error = EINVAL;
+    if (reinterpret_cast<uintptr_t>(buf) % 4096 == 0 &&
+        offset % 4096 == 0 && _page_size % 4096 == 0) {
+        do {
+            n = ::pwrite(_heap_fd, buf, _page_size, static_cast<off_t>(offset));
+            error = n < 0 ? errno : 0;
+        } while (n < 0 && error == EINTR);
+    }
+    if (n == static_cast<ssize_t>(_page_size)) return;
+    // A short direct write is fatal: retrying the suffix can violate alignment.
+    try {
+        throw std::runtime_error("BufferPool page write failed: page_id=" +
+            std::to_string(page_id) + " offset=" + std::to_string(offset) +
+            " requested=" + std::to_string(_page_size) + " actual=" +
+            std::to_string(n) + " errno=" + std::to_string(error) +
+            " (" + std::string(std::strerror(error)) + ")");
+    } catch (...) {
+        record_io_failure(std::current_exception());
+        throw;
+    }
 }
 
 uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
                                bool* used_eviction_out) {
+    check_io_failure();
     const auto evict_begin = std::chrono::steady_clock::now();
     uint64_t local_scan_ns = 0;
     uint64_t local_wait_pins_ns = 0;
@@ -556,15 +610,26 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
         // Wait for existing pinners to release — no lock held, bounded by unpin_frame()
         const auto wait_begin = std::chrono::steady_clock::now();
         while (f.pin_count.load(std::memory_order_acquire) > 0) {
+            check_io_failure();
             _mm_pause();
         }
         local_wait_pins_ns += elapsed_ns(wait_begin);
-        const bool was_dirty = f.dirty.exchange(false, std::memory_order_acq_rel);
+        const bool was_dirty = f.dirty.load(std::memory_order_acquire);
+        if (was_dirty) {
+            try {
+                AlignedPage snapshot(f.data, _page_size);
+                const auto flush_begin = std::chrono::steady_clock::now();
+                write_page(old_page_id, snapshot.data());
+                local_flush_ns += elapsed_ns(flush_begin);
+            } catch (...) {
+                record_io_failure(std::current_exception());
+                throw;
+            }
+            f.dirty.store(false, std::memory_order_release);
+        }
         if (was_dirty) {
             _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
         }
-        std::vector<char> flush_copy;
-        if (was_dirty) flush_copy.assign(f.data, f.data + _page_size);
         if (_stats) {
             _stats->evictions.fetch_add(1);
             if (was_dirty) _stats->dirty_evictions.fetch_add(1);
@@ -576,9 +641,6 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
         f.ref_bit.store(0, std::memory_order_release);
         store_frame_state(f, FrameState::LOADING);
         if (was_dirty) {
-            const auto flush_begin = std::chrono::steady_clock::now();
-            write_page(old_page_id, flush_copy.data());
-            local_flush_ns += elapsed_ns(flush_begin);
             if (_stats) {
                 _stats->pages_flushed.fetch_add(1);
                 _stats->dirty_page_bytes_flushed.fetch_add(_page_size);
@@ -675,6 +737,7 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
 }
 
 PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
+    check_io_failure();
     if (hint == FrameRegion::QUERY) {
         if (PageFrame* fast = try_pin_query_fast(page_id)) {
             return *fast;
@@ -683,6 +746,7 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
 
     ShardState& shard = shard_for_page(page_id);
     while (true) {
+        check_io_failure();
         // ---------------------------------------------------------------
         // Fast path: page already resident — phmap shared lock, no mutex
         // ---------------------------------------------------------------
@@ -730,7 +794,8 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
             FrameWaitState* wait_state = _frame_waiters[loading_idx].get();
             auto wait_begin = std::chrono::high_resolution_clock::now();
             std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
-            wait_state->cv.wait(wait_lk, [&f_ref = _frames[loading_idx], hint] {
+            wait_state->cv.wait(wait_lk, [this, &f_ref = _frames[loading_idx], hint] {
+                if (_io_failed.load(std::memory_order_acquire)) return true;
                 FrameState st = load_frame_state(f_ref);
                 return st != FrameState::LOADING &&
                        (st != FrameState::FLUSHING ||
@@ -840,6 +905,7 @@ static_assert(BufferPool::kPinBatchMax <= 256,
 void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                            size_t n, FrameRegion hint,
                            bool account_sequential_read) {
+    check_io_failure();
     if (n == 0) return;
     if (n > kPinBatchMax) {
         throw std::invalid_argument(
@@ -886,186 +952,204 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
     std::vector<AlignedRead> reqs;
     reqs.reserve(n_unique);
 
-    // --- Step B: per-unique classification (one pin per unique frame) ---
-    for (size_t u = 0; u < n_unique; ++u) {
-        const uint32_t page_id = unique_ids[u];
-        ShardState& shard = shard_for_page(page_id);
-        while (true) {
-            PageFrame* hit_frame = nullptr;
-            uint32_t   loading_idx = INVALID_PAGE;
-            shard.page_table.if_contains(page_id, [&](const auto& kv) {
-                auto& f = _frames[kv.second];
-                f.pin_count.fetch_add(1, std::memory_order_acq_rel);
-                if (hint != FrameRegion::QUERY) {
-                    f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
-                }
-                FrameState st = load_frame_state(f);
-                if (frame_state_allows_pin(f, st, hint) &&
-                    f.page_id.load(std::memory_order_acquire) == page_id) {
-                    f.ref_bit.store(1, std::memory_order_release);
-                    if (hint == FrameRegion::QUERY) {
-                        publish_resident_frame(page_id, kv.second);
-                    }
-                    hit_frame = &f;
-                } else {
+    size_t classified = 0;
+    try {
+
+        // --- Step B: per-unique classification (one pin per unique frame) ---
+        for (size_t u = 0; u < n_unique; ++u) {
+            const uint32_t page_id = unique_ids[u];
+            ShardState &shard = shard_for_page(page_id);
+            while (true) {
+                check_io_failure();
+                PageFrame *hit_frame = nullptr;
+                uint32_t loading_idx = INVALID_PAGE;
+                shard.page_table.if_contains(page_id, [&](const auto &kv) {
+                    auto &f = _frames[kv.second];
+                    f.pin_count.fetch_add(1, std::memory_order_acq_rel);
                     if (hint != FrameRegion::QUERY) {
-                        f.update_pin_count.fetch_sub(1, std::memory_order_acq_rel);
+                        f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
                     }
-                    f.pin_count.fetch_sub(1, std::memory_order_acq_rel);
-                    loading_idx = kv.second;
+                    FrameState st = load_frame_state(f);
+                    if (frame_state_allows_pin(f, st, hint) &&
+                        f.page_id.load(std::memory_order_acquire) == page_id) {
+                        f.ref_bit.store(1, std::memory_order_release);
+                        if (hint == FrameRegion::QUERY) {
+                            publish_resident_frame(page_id, kv.second);
+                        }
+                        hit_frame = &f;
+                    } else {
+                        if (hint != FrameRegion::QUERY) {
+                            f.update_pin_count.fetch_sub(1, std::memory_order_acq_rel);
+                        }
+                        f.pin_count.fetch_sub(1, std::memory_order_acq_rel);
+                        loading_idx = kv.second;
+                    }
+                });
+                if (hit_frame) {
+                    entries[u] = Entry{hit_frame, INVALID_PAGE, K_HIT, false};
+                    classified = u + 1;
+                    break;
                 }
-            });
-            if (hit_frame) {
-                entries[u] = Entry{ hit_frame, INVALID_PAGE, K_HIT, false };
-                break;
-            }
-            if (loading_idx != INVALID_PAGE) {
-                // Another thread is loading this page; take a pin and wait later.
-                auto& f = _frames[loading_idx];
-                f.pin_count.fetch_add(1, std::memory_order_acq_rel);
-                if (hint != FrameRegion::QUERY) {
-                    f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
+                if (loading_idx != INVALID_PAGE) {
+                    // Another thread is loading this page; take a pin and wait later.
+                    auto &f = _frames[loading_idx];
+                    f.pin_count.fetch_add(1, std::memory_order_acq_rel);
+                    if (hint != FrameRegion::QUERY) {
+                        f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
+                    }
+                    entries[u] = Entry{&f, loading_idx, K_WAIT_OTHER, false};
+                    classified = u + 1;
+                    break;
                 }
-                entries[u] = Entry{ &f, loading_idx, K_WAIT_OTHER, false };
-                break;
-            }
-            // Slow path: claim a frame, race to insert.
-            bool used_eviction = false;
-            uint32_t frame_idx = evict_one(shard, hint, &used_eviction);
-            bool we_won = shard.page_table.lazy_emplace_l(page_id,
-                [&](auto& /*kv*/) {
+                // Slow path: claim a frame, race to insert.
+                bool used_eviction = false;
+                uint32_t frame_idx = evict_one(shard, hint, &used_eviction);
+                bool we_won = shard.page_table.lazy_emplace_l(page_id, [&](auto & /*kv*/) {
                     auto& claimed_f = _frames[frame_idx];
                     claimed_f.page_id.store(INVALID_PAGE, std::memory_order_release);
-                    store_frame_state(claimed_f, FrameState::FREE);
-                },
-                [&](auto&& ctor) {
-                    ctor(std::piecewise_construct,
-                         std::make_tuple(page_id),
-                         std::make_tuple(frame_idx));
-                });
-            if (!we_won) continue;
-            auto& f = _frames[frame_idx];
-            f.page_id.store(page_id, std::memory_order_release);
-            f.pin_count.store(1, std::memory_order_release);
-            f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
-                                     std::memory_order_release);
-            f.dirty.store(false, std::memory_order_release);
-            f.ref_bit.store(1, std::memory_order_release);
-            // State is LOADING (set by evict_one's finish_evict path).
-            entries[u] = Entry{ &f, frame_idx, K_MISS_OURS, used_eviction };
-            reqs.push_back(AlignedRead{
-                static_cast<uint64_t>(page_id) * static_cast<uint64_t>(_page_size),
-                static_cast<uint64_t>(_page_size),
-                f.data
-            });
-            break;
+                    store_frame_state(claimed_f, FrameState::FREE); }, [&](auto &&ctor) { ctor(std::piecewise_construct,
+                                                                                                                       std::make_tuple(page_id),
+                                                                                                                       std::make_tuple(frame_idx)); });
+                if (!we_won)
+                    continue;
+                auto &f = _frames[frame_idx];
+                f.page_id.store(page_id, std::memory_order_release);
+                f.pin_count.store(1, std::memory_order_release);
+                f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
+                                         std::memory_order_release);
+                f.dirty.store(false, std::memory_order_release);
+                f.ref_bit.store(1, std::memory_order_release);
+                // State is LOADING (set by evict_one's finish_evict path).
+                entries[u] = Entry{&f, frame_idx, K_MISS_OURS, used_eviction};
+                classified = u + 1;
+                reqs.push_back(AlignedRead{
+                    static_cast<uint64_t>(page_id) * static_cast<uint64_t>(_page_size),
+                    static_cast<uint64_t>(_page_size),
+                    f.data});
+                break;
+            }
         }
-    }
 
-    // --- Step C: batched libaio read for MISS_OURS ---
-    uint64_t n_miss = 0, n_with_evict = 0, n_no_evict = 0;
-    uint64_t batch_ns = 0;
-    if (!reqs.empty()) {
-        const auto io_begin = std::chrono::high_resolution_clock::now();
-        _aio_reader->read(reqs, ctx);
-        const auto io_end = std::chrono::high_resolution_clock::now();
-        batch_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count());
+        // --- Step C: batched libaio read for MISS_OURS ---
+        uint64_t n_miss = 0, n_with_evict = 0, n_no_evict = 0;
+        uint64_t batch_ns = 0;
+        if (!reqs.empty()) {
+            const auto io_begin = std::chrono::high_resolution_clock::now();
+            _aio_reader->read(reqs, ctx);
+            const auto io_end = std::chrono::high_resolution_clock::now();
+            batch_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(io_end - io_begin).count());
 
-        // --- Step D: transition MISS_OURS frames to READY, notify waiters ---
+            // --- Step D: transition MISS_OURS frames to READY, notify waiters ---
+            for (size_t u = 0; u < n_unique; ++u) {
+                if (entries[u].kind != K_MISS_OURS)
+                    continue;
+                auto &f = *entries[u].frame;
+                store_frame_state(f, FrameState::READY);
+                {
+                    std::lock_guard<std::mutex> wait_lk(_frame_waiters[entries[u].frame_idx]->mtx);
+                }
+                _frame_waiters[entries[u].frame_idx]->cv.notify_all();
+                if (hint == FrameRegion::QUERY) {
+                    publish_resident_frame(unique_ids[u], entries[u].frame_idx);
+                }
+                ++n_miss;
+                if (entries[u].used_eviction)
+                    ++n_with_evict;
+                else
+                    ++n_no_evict;
+            }
+        }
+
+        // --- Step E: CV-wait WAIT_OTHER entries ---
         for (size_t u = 0; u < n_unique; ++u) {
-            if (entries[u].kind != K_MISS_OURS) continue;
-            auto& f = *entries[u].frame;
-            store_frame_state(f, FrameState::READY);
-            {
-                std::lock_guard<std::mutex> wait_lk(_frame_waiters[entries[u].frame_idx]->mtx);
-            }
-            _frame_waiters[entries[u].frame_idx]->cv.notify_all();
-            if (hint == FrameRegion::QUERY) {
-                publish_resident_frame(unique_ids[u], entries[u].frame_idx);
-            }
-            ++n_miss;
-            if (entries[u].used_eviction) ++n_with_evict;
-            else                          ++n_no_evict;
+            if (entries[u].kind != K_WAIT_OTHER)
+                continue;
+            FrameWaitState *wait_state = _frame_waiters[entries[u].frame_idx].get();
+            auto &f_ref = *entries[u].frame;
+            std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
+            wait_state->cv.wait(wait_lk, [this, &f_ref, hint] {
+                if (_io_failed.load(std::memory_order_acquire))
+                    return true;
+                FrameState st = load_frame_state(f_ref);
+                return st != FrameState::LOADING &&
+                       (st != FrameState::FLUSHING ||
+                        frame_state_allows_pin(f_ref, st, hint));
+            });
         }
-    }
 
-    // --- Step E: CV-wait WAIT_OTHER entries ---
-    for (size_t u = 0; u < n_unique; ++u) {
-        if (entries[u].kind != K_WAIT_OTHER) continue;
-        FrameWaitState* wait_state = _frame_waiters[entries[u].frame_idx].get();
-        auto& f_ref = *entries[u].frame;
-        std::unique_lock<std::mutex> wait_lk(wait_state->mtx);
-        wait_state->cv.wait(wait_lk, [&f_ref, hint] {
-            FrameState st = load_frame_state(f_ref);
-            return st != FrameState::LOADING &&
-                   (st != FrameState::FLUSHING ||
-                    frame_state_allows_pin(f_ref, st, hint));
-        });
-    }
-
-    // --- Step F: extra pins for duplicate slots ---
-    uint16_t pin_count_per_unique[kPinBatchMax] = {0};
-    for (size_t i = 0; i < n; ++i) ++pin_count_per_unique[slot_to_unique[i]];
-    uint64_t logical_hits = 0;
-    uint64_t logical_misses = 0;
-    for (size_t u = 0; u < n_unique; ++u) {
-        if (entries[u].kind != K_MISS_OURS) {
-            logical_hits += pin_count_per_unique[u];
-        } else {
-            logical_misses += pin_count_per_unique[u];
-        }
-        if (pin_count_per_unique[u] <= 1) continue;
-        const uint32_t extra = pin_count_per_unique[u] - 1u;
-        auto& f = *entries[u].frame;
-        f.pin_count.fetch_add(extra, std::memory_order_acq_rel);
-        if (hint != FrameRegion::QUERY) {
-            f.update_pin_count.fetch_add(extra, std::memory_order_acq_rel);
-        }
-    }
-
-    // --- Step G: fill output ---
-    for (size_t i = 0; i < n; ++i) {
-        out_frames[i] = entries[slot_to_unique[i]].frame;
-    }
-
-    // Keep phase-local diagnostics aligned with synchronous read_page().
-    // Insert/delete phase scopes sample this thread-local counter directly.
-    if (n_miss > 0) {
-        t_phys_reads += n_miss;
-    }
-
-    // --- Stats ---
-    // Logical cache misses are counted per request; batch_misses_total counts
-    // only the unique pages this batch physically read.
-    if (_stats) {
-        _stats->batch_pin_calls.fetch_add(1, std::memory_order_relaxed);
-        if (logical_hits > 0) {
-            if (hint == FrameRegion::QUERY) {
-                record_query_cache_hit(logical_hits);
+        // --- Step F: extra pins for duplicate slots ---
+        check_io_failure();
+        uint16_t pin_count_per_unique[kPinBatchMax] = {0};
+        for (size_t i = 0; i < n; ++i)
+            ++pin_count_per_unique[slot_to_unique[i]];
+        uint64_t logical_hits = 0;
+        uint64_t logical_misses = 0;
+        for (size_t u = 0; u < n_unique; ++u) {
+            if (entries[u].kind != K_MISS_OURS) {
+                logical_hits += pin_count_per_unique[u];
             } else {
-                _stats->cache_hits.fetch_add(logical_hits, std::memory_order_relaxed);
+                logical_misses += pin_count_per_unique[u];
+            }
+            if (pin_count_per_unique[u] <= 1)
+                continue;
+            const uint32_t extra = pin_count_per_unique[u] - 1u;
+            auto &f = *entries[u].frame;
+            f.pin_count.fetch_add(extra, std::memory_order_acq_rel);
+            if (hint != FrameRegion::QUERY) {
+                f.update_pin_count.fetch_add(extra, std::memory_order_acq_rel);
             }
         }
-        if (logical_misses > 0) {
-            _stats->cache_misses.fetch_add(logical_misses, std::memory_order_relaxed);
+
+        // --- Step G: fill output ---
+        for (size_t i = 0; i < n; ++i) {
+            out_frames[i] = entries[slot_to_unique[i]].frame;
         }
+
+        // Keep phase-local diagnostics aligned with synchronous read_page().
+        // Insert/delete phase scopes sample this thread-local counter directly.
         if (n_miss > 0) {
-            const uint64_t read_bytes =
-                n_miss * static_cast<uint64_t>(_page_size);
-            _stats->batch_misses_total.fetch_add(n_miss, std::memory_order_relaxed);
-            _stats->batch_with_evict.fetch_add(n_with_evict, std::memory_order_relaxed);
-            _stats->batch_no_evict.fetch_add(n_no_evict, std::memory_order_relaxed);
-            _stats->batch_io_ns_total.fetch_add(batch_ns, std::memory_order_relaxed);
-            if (account_sequential_read) {
-                _stats->sequential_read_ios.fetch_add(n_miss, std::memory_order_relaxed);
-                _stats->sequential_read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
+            t_phys_reads += n_miss;
+        }
+
+        // --- Stats ---
+        // Logical cache misses are counted per request; batch_misses_total counts
+        // only the unique pages this batch physically read.
+        if (_stats) {
+            _stats->batch_pin_calls.fetch_add(1, std::memory_order_relaxed);
+            if (logical_hits > 0) {
+                if (hint == FrameRegion::QUERY) {
+                    record_query_cache_hit(logical_hits);
+                } else {
+                    _stats->cache_hits.fetch_add(logical_hits, std::memory_order_relaxed);
+                }
+            }
+            if (logical_misses > 0) {
+                _stats->cache_misses.fetch_add(logical_misses, std::memory_order_relaxed);
+            }
+            if (n_miss > 0) {
+                const uint64_t read_bytes =
+                    n_miss * static_cast<uint64_t>(_page_size);
+                _stats->batch_misses_total.fetch_add(n_miss, std::memory_order_relaxed);
+                _stats->batch_with_evict.fetch_add(n_with_evict, std::memory_order_relaxed);
+                _stats->batch_no_evict.fetch_add(n_no_evict, std::memory_order_relaxed);
+                _stats->batch_io_ns_total.fetch_add(batch_ns, std::memory_order_relaxed);
+                if (account_sequential_read) {
+                    _stats->sequential_read_ios.fetch_add(n_miss, std::memory_order_relaxed);
+                    _stats->sequential_read_bytes.fetch_add(read_bytes, std::memory_order_relaxed);
+                }
             }
         }
+    } catch (...) {
+        record_io_failure(std::current_exception());
+        for (size_t u = 0; u < classified; ++u)
+            unpin_frame(entries[u].frame, false, hint);
+        throw;
     }
 }
 
 PageFrame* BufferPool::try_pin_resident(uint32_t page_id, FrameRegion hint) {
+    check_io_failure();
     ShardState& shard = shard_for_page(page_id);
     PageFrame* result = nullptr;
     shard.page_table.if_contains(page_id, [&](const auto& kv) {
@@ -1134,6 +1218,8 @@ void BufferPool::unpin_frame(PageFrame* frame, bool dirty, FrameRegion hint) {
 }
 
 void BufferPool::discard_frame(PageFrame* frame) {
+    // Called from PinnedFrame destruction; record failures without throwing.
+    if (_io_failed.load(std::memory_order_acquire)) return;
     if (frame == nullptr) return;
     if (frame->pin_count.load(std::memory_order_acquire) > 0) return;
     const uint32_t page_id = frame->page_id.load(std::memory_order_acquire);
@@ -1152,13 +1238,20 @@ void BufferPool::discard_frame(PageFrame* frame) {
     clear_resident_frame(page_id, frame->frame_index);
 
     while (frame->pin_count.load(std::memory_order_acquire) > 0) {
+        if (_io_failed.load(std::memory_order_acquire)) return;
         _mm_pause();
     }
 
-    const bool was_dirty = frame->dirty.exchange(false, std::memory_order_acq_rel);
+    const bool was_dirty = frame->dirty.load(std::memory_order_acquire);
     if (was_dirty) {
+        try {
+            write_page(page_id, frame->data);
+        } catch (...) {
+            record_io_failure(std::current_exception());
+            return;
+        }
+        frame->dirty.store(false, std::memory_order_release);
         _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
-        write_page(page_id, frame->data);
         if (_stats) _stats->pages_flushed.fetch_add(1);
     }
     if (_stats) _stats->evictions.fetch_add(1);
@@ -1196,6 +1289,7 @@ void BufferPool::mark_frame_dirty(PageFrame& frame) {
 }
 
 uint32_t BufferPool::flush_dirty_budget(uint32_t max_pages) {
+    check_io_failure();
     uint32_t flushed = 0;
     uint32_t remaining =
         max_pages == 0 ? std::numeric_limits<uint32_t>::max() : max_pages;
@@ -1213,6 +1307,8 @@ uint32_t BufferPool::flush_dirty_budget(uint32_t max_pages) {
             ShardState& shard = shard_for_page(flush_entry.first);
             shard.page_table.if_contains(flush_entry.first, [&](const auto& kv) {
                 auto& f = _frames[kv.second];
+                if (f.dirty.exchange(false, std::memory_order_acq_rel))
+                    _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
                 uint8_t expected = static_cast<uint8_t>(FrameState::FLUSHING);
                 if (f.state.compare_exchange_strong(expected,
                                                     static_cast<uint8_t>(FrameState::READY),
@@ -1249,6 +1345,7 @@ void BufferPool::set_flush_budget_pages_per_cycle(uint32_t flush_budget_pages_pe
 }
 
 uint32_t BufferPool::grow_heap(uint32_t batch_size) {
+    check_io_failure();
     uint32_t base = _total_pages.load(std::memory_order_relaxed);
     uint64_t max_pages = static_cast<uint64_t>(std::numeric_limits<off_t>::max()) /
                          static_cast<uint64_t>(_page_size);
@@ -1268,6 +1365,7 @@ uint32_t BufferPool::grow_heap(uint32_t batch_size) {
 }
 
 void BufferPool::set_total_pages(uint32_t used_pages) {
+    check_io_failure();
     uint32_t current = _total_pages.load(std::memory_order_acquire);
     if (used_pages > current) {
         throw ANNException("set_total_pages: used_pages=" + std::to_string(used_pages) +
@@ -1277,9 +1375,9 @@ void BufferPool::set_total_pages(uint32_t used_pages) {
     _total_pages.store(used_pages, std::memory_order_release);
 }
 
-std::vector<std::pair<uint32_t, std::vector<char>>> BufferPool::collect_dirty_frames(
+std::vector<std::pair<uint32_t, BufferPool::AlignedPage>> BufferPool::collect_dirty_frames(
     ShardState& shard, uint32_t max_frames, bool flush_all) {
-    std::vector<std::pair<uint32_t, std::vector<char>>> flushes;
+    std::vector<std::pair<uint32_t, AlignedPage>> flushes;
     if (shard.frame_begin >= shard.frame_end) return flushes;
     uint32_t shard_frames = shard.frame_end - shard.frame_begin;
     uint32_t budget = flush_all ? shard_frames
@@ -1314,10 +1412,11 @@ std::vector<std::pair<uint32_t, std::vector<char>>> BufferPool::collect_dirty_fr
         }
 
         while (f.update_pin_count.load(std::memory_order_acquire) > 0) {
+            check_io_failure();
             _mm_pause();
         }
 
-        const bool was_dirty = f.dirty.exchange(false, std::memory_order_acq_rel);
+        const bool was_dirty = f.dirty.load(std::memory_order_acquire);
         if (!was_dirty) {
             store_frame_state(f, FrameState::READY);
             {
@@ -1326,32 +1425,40 @@ std::vector<std::pair<uint32_t, std::vector<char>>> BufferPool::collect_dirty_fr
             _frame_waiters[idx]->cv.notify_all();
             continue;
         }
-        _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
-        std::vector<char> copy(f.data, f.data + _page_size);
-        flushes.emplace_back(page_id, std::move(copy));
+        try {
+            flushes.emplace_back(page_id, AlignedPage(f.data, _page_size));
+        } catch (...) {
+            record_io_failure(std::current_exception());
+            throw;
+        }
     }
     return flushes;
 }
 
 void BufferPool::bg_flush_loop(float high_wm, float low_wm) {
+    try {
     while (_flush_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(_flush_wakeup_ms));
         uint32_t dirty_count = dirty_page_count();
         float ratio = (float)dirty_count / (float)(_num_frames ? _num_frames : 1);
-        if (ratio <= high_wm) continue;
-        for (auto& shard_ptr : _shards) {
-            if (dirty_count <= static_cast<uint32_t>(low_wm * _num_frames)) break;
+        if (ratio <= high_wm)
+            continue;
+        for (auto &shard_ptr : _shards) {
+            if (dirty_count <= static_cast<uint32_t>(low_wm * _num_frames))
+                break;
             auto flushes = collect_dirty_frames(*shard_ptr, _flush_budget_pages_per_cycle, false);
-            for (auto& flush_entry : flushes) {
+            for (auto &flush_entry : flushes) {
                 write_page(flush_entry.first, flush_entry.second.data());
                 if (_stats) {
                     _stats->pages_flushed.fetch_add(1);
                     _stats->dirty_page_bytes_flushed.fetch_add(_page_size);
                 }
                 dirty_count = dirty_page_count();
-                ShardState& shard = shard_for_page(flush_entry.first);
-                shard.page_table.if_contains(flush_entry.first, [&](const auto& kv) {
-                    auto& f = _frames[kv.second];
+                ShardState &shard = shard_for_page(flush_entry.first);
+                shard.page_table.if_contains(flush_entry.first, [&](const auto &kv) {
+                    auto &f = _frames[kv.second];
+                    if (f.dirty.exchange(false, std::memory_order_acq_rel))
+                        _dirty_frame_count.fetch_sub(1, std::memory_order_relaxed);
                     uint8_t expected = static_cast<uint8_t>(FrameState::FLUSHING);
                     if (f.state.compare_exchange_strong(expected,
                                                         static_cast<uint8_t>(FrameState::READY),
@@ -1364,10 +1471,15 @@ void BufferPool::bg_flush_loop(float high_wm, float low_wm) {
             }
         }
     }
+    } catch (...) {
+        record_io_failure(std::current_exception());
+    }
 }
 
 void BufferPool::start_bg_flush(float high_wm, float low_wm) {
-    if (_flush_running.load()) return;
+    check_io_failure();
+    if (_flush_running.load())
+        return;
     _flush_running.store(true);
     _flush_thread = std::thread(&BufferPool::bg_flush_loop, this,
                                 high_wm, low_wm);
@@ -1388,6 +1500,7 @@ uint32_t BufferPool::pin_count_of(uint32_t page_id) const {
 }
 
 void BufferPool::reset() {
+    check_io_failure();
     stop_bg_flush();
     reset_residency_directory();
     for (auto& f : _frames) {
@@ -2913,6 +3026,9 @@ void InPlaceGraphStore::set_entry_point(uint32_t entry_point) {
 }
 
 void InPlaceGraphStore::save_snapshot(const std::string& meta_path) {
+    // A snapshot cannot claim success after a background or destructor write
+    // failed. Callers still own the existing quiescent flush boundary.
+    _bp.check_io_failure();
     struct SnapshotHeader {
         char magic[8];
         uint32_t version;

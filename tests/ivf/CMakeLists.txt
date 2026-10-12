@@ -84,6 +84,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
         target_link_libraries(ivf_heap_adapter_tests PRIVATE ivf_heap Threads::Threads)
         add_test(NAME ivf_heap_adapter COMMAND ivf_heap_adapter_tests
                                                "${CMAKE_CURRENT_BINARY_DIR}/adapter_fixtures")
+        add_executable(ivf_direct_io_tests ivf_direct_io_tests.cpp)
+        target_link_libraries(ivf_direct_io_tests PRIVATE ivf_heap Threads::Threads)
+        add_test(NAME ivf_direct_io COMMAND ivf_direct_io_tests
+                                            "${CMAKE_CURRENT_BINARY_DIR}/direct_io_fixtures")
+        set_tests_properties(ivf_direct_io PROPERTIES TIMEOUT 60)
     endif()
     add_executable(ivf_contract_tests ivf_contract_tests.cpp "${IVF_ROOT}/src/logger.cpp"
                                       "${IVF_ROOT}/src/ann_exception.cpp")
@@ -109,6 +114,9 @@ if(IVF_BUILD_CONTRACT_TESTS)
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_orchestration.py"
                      --scratch "${CMAKE_CURRENT_BINARY_DIR}/orchestration_fixtures")
     set_tests_properties(ivf_shared_orchestration PROPERTIES TIMEOUT 30)
+    add_test(NAME ivf_sift_download
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_sift_download.py")
+    set_tests_properties(ivf_sift_download PROPERTIES TIMEOUT 30)
     set(IVF_DEPENDENCY_TEST_SOURCE_ARGS)
     if(TARGET ivf_hnswlib_headers)
         get_target_property(IVF_DEPENDENCY_TEST_SOURCE ivf_hnswlib_headers IVF_UPSTREAM_SOURCE_DIR)

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <immintrin.h>
 #include <memory>
 #include <mutex>
@@ -470,6 +471,14 @@ class BufferPool {
 
  private:
     struct ResidencySegment;
+    friend class InPlaceGraphStore;
+    // Unlike vector<char>, snapshots must satisfy O_DIRECT alignment.
+    struct AlignedPage {
+        struct Deleter { void operator()(char* data) const noexcept; };
+        explicit AlignedPage(const char* source, size_t size);
+        std::unique_ptr<char, Deleter> bytes;
+        const char* data() const { return bytes.get(); }
+    };
     struct FrameWaitState {
         std::mutex mtx;
         std::condition_variable cv;
@@ -514,10 +523,12 @@ class BufferPool {
     void reset_residency_directory();
     uint32_t evict_one(ShardState& shard, FrameRegion preferred,
                        bool* used_eviction_out = nullptr);
-    std::vector<std::pair<uint32_t, std::vector<char>>> collect_dirty_frames(ShardState& shard, uint32_t max_frames, bool flush_all);
+    std::vector<std::pair<uint32_t, AlignedPage>> collect_dirty_frames(ShardState& shard, uint32_t max_frames, bool flush_all);
     void     read_page(uint32_t page_id, char* buf);
     void     write_page(uint32_t page_id, const char* buf);
     void     bg_flush_loop(float high_wm, float low_wm);
+    void     check_io_failure() const;
+    void     record_io_failure(std::exception_ptr error);
 
     static constexpr uint32_t kResidencySegmentBits = 14;
     static constexpr uint32_t kResidencySegmentSize = 1u << kResidencySegmentBits;
@@ -540,6 +551,10 @@ class BufferPool {
 
     std::thread         _flush_thread;
     std::atomic<bool>   _flush_running{false};
+    // Terminal for this pool's lifetime. Never reset a failed pool for reuse.
+    std::atomic<bool> _io_failed{false};
+    mutable std::mutex _io_failure_mutex;
+    std::exception_ptr _io_failure;
     InPlaceIOStats*     _stats = nullptr;
 };
 
