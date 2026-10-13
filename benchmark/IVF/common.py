@@ -88,7 +88,9 @@ def command_log(command, path):
         with process:
             for line in process.stdout:
                 sys.stdout.write(line)
+                sys.stdout.flush()
                 log.write(line)
+                log.flush()
         require(process.returncode == 0, f"command failed ({process.returncode}); inspect {path}")
 
 

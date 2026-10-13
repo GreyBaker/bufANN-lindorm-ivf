@@ -12,6 +12,7 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   FileHandle   file_desc;
   io_context_t bad_ctx = (io_context_t) -1;
   bool         owns_fd = true;
+  bool         exact_reads = false;
 
  public:
   LinuxAlignedFileReader();
@@ -20,9 +21,11 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   // Adopt a fd opened elsewhere (e.g., BufferPool's _heap_fd). The reader
   // will not ::close() it in close()/dtor. Caller must keep the fd valid for
   // the reader's lifetime. Mutually exclusive with open().
-  void use_external_fd(int fd);
+  void use_external_fd(int fd, bool require_exact_reads = false);
 
   IOContext &get_ctx();
+  // Copy under the map lock: concurrent registrations may rehash ctx_map.
+  IOContext get_ctx_copy();
 
   // register thread-id for a context
   void register_thread();

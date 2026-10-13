@@ -153,9 +153,12 @@ namespace {
     std::sort(brute.begin(), brute.end(), nearer);
     brute.resize(config.recall_at);
     const auto all = search(*router, lists, pq, *heap, query, config);
-    require(all.hits == brute && all.scanned_codes == base &&
-                all.reranked_vectors == base && all.backend_batch_calls == 160,
-            "all-list/full-budget differs from exact vector oracle");
+    require(
+        all.hits == brute && all.scanned_codes == base &&
+            all.reranked_vectors == base &&
+            all.backend_batch_calls == (base + heap->copy_batch_limit() - 1) /
+                                           heap->copy_batch_limit(),
+        "all-list/full-budget differs from exact vector oracle");
     heap.reset();
     auto read_options = options;
     read_options.buffer_frames = 256;
@@ -201,8 +204,11 @@ namespace {
                 .heap_pages_read == 0,
         "resident two-page batch reported physical reads");
     const auto reopened = search(*router, lists, pq, *heap, query, config);
-    require(reopened.hits == all.hits && reopened.backend_batch_calls == 3,
-            "reopen/batch split changed exact results");
+    require(reopened.hits == all.hits, "reopen changed exact results");
+    require(
+        reopened.backend_batch_calls ==
+            (base + heap->copy_batch_limit() - 1) / heap->copy_batch_limit(),
+        "reopened fetch ignored the admitted batch limit");
     require(reopened.logical_fetch_stages == 1 && reopened.routing_us >= 0 &&
                 reopened.adc_us >= 0 && reopened.scan_select_us >= 0 &&
                 reopened.fetch_us >= 0 && reopened.rerank_us >= 0,

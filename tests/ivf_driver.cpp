@@ -21,6 +21,8 @@ int main(int argc, char** argv) {
                              "--gt_file",
                              "--recall_at",
                              "--query_threads",
+                             "--insert_threads",
+                             "--insert_input_policy",
                              "--nlist",
                              "--nprobe",
                              "--rerank_factor",
@@ -71,6 +73,14 @@ int main(int argc, char** argv) {
                    "search_after_update deletes then inserts,\n"
                    "checkpoints and queries the final live set; no concurrent "
                    "mixed scheduling.\n";
+      std::cout
+          << "Sequential insertion: [--insert_threads 1..256] (default 1);\n"
+             "  only insert_only/search_after_update; delete phase stays "
+             "serial.\n";
+      std::cout
+          << "  [--insert_input_policy streaming|staged] (default streaming);\n"
+             "  staged coordinates load before insertion timing and require "
+             "memory admission.\n";
       std::cout << "Mixed: --workload mixed --scheduler "
                    "update_driven|weighted|fixed_8_8 "
                    "(default weighted)\n"
@@ -106,7 +116,8 @@ int main(int argc, char** argv) {
          "--search_result_file", "--index_format", "--private_heap_path",
          "--checkpoint_prefix", "--scheduler", "--pool_threads",
          "--query_ratio", "--query_count", "--scheduler_seed", "--router_mode",
-         "--router_rerank_factor", "--router_breadth"},
+         "--router_rerank_factor", "--router_breadth", "--insert_threads",
+         "--insert_input_policy"},
         "execution-only setting");
     const auto     type = parse_data_type(args.get("--data_type", "float"));
     const uint32_t dim = args.u32("--dim");

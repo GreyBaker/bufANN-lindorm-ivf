@@ -1,4 +1,5 @@
 #include "bufann/ivf_heap.h"
+#include "bufann/ivf_fetch_timing.h"
 #include "bufann/ivf_artifacts.h"
 
 #include <bit>
@@ -229,6 +230,8 @@ namespace diskann::ivf {
                 _options.buffer_frames, _heap_path, 32, 100, false,
                 _options.id_capacity);
     _store.set_page_data_locks_enabled(true);
+    _pins = std::make_unique<detail::PinAdmission>(
+        std::max(1u, _store.min_buffer_shard_frames() - 1));
   }
 
   template<typename T>
@@ -246,6 +249,25 @@ namespace diskann::ivf {
     check(!_failed,
           "IVF heap build failed; discard it rather than checkpointing");
     check(!_read_only, "Reopened immutable IVF heap is read-only");
+  }
+
+  template<typename T>
+  void HeapStorage<T>::poison(std::exception_ptr error) noexcept {
+    _failed = true;
+    _pins->poison(error);
+  }
+
+  template<typename T>
+  std::unique_lock<std::mutex> HeapStorage<T>::lock_writer() {
+    _writer_waiters.fetch_add(1, std::memory_order_acq_rel);
+    try {
+      std::unique_lock lock(_writer_mutex);
+      _writer_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      return lock;
+    } catch (...) {
+      _writer_waiters.fetch_sub(1, std::memory_order_acq_rel);
+      throw;
+    }
   }
 
   template<typename T>
@@ -267,11 +289,14 @@ namespace diskann::ivf {
 
   template<typename T>
   void HeapStorage<T>::append(uint32_t id, std::span<const T> coordinates) {
-    std::lock_guard lock(_copy_mutex);
-    require_writable();
-    check(!_mutable_mode, "Mutable IVF heap requires prepared insertion");
-    check(id < _options.id_capacity, "IVF external ID exceeds capacity");
-    check(!contains_unlocked(id), "Duplicate IVF external ID");
+    auto writer = lock_writer();
+    {
+      std::lock_guard lock(_copy_mutex);
+      require_writable();
+      check(!_mutable_mode, "Mutable IVF heap requires prepared insertion");
+      check(id < _options.id_capacity, "IVF external ID exceeds capacity");
+      check(!contains_unlocked(id), "Duplicate IVF external ID");
+    }
     write_coordinates(id, coordinates, true);
   }
   template<typename T>
@@ -286,31 +311,39 @@ namespace diskann::ivf {
     std::vector<T> padded(aligned_dim(), T{});
     std::copy(coordinates.begin(), coordinates.end(), padded.begin());
     try {
-      if (allocate) {
-        if (sequential)
-          _store.allocate_node_sequential(id);
-        else
-          _store.allocate_node(id);
+      uint64_t wait = 0;
+      auto     pins = _pins->acquire(1, wait);
+      try {
+        if (allocate) {
+          if (sequential)
+            _store.allocate_node_sequential(id);
+          else
+            _store.allocate_node(id);
+        }
+        {
+          inplace::NodeRID rid;
+          auto frame = _store.pin_page_for_node(id, inplace::WRITE, &rid);
+          check(frame.valid(), "IVF allocated page unavailable");
+          auto guard = frame.write_guard();
+          auto node = guard.write_node(rid);
+          check(node.valid() && node.node_id() == id,
+                "IVF allocated slot mismatch");
+          std::memcpy(node.coords_bytes(), padded.data(),
+                      padded.size() * sizeof(T));
+          node.set_degree(0);  // Marks the coordinate write dirty as well.
+          guard.commit();
+        }
+        check(_store.set_node_tag(id, id),
+              "IVF external tag assignment failed");
+        if (allocate)
+          _store.publish_node(id);  // Physical readiness; mutable logical
+                                    // visibility is separate.
+      } catch (...) {
+        poison(std::current_exception());
+        throw;
       }
-      {
-        inplace::NodeRID rid;
-        auto frame = _store.pin_page_for_node(id, inplace::WRITE, &rid);
-        check(frame.valid(), "IVF allocated page unavailable");
-        auto guard = frame.write_guard();
-        auto node = guard.write_node(rid);
-        check(node.valid() && node.node_id() == id,
-              "IVF allocated slot mismatch");
-        std::memcpy(node.coords_bytes(), padded.data(),
-                    padded.size() * sizeof(T));
-        node.set_degree(0);  // Marks the coordinate write dirty as well.
-        guard.commit();
-      }
-      check(_store.set_node_tag(id, id), "IVF external tag assignment failed");
-      if (allocate)
-        _store.publish_node(
-            id);  // Physical readiness; mutable logical visibility is separate.
     } catch (...) {
-      _failed = true;
+      poison(std::current_exception());
       throw;
     }
   }
@@ -347,14 +380,22 @@ namespace diskann::ivf {
   template<typename T>
   void HeapStorage<T>::prepare_insert(uint32_t           id,
                                       std::span<const T> coordinates) {
+    auto         writer = lock_writer();
+    MutableState state;
+    {
+      std::lock_guard lock(_copy_mutex);
+      require_writable();
+      check(_mutable_mode, "IVF heap is not a mutable session");
+      check(id < id_capacity(), "IVF external ID exceeds capacity");
+      state = _mutable_states[id];
+      check(state == MutableState::Absent || state == MutableState::Aborted,
+            "Mutable IVF heap ID already prepared/live/deleted; reuse refused");
+    }
+    // IVF owns/serializes this heap; fill one page instead of cycling across
+    // the backend's 256-page growth batch. Aborted retries retain their slot.
+    write_coordinates(id, coordinates, state == MutableState::Absent, true);
     std::lock_guard lock(_copy_mutex);
     require_writable();
-    check(_mutable_mode, "IVF heap is not a mutable session");
-    check(id < id_capacity(), "IVF external ID exceeds capacity");
-    const auto state = _mutable_states[id];
-    check(state == MutableState::Absent || state == MutableState::Aborted,
-          "Mutable IVF heap ID already prepared/live/deleted; reuse refused");
-    write_coordinates(id, coordinates, state == MutableState::Absent);
     _mutable_states[id] = MutableState::Prepared;
   }
   template<typename T>
@@ -369,6 +410,7 @@ namespace diskann::ivf {
   }
   template<typename T>
   void HeapStorage<T>::cancel_insert(uint32_t id) {
+    auto            writer = lock_writer();
     std::lock_guard lock(_copy_mutex);
     check(_mutable_mode && id < id_capacity() &&
               (_mutable_states[id] == MutableState::Prepared ||
@@ -417,9 +459,9 @@ namespace diskann::ivf {
         // Finish each physical page before moving on. Round-robin append would
         // cycle across 256 allocation pages even with only 64 buffer frames,
         // repeatedly reading/writing every partially filled page. Source IDs,
-        // validation, publication and framing stay unchanged; mutable append
-        // retains its existing placement policy.
-        std::lock_guard lock(_copy_mutex);
+        // validation, publication and framing stay unchanged. Generic append
+        // retains its round-robin placement; mutable IVF uses page filling too.
+        auto writer = lock_writer();
         write_coordinates(first_id + r, row, true, true);
         if (rows >= 1000000 && ((r + 1) % 1000000 == 0 || r + 1 == rows))
           std::clog << "[IVF heap] rows=" << r + 1 << '/' << rows
@@ -443,26 +485,60 @@ namespace diskann::ivf {
     check(output.size() >= aligned_dim() && output.data() != nullptr &&
               reinterpret_cast<uintptr_t>(output.data()) % 64 == 0,
           "IVF coordinate output must be padded and 64-byte aligned");
-    std::lock_guard<std::mutex> lock(_copy_mutex);
-    if (!contains_unlocked(id))
-      return false;
-    inplace::NodeRID rid;
-    auto             frame = _store.pin_page_for_node(id, inplace::READ, &rid);
-    check(frame.valid(), "IVF coordinate page unavailable");
-    auto guard = frame.read_guard();
-    auto node = guard.read_node(rid);
-    check(node.valid() && node.node_id() == id && node.degree() == 0,
-          "IVF coordinate slot mismatch");
-    std::memcpy(output.data(), node.coords_bytes(),
-                size_t(aligned_dim()) * sizeof(T));
-    return true;
+    {
+      std::lock_guard lock(_copy_mutex);
+      check(!_failed, "IVF coordinate heap failed");
+      if (!contains_unlocked(id))
+        return false;
+    }
+    try {
+      uint64_t             wait = 0;
+      auto                 pins = _pins->acquire(1, wait);
+      inplace::NodeRID     rid;
+      inplace::PinnedFrame frame;
+      try {
+        frame = _store.pin_page_for_node(id, inplace::READ, &rid);
+        check(frame.valid(), "IVF coordinate page unavailable");
+        auto guard = frame.read_guard();
+        auto node = guard.read_node(rid);
+        check(node.valid() && node.node_id() == id && node.degree() == 0,
+              "IVF coordinate slot mismatch");
+        std::lock_guard lock(_copy_mutex);
+        check(!_failed, "IVF coordinate heap failed");
+        if (!contains_unlocked(id))
+          return false;
+        std::memcpy(output.data(), node.coords_bytes(),
+                    size_t(aligned_dim()) * sizeof(T));
+        return true;
+      } catch (...) {
+        poison(std::current_exception());
+        throw;
+      }
+    } catch (...) {
+      poison(std::current_exception());
+      throw;
+    }
+  }
+
+  template<typename T>
+  HeapIOCounters HeapStorage<T>::io_counters() const {
+    const auto& stats = _store.stats();
+    return {stats.page_fault_total.load(std::memory_order_relaxed) +
+                stats.batch_misses_total.load(std::memory_order_relaxed),
+            stats.pages_flushed.load(std::memory_order_relaxed),
+            stats.dirty_evictions.load(std::memory_order_relaxed),
+            stats.dirty_page_bytes_flushed.load(std::memory_order_relaxed),
+            stats.page_in_ns.load(std::memory_order_relaxed) +
+                stats.batch_io_ns_total.load(std::memory_order_relaxed),
+            stats.eviction_flush_ns.load(std::memory_order_relaxed)};
   }
 
   template<typename T>
   uint32_t HeapStorage<T>::copy_batch_limit() const {
-    const auto shard_frames = _store.min_buffer_shard_frames();
+    // Leave room for a second batch or a writer, without depending on worker
+    // count. The aggregate cap remains safe if all requests hash to one shard.
     return std::min(inplace::BufferPool::kPinBatchMax,
-                    std::max(1u, shard_frames - 1));
+                    std::max(1u, _pins->capacity() / 2));
   }
 
   template<typename T>
@@ -479,34 +555,68 @@ namespace diskann::ivf {
           "Invalid IVF batch coordinate output");
     BatchCopyResult result;
     result.present.resize(ids.size(), 0);
-    std::lock_guard<std::mutex> lock(_copy_mutex);
     const auto reads_before = inplace::thread_physical_reads_count();
     // All requested pages could map to one shard. Keep one spare per shard
     // when possible; one-frame shards necessarily use single-page batches.
     const size_t limit = copy_batch_limit();
-    for (size_t begin = 0; begin < ids.size(); begin += limit) {
-      const size_t count = std::min(limit, ids.size() - begin);
-      std::array<inplace::PinnedFrame, inplace::BufferPool::kPinBatchMax>
-                                                                      frames;
-      std::array<inplace::NodeRID, inplace::BufferPool::kPinBatchMax> rids;
-      _store.pin_pages_for_nodes_batch(ids.data() + begin, count, inplace::READ,
-                                       frames.data(), rids.data());
-      ++result.backend_batch_calls;
-      for (size_t i = 0; i < count; ++i) {
-        if (!contains_unlocked(ids[begin + i]))
-          continue;
-        check(frames[i].valid(), "IVF batch coordinate page unavailable");
-        // One guard at a time: duplicate IDs/pages must not recursively
-        // acquire the same shared mutex. RAII frames release every pin.
-        auto guard = frames[i].read_guard();
-        auto node = guard.read_node(rids[i]);
-        check(node.valid() && node.node_id() == ids[begin + i] &&
-                  node.degree() == 0,
-              "IVF batch coordinate slot mismatch");
-        std::memcpy(output.data() + (begin + i) * stride, node.coords_bytes(),
-                    size_t(aligned_dim()) * sizeof(T));
-        result.present[begin + i] = 1;
+    try {
+      for (size_t begin = 0; begin < ids.size(); begin += limit) {
+        const size_t count = std::min(limit, ids.size() - begin);
+        std::array<uint32_t, inplace::BufferPool::kPinBatchMax> requested;
+        {
+          uint64_t wait = 0;
+          auto     lock = detail::timed_mutex_lock(_copy_mutex, wait);
+          result.adapter_mutex_wait_ns += wait;
+          check(!_failed, "IVF coordinate heap failed");
+          for (size_t i = 0; i < count; ++i)
+            requested[i] = contains_unlocked(ids[begin + i])
+                               ? ids[begin + i]
+                               : inplace::INVALID_NODE;
+        }
+        uint64_t admission_wait = 0;
+        auto     pins = _pins->acquire(uint32_t(count), admission_wait);
+        result.pin_admission_wait_ns += admission_wait;
+        std::array<inplace::PinnedFrame, inplace::BufferPool::kPinBatchMax>
+                                                                        frames;
+        std::array<inplace::NodeRID, inplace::BufferPool::kPinBatchMax> rids;
+        const auto pin_begin = std::chrono::steady_clock::now();
+        try {
+          _store.pin_pages_for_nodes_batch(requested.data(), count,
+                                           inplace::READ, frames.data(),
+                                           rids.data());
+          result.backend_pin_wall_ns += detail::elapsed_nanoseconds(pin_begin);
+          ++result.backend_batch_calls;
+          for (size_t i = 0; i < count; ++i) {
+            if (requested[i] == inplace::INVALID_NODE)
+              continue;
+            check(frames[i].valid(), "IVF batch coordinate page unavailable");
+            // One guard at a time: duplicate IDs/pages must not recursively
+            // acquire the same shared mutex. RAII frames release every pin.
+            auto guard = frames[i].read_guard();
+            auto node = guard.read_node(rids[i]);
+            check(node.valid() && node.node_id() == ids[begin + i] &&
+                      node.degree() == 0,
+                  "IVF batch coordinate slot mismatch");
+            uint64_t wait = 0;
+            auto     lock = detail::timed_mutex_lock(_copy_mutex, wait);
+            result.adapter_mutex_wait_ns += wait;
+            check(!_failed, "IVF coordinate heap failed");
+            if (!contains_unlocked(ids[begin + i]))
+              continue;
+            std::memcpy(output.data() + (begin + i) * stride,
+                        node.coords_bytes(), size_t(aligned_dim()) * sizeof(T));
+            result.present[begin + i] = 1;
+          }
+        } catch (...) {
+          // Close admission before frames/credits unwind, including cached
+          // contenders and validation failures that did not poison the pool.
+          poison(std::current_exception());
+          throw;
+        }
       }
+    } catch (...) {
+      poison(std::current_exception());
+      throw;
     }
     result.heap_pages_read =
         inplace::thread_physical_reads_count() - reads_before;
@@ -515,6 +625,7 @@ namespace diskann::ivf {
 
   template<typename T>
   void HeapStorage<T>::checkpoint(const std::string& snapshot_path) {
+    auto writer = lock_writer();
     require_writable();
     check(!_mutable_mode,
           "Mutable IVF heap checkpoint format is not implemented; no snapshot "
@@ -553,6 +664,7 @@ namespace diskann::ivf {
   void HeapStorage<T>::checkpoint_mutable_copy(const std::string& path,
                                                const std::string& snapshot,
                                                const std::string& state_path) {
+    auto            writer = lock_writer();
     std::lock_guard lock(_copy_mutex);
     require_writable();
     check(_mutable_mode, "Mutable IVF checkpoint requires a mutable heap");

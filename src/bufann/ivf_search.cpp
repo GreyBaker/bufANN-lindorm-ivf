@@ -124,6 +124,9 @@ namespace diskann::ivf {
           ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
       result.backend_batch_calls += copied.backend_batch_calls;
       result.heap_pages_read += copied.heap_pages_read;
+      result.fetch_adapter_mutex_wait_ns += copied.adapter_mutex_wait_ns;
+      result.fetch_backend_pin_ns += copied.backend_pin_wall_ns;
+      result.fetch_pin_admission_wait_ns += copied.pin_admission_wait_ns;
       result.fetch_us += elapsed_us(start);
       start = Clock::now();
       for (size_t i = 0; i < count; ++i) {
@@ -287,6 +290,9 @@ namespace diskann::ivf {
           ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
       result.backend_batch_calls += copied.backend_batch_calls;
       result.heap_pages_read += copied.heap_pages_read;
+      result.fetch_adapter_mutex_wait_ns += copied.adapter_mutex_wait_ns;
+      result.fetch_backend_pin_ns += copied.backend_pin_wall_ns;
+      result.fetch_pin_admission_wait_ns += copied.pin_admission_wait_ns;
       result.fetch_us += elapsed_us(start);
       start = Clock::now();
       for (size_t i = 0; i < count; ++i) {

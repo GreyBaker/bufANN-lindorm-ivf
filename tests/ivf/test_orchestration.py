@@ -2,11 +2,13 @@
 """Dependency-free contracts for shared IVF settings and evidence/process helpers."""
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import struct
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark/IVF"))
 import common
 import harness
+import mixed
 import settings
 
 SCRATCH = None
@@ -119,6 +122,111 @@ class SharedOrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             settings.read_cost_model_report(path)
 
+    def test_independent_insertion_worker_setting(self):
+        with patch.dict(os.environ, {"NTHREADS": "20"}, clear=True):
+            self.assertEqual(settings.insertion_threads(), "1")
+            for value in ("1", "2", "8", "256"):
+                os.environ["IVF_INSERT_THREADS"] = value
+                self.assertEqual(settings.insertion_threads(), value)
+            for value in ("0", "257", "-1", "1.5", "bad"):
+                os.environ["IVF_INSERT_THREADS"] = value
+                with self.assertRaises(ValueError):
+                    settings.insertion_threads()
+        common.write_json(self.root / "prepared.json", {"settings": {"page_size": "4096"}})
+        args = argparse.Namespace(work_dir=self.root, workload="insert", output_dir=self.root / "runs")
+        with patch.dict(os.environ, {"IVF_INSERT_THREADS": "0"}, clear=True), \
+             patch.object(common.subprocess, "Popen") as launch, \
+             self.assertRaisesRegex(ValueError, "IVF_INSERT_THREADS"):
+            harness.run(args)
+        launch.assert_not_called()
+        self.assertFalse(args.output_dir.exists())
+
+    def test_resource_lower_bound_and_unchanged_defaults(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.runtime_resources(4096),
+                             {"buffer_frames": "64", "page_size": "4096", "memory_budget_gb": "1"})
+            os.environ.update(IVF_BUFFER_FRAMES="262144", IVF_MEMORY_BUDGET_GB="96", IVF_NLIST="8")
+            self.assertEqual(settings.build_settings()["buffer_frames"], "262144")
+            self.assertEqual(settings.runtime_resources(4096)["memory_budget_gb"], "96")
+            os.environ["IVF_QUERY_MEMORY_BUDGET_GB"] = "1"
+            # Insufficient post-update query budget is rejected before mutation.
+            with self.assertRaisesRegex(ValueError, "frame allowance alone"):
+                settings.runtime_resources(4096, query=True)
+            os.environ["IVF_MEMORY_BUDGET_GB"] = "1"
+            with self.assertRaisesRegex(ValueError, "frame allowance alone"):
+                settings.build_settings()
+        for frames, page, budget in (("1", "4096", "1"), ("4294967296", "4096", "1"),
+                                      ("64", "512", "1"), ("64", "6144", "1"),
+                                      ("64", "4096", "nan"), ("64", "4096", "inf"),
+                                      ("64", "4096", "0")):
+            with self.subTest(frames=frames, page=page, budget=budget), self.assertRaises(ValueError):
+                settings.validate_resources({"buffer_frames": frames, "page_size": page,
+                                             "memory_budget_gb": budget})
+
+    def test_runtime_resource_rejection_precedes_outputs_and_processes(self):
+        common.write_json(self.root / "prepared.json", {"settings": {"page_size": "4096"}})
+        args = argparse.Namespace(work_dir=self.root, workload="insert", output_dir=self.root / "runs")
+        for run in (harness.run, mixed.run):
+            with patch.dict(os.environ, {"IVF_BUFFER_FRAMES": "262144", "IVF_MEMORY_BUDGET_GB": "1"}, clear=True), \
+                 patch.object(common.subprocess, "Popen") as launch, \
+                 self.assertRaisesRegex(ValueError, "frame allowance alone"):
+                run(args)
+            launch.assert_not_called()
+            self.assertFalse(args.output_dir.exists())
+        with patch.dict(os.environ, {"IVF_BUFFER_FRAMES": "262144", "IVF_MEMORY_BUDGET_GB": "96",
+                                     "IVF_QUERY_MEMORY_BUDGET_GB": "1"}, clear=True), \
+             self.assertRaisesRegex(ValueError, "frame allowance alone"):
+            harness.run(args)
+        # Build preflight must not need data/PQ/tools to reject this pairing.
+        with patch.dict(os.environ, {"IVF_NLIST": "8", "IVF_BUFFER_FRAMES": "262144",
+                                     "IVF_MEMORY_BUDGET_GB": "1"}, clear=True), \
+             self.assertRaisesRegex(ValueError, "frame allowance alone"):
+            harness.prepare(args)
+
+    def test_insertion_policy_and_staging_lower_bound(self):
+        resources = {"buffer_frames": "64", "page_size": "4096", "memory_budget_gb": "1"}
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.insertion_input_policy(), "streaming")
+            os.environ["IVF_INSERT_INPUT_POLICY"] = "staged"
+            self.assertEqual(settings.insertion_input_policy(), "staged")
+            os.environ["IVF_INSERT_INPUT_POLICY"] = "unknown"
+            with self.assertRaisesRegex(ValueError, "IVF_INSERT_INPUT_POLICY"):
+                settings.insertion_input_policy()
+        for dtype in ("float", "int8", "uint8"):
+            settings.validate_insertion_staging(resources, 8192, 128, dtype)
+        with self.assertRaisesRegex(ValueError, "staging and frame"):
+            settings.validate_insertion_staging(resources, 10000000, 128, "float")
+        common.write_json(self.root / "prepared.json", {"settings": {"page_size": "4096"}})
+        args = argparse.Namespace(work_dir=self.root, workload="insert", output_dir=self.root / "runs",
+                                  update_count=10000000, dim=128, dtype="float")
+        for policy, expected in (("unknown", "IVF_INSERT_INPUT_POLICY"), ("staged", "staging and frame")):
+            with patch.dict(os.environ, {"IVF_INSERT_INPUT_POLICY": policy}, clear=True), \
+                 patch.object(common.subprocess, "Popen") as launch, self.assertRaisesRegex(ValueError, expected):
+                harness.run(args)
+            launch.assert_not_called()
+            self.assertFalse(args.output_dir.exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "quickstart gate executes in Bash")
+    def test_quickstart_gt_gate_stops_preparation(self):
+        text = (Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md").read_text()
+        marker = "# Each workload gets an independent prepared base; stop on any failure."
+        block = text.split(marker, 1)[1].split("```", 1)[0]
+        self.assertLess(block.index("GT_BIN_KCACHED=$(python3"), block.index("for workload in"))
+        self.assertIn("export GT_BIN_KCACHED", block)
+        self.assertNotIn("export GT_BIN_KCACHED=", block)
+        self.assertIn("--memory-budget-gb 96 --buffer-frames 262144", text)
+        env = dict(os.environ, DATA_BIN="/source.bin", QUERY_BIN="/queries.bin", NPTS_FULL="100000000",
+                   NPTS_BASE="90000000", UPDATE_POINTS="10000000", UPDATE_BATCH="1000000", RECALL_AT="10")
+        for status in (0, 3):
+            script = ("python3() { printf '/covered-fixture.gt\\n'; return " + str(status) + "; }\n"
+                      "bash() { printf 'workload %s gt=%s\\n' \"$1\" \"$GT_BIN_KCACHED\"; }\n" + block)
+            result = subprocess.run(["bash", "-c", script], env=env, text=True,
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual(result.stdout.count("workload "), 8 if status == 0 else 0)
+            if status == 0:
+                self.assertEqual(result.stdout.count("gt=/covered-fixture.gt"), 8)
+
     def test_identity_framing_and_exclusive_evidence(self):
         vectors = self.root / "vectors.bin"
         vectors.write_bytes(struct.pack("<II2f", 1, 2, 1, 2))
@@ -199,6 +307,46 @@ class SharedOrchestrationTests(unittest.TestCase):
             self.assertTrue(path.is_file())
         self.assertEqual(settings.CALIBRATION_DEFAULTS["pca_variance"], ".95")
         self.assertEqual(settings.CALIBRATION_DEFAULTS["rerank_factor"], "4")
+
+    def test_command_log_flushes_progress_and_preserves_failure(self):
+        class Process:
+            returncode = 0
+            def __init__(self):
+                self.stdout = iter(["[IVF driver] phase=insert event=begin\n",
+                                    "[IVF driver] phase=insert event=running completed=1024\n"])
+            def __enter__(self):
+                return self
+            def __exit__(self, *unused):
+                return False
+        class Flushed(io.StringIO):
+            count = 0
+            def flush(self):
+                self.count += 1
+        output = Flushed()
+        log = self.root / "progress.log"
+        process = Process()
+        def lines():
+            yield "[IVF driver] phase=insert event=begin\n"
+            self.assertIn("event=begin", log.read_text())
+            yield "[IVF driver] phase=insert event=running completed=1024\n"
+            self.assertIn("completed=1024", log.read_text())
+        process.stdout = lines()
+        with patch.object(common.subprocess, "Popen", return_value=process), \
+             patch.object(common.sys, "stdout", output):
+            common.command_log(["fake-native-driver"], log)
+        self.assertEqual(output.count, 2)
+        self.assertIn("event=running completed=1024", log.read_text())
+        before = log.read_bytes()
+        with self.assertRaises(FileExistsError):
+            common.command_log(["fake-native-driver"], log)
+        self.assertEqual(log.read_bytes(), before)
+        process = Process()
+        process.returncode = 7
+        with patch.object(common.subprocess, "Popen", return_value=process), \
+             patch.object(common.sys, "stdout", Flushed()), \
+             self.assertRaisesRegex(ValueError, "command failed"):
+            common.command_log(["fake-native-driver"], self.root / "failed-progress.log")
+        self.assertIn("event=running", (self.root / "failed-progress.log").read_text())
 
 
 if __name__ == "__main__":

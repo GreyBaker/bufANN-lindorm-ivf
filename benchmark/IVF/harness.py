@@ -13,6 +13,7 @@ import re
 import shutil
 import struct
 import sys
+import time
 
 # Re-export shared helpers for existing local callers; workload ownership stays here.
 from common import (
@@ -32,6 +33,10 @@ from settings import (
     profile,
     query_router_flags,
     read_cost_model_report,
+    runtime_resources,
+    insertion_threads,
+    insertion_input_policy,
+    validate_insertion_staging,
 )
 
 SUFFIXES = (
@@ -138,6 +143,7 @@ def component_digests(directory, dataset):
 
 
 def prepare(args):
+    settings = build_settings()  # Reject incompatible frame budgets before hashing/copying.
     work = args.work_dir.resolve()
     data = work / "data/full.bin"
     require(
@@ -149,7 +155,6 @@ def prepare(args):
     query_truth_shapes(args.query, args.truth, args.dtype, args.dim, args.recall_at)
     # Query row count is arbitrary, but dimension, framing and GT shape are
     # checked by the native driver before timed queries.
-    settings = build_settings()
     pivots, codes = (
         Path(str(args.pq_prefix) + suffix) for suffix in ("_pq_pivots.bin", "_pq_compressed.bin")
     )
@@ -265,8 +270,17 @@ def prepare(args):
 
 
 def run(args):
+    workflow_start = time.monotonic()
+    mutation_process_wall_s = None
     work = args.work_dir.resolve()
     prepared = read_json(work / "prepared.json")
+    query_resources = runtime_resources(prepared["settings"]["page_size"], query=True)
+    mutation_resources = (runtime_resources(prepared["settings"]["page_size"])
+                           if args.workload != "query" else None)
+    insert_workers = insertion_threads() if args.workload == "insert" else None
+    insert_policy = insertion_input_policy() if args.workload == "insert" else None
+    if insert_policy == "staged":
+        validate_insertion_staging(mutation_resources, args.update_count, args.dim, args.dtype)
     require(
         prepared["version"] == 1 and prepared["profile"] == profile(args),
         "profile changed since prepare",
@@ -308,6 +322,7 @@ def run(args):
         "result.json",
         "neighbors.bin",
         "nlist_selection.json",
+        "execution_protocol.json",
     ):
         path = output / name
         require(
@@ -358,13 +373,17 @@ def run(args):
             "--checkpoint_prefix",
             str(saved),
             "--buffer_frames",
-            os.environ.get("IVF_BUFFER_FRAMES", "64"),
+            mutation_resources["buffer_frames"],
             "--memory_budget_gb",
-            os.environ.get("IVF_MEMORY_BUDGET_GB", "1"),
+            mutation_resources["memory_budget_gb"],
             "--result_file",
             str(output / "mutation_result.json"),
         ]
+        if insert_workers is not None:
+            command += ["--insert_threads", insert_workers, "--insert_input_policy", insert_policy]
+        mutation_start = time.monotonic()
         command_log(command, output / "mutation.log")
+        mutation_process_wall_s = time.monotonic() - mutation_start
         record = read_json(output / "mutation_result.json")
         require(
             record["phase"] == args.workload
@@ -414,9 +433,9 @@ def run(args):
         "--query_threads",
         os.environ.get("QUERY_THREADS", "1"),
         "--buffer_frames",
-        os.environ.get("IVF_BUFFER_FRAMES", "64"),
+        query_resources["buffer_frames"],
         "--memory_budget_gb",
-        os.environ.get("IVF_QUERY_MEMORY_BUDGET_GB", os.environ.get("IVF_MEMORY_BUDGET_GB", "1")),
+        query_resources["memory_budget_gb"],
         "--result_file",
         str(output / "native_result.json"),
         "--search_result_file",
@@ -425,7 +444,9 @@ def run(args):
     if mutation is not None:
         command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
     command += query_router_flags()
+    query_start = time.monotonic()
     command_log(command, output / "run.log")
+    query_process_wall_s = time.monotonic() - query_start
     record = read_json(output / "native_result.json")
     require(
         record["baseline"] == "IVF"
@@ -434,6 +455,26 @@ def run(args):
         and "recall" in record,
         "missing canonical native query record",
     )
+    write_json(output / "execution_protocol.json", {
+        "version": 1,
+        "kind": "ivf_sequential_harness_execution_protocol",
+        "completed": True,
+        "insert_input_policy": insert_policy,
+        "insert_threads_requested": int(insert_workers) if insert_workers is not None else None,
+        "native_driver_process_count": 2 if mutation is not None else 1,
+        "process_boundary_policy": (
+            "mutation_driver_verified_checkpoint_then_separate_query_driver_private_copy"
+            if mutation is not None else "standalone_query_driver"),
+        "application_cache_transfer_between_driver_processes": False,
+        "explicit_warmup_query_count": 0,
+        "os_cache_policy": "not_controlled_validation_hash_and_copy_may_touch_pages",
+        "mutation_process_wall_s": mutation_process_wall_s,
+        "query_process_wall_s": query_process_wall_s,
+        "process_wall_scope": "parent_spawn_wait_includes_native_record_write_and_log_streaming_not_cpu_or_device_time",
+        "harness_workflow_wall_s": time.monotonic() - workflow_start,
+        "harness_workflow_scope": "run_entry_through_native_record_validation_pre_protocol_write_excludes_prepare_script_and_outer_shell_exports",
+        "canonical_native_query_metrics_rewritten": False,
+    })
 
 
 def main():

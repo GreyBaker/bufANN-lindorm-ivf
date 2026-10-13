@@ -2,6 +2,9 @@
 #include "bufann/ivf_index.h"
 #include "ivf_mixed_workload.h"
 #include "ivf_training_json.h"
+#include "ivf_driver_progress.h"
+#include "ivf_insert_workload.h"
+#include "ivf_insert_input.h"
 #include <omp.h>
 #include <mkl_service.h>
 
@@ -223,6 +226,8 @@ namespace ivf_cli {
                short_rows = 0;
       double             routing = 0, adc = 0, scan = 0, fetch = 0, rerank = 0;
       double             projection = 0, graph = 0, centroid_rerank = 0;
+      double             fetch_adapter_wait = 0, fetch_backend_pin = 0;
+      double             fetch_pin_admission_wait = 0;
       uint64_t           router_distances = 0, router_counted_queries = 0;
       std::exception_ptr failure;
     };
@@ -239,6 +244,11 @@ namespace ivf_cli {
       stats.adc += result.adc_us;
       stats.scan += result.scan_select_us;
       stats.fetch += result.fetch_us;
+      stats.fetch_adapter_wait +=
+          double(result.fetch_adapter_mutex_wait_ns) / 1000;
+      stats.fetch_backend_pin += double(result.fetch_backend_pin_ns) / 1000;
+      stats.fetch_pin_admission_wait +=
+          double(result.fetch_pin_admission_wait_ns) / 1000;
       stats.rerank += result.rerank_us;
       stats.projection += result.router_stats.projection_us;
       stats.graph += result.router_stats.graph_us;
@@ -263,6 +273,9 @@ namespace ivf_cli {
         total.adc += stats.adc;
         total.scan += stats.scan;
         total.fetch += stats.fetch;
+        total.fetch_adapter_wait += stats.fetch_adapter_wait;
+        total.fetch_backend_pin += stats.fetch_backend_pin;
+        total.fetch_pin_admission_wait += stats.fetch_pin_admission_wait;
         total.rerank += stats.rerank;
         total.projection += stats.projection;
         total.graph += stats.graph;
@@ -364,9 +377,26 @@ namespace ivf_cli {
     // insertion. Partial failures keep owned files but publish neither a
     // checkpoint nor a success record.
     struct UpdateStats {
-      uint64_t inserted = 0, deleted = 0, missing = 0, bytes = 0;
-      double   insert_s = 0, delete_s = 0, checkpoint_s = 0;
+      uint64_t       inserted = 0, deleted = 0, missing = 0, bytes = 0;
+      double         insert_s = 0, delete_s = 0, checkpoint_s = 0;
+      double         source_before_s = 0, input_validation_s = 0;
+      double         coordinate_validation_s = 0, source_after_s = 0;
+      HeapIOCounters foreground_io, checkpoint_io;
+      uint32_t       insert_threads_requested = 0, insert_threads_effective = 0;
+      uint32_t insert_peak_active = 0, insert_runtime_threads_before_launch = 0;
+      uint64_t insert_worker_allowance_bytes = 0;
+      uint64_t insert_list_growth_allowance_bytes = 0;
+      uint64_t insert_staged_bytes = 0;
+      InsertInputPolicy input_policy = InsertInputPolicy::Streaming;
     };
+    void heap_progress(std::ostream& out, const HeapIOCounters& io) {
+      out << " heap_page_reads=" << io.page_reads
+          << " heap_page_writes=" << io.page_writes
+          << " dirty_evictions=" << io.dirty_evictions
+          << " heap_flush_bytes=" << io.flush_bytes
+          << " heap_read_wait_ns=" << io.read_wait_ns
+          << " heap_eviction_write_ns=" << io.eviction_write_ns;
+    }
     template<typename T>
     UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index,
                             uint64_t budget, uint64_t resident_bytes,
@@ -376,13 +406,16 @@ namespace ivf_cli {
       const auto& m = index.origin_manifest();
       args.reject_present({"--pq_prefix"},
                           "mixed updates use frozen bundle PQ");
-      const auto source = args.require("--full_data_file");
+      const auto     source = args.require("--full_data_file");
+      DriverProgress source_before("source_identity_before");
       check(
           inspect_vectors(source, m.training.data_type, m.training.dim).rows ==
                   m.source_rows &&
               artifact_digest(source) == m.sources[0],
           "Mixed full-source identity mismatch");
-      const auto scheduler = args.get("--scheduler", "weighted");
+      const auto     source_before_s = source_before.finish();
+      DriverProgress input_validation("update_input_validation");
+      const auto     scheduler = args.get("--scheduler", "weighted");
       check(scheduler == "weighted" || scheduler == "fixed_8_8" ||
                 scheduler == "update_driven",
             "Unknown mixed scheduler");
@@ -396,6 +429,7 @@ namespace ivf_cli {
             "update_driven queries run until mutations complete");
       plan.seed = args.integer("--scheduler_seed", plan.seed);
       UpdateStats s;
+      s.source_before_s = source_before_s;
       s.bytes = resident_bytes;
       for (auto key : {"--insert_ids_file", "--delete_ids_file"})
         add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
@@ -441,6 +475,8 @@ namespace ivf_cli {
       add(s.bytes, index.estimated_checkpoint_bytes());
       add(s.bytes, 1024 * 1024);
       check(s.bytes <= budget, "CLI composed mixed workload exceeds allowance");
+      s.input_validation_s = input_validation.finish();
+      DriverProgress staging("coordinate_staging", plan.inserts, "staged_rows");
       std::vector<T> coordinates(size_t(plan.inserts) * m.training.dim);
       std::ifstream  input(source, std::ios::binary);
       for (size_t i = 0; i < inserts.size(); ++i) {
@@ -449,15 +485,23 @@ namespace ivf_cli {
             reinterpret_cast<char*>(coordinates.data() + i * m.training.dim),
             size_t(m.training.dim) * sizeof(T));
         check(bool(input), "Mixed source row read failed");
+        staging.observe(i + 1);
       }
       for (auto v : coordinates)
         check(std::isfinite(double(v)), "Nonfinite mixed insert coordinate");
+      s.coordinate_validation_s = staging.finish();
       const auto query_rows = queries.size() / m.training.dim;
       check(query_rows != 0, "Mixed queries require a nonempty source");
       std::atomic<uint64_t> missing{0};
       const auto            runtime_threads = uint32_t(
           std::distance(std::filesystem::directory_iterator("/proc/self/task"),
                                    std::filesystem::directory_iterator{}));
+      const auto     io_before = index.heap_io_counters();
+      DriverProgress foreground(
+          "mixed_foreground", std::nullopt, "operations",
+          [&](std::ostream& out) {
+            heap_progress(out, index.heap_io_counters().since(io_before));
+          });
       mixed = run_mixed_round(
           plan, {[&](uint64_t i) {
                    index.insert(
@@ -477,6 +521,8 @@ namespace ivf_cli {
                        config, {query_bytes, false, routing});
                  }});
       mixed.runtime_threads_before_launch = runtime_threads;
+      s.foreground_io = index.heap_io_counters().since(io_before);
+      foreground.finish();
       check(missing == 0 && index.size() == uint64_t(initial_live) +
                                                 plan.inserts - plan.deletes,
             "Mixed round count/live set mismatch");
@@ -484,8 +530,10 @@ namespace ivf_cli {
         check(index.contains(id), "Completed mixed insert missing at barrier");
       for (auto id : deletes)
         check(!index.contains(id), "Completed mixed delete live at barrier");
+      DriverProgress source_after("source_identity_after");
       check(artifact_digest(source) == m.sources[0],
             "Mixed source changed during execution");
+      s.source_after_s = source_after.finish();
       s.inserted = mixed.completed[0];
       s.deleted = mixed.completed[1];
       s.insert_s = s.delete_s =
@@ -494,10 +542,19 @@ namespace ivf_cli {
       add(s.bytes, index.estimated_retained_bytes() - retained_before);
       check(s.bytes <= budget,
             "CLI post-growth mixed workload exceeds allowance");
+      const auto     checkpoint_before = index.heap_io_counters();
+      DriverProgress checkpoint(
+          "checkpoint_flush_copy_verify", std::nullopt, "operations",
+          [&](std::ostream& out) {
+            heap_progress(out,
+                          index.heap_io_counters().since(checkpoint_before));
+          });
       const auto start = Clock::now();
       index.checkpoint(args.require("--checkpoint_prefix"),
                        index.estimated_checkpoint_bytes());
       s.checkpoint_s = seconds(start);
+      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
+      checkpoint.finish();
       return s;
     }
     void validate_driver_paths(const Arguments& args, bool updating) {
@@ -578,18 +635,24 @@ namespace ivf_cli {
         args.reject_present({"--insert_ids_file"}, "not used by delete_only");
       if (!erase)
         args.reject_present({"--delete_ids_file"}, "not used by insert_only");
-      const auto source = args.require("--full_data_file");
-      const auto shape =
+      const auto     source = args.require("--full_data_file");
+      DriverProgress source_before("source_identity_before");
+      const auto     shape =
           inspect_vectors(source, m.training.data_type, m.training.dim);
       check(shape.rows == m.source_rows &&
                 artifact_digest(source) == m.sources[0],
             "Update full-source identity mismatch");
+      const auto     source_before_s = source_before.finish();
+      DriverProgress input_validation("update_input_validation");
       // Counted-ID parser temporarily uses an unordered_set as well as the
       // vector. Conservatively budget both ID files before allocating either
       // parser.
       UpdateStats s;
+      s.source_before_s = source_before_s;
       s.bytes = resident_bytes;
       const auto retained_before = index.estimated_retained_bytes();
+      s.input_policy = parse_insert_input_policy(
+          args.get("--insert_input_policy", "streaming"));
       for (auto key : {"--insert_ids_file", "--delete_ids_file"})
         if (args.has(key))
           add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
@@ -606,6 +669,52 @@ namespace ivf_cli {
       auto deletes = erase ? load_counted_ids(args.require("--delete_ids_file"),
                                               m.source_rows)
                            : std::vector<uint32_t>{};
+      if (s.input_policy == InsertInputPolicy::Staged) {
+        s.insert_staged_bytes =
+            insert_staging_bytes(inserts.size(), m.training.dim, sizeof(T));
+        add(s.bytes, s.insert_staged_bytes);
+        if (s.insert_staged_bytes)
+          add(s.bytes, 64);  // Staged allocation metadata/alignment allowance.
+        check(s.bytes <= budget,
+              "CLI insertion staging exceeds workspace allowance");
+      }
+      s.insert_threads_requested = insert ? args.u32("--insert_threads", 1) : 0;
+      s.insert_threads_effective =
+          insert ? effective_insert_workers(inserts.size(),
+                                            s.insert_threads_requested)
+                 : 0;
+      // The original allowance contains one row/mutation workspace. Admit
+      // every extra independent reader/row/router/PQ workspace before launch.
+      uint64_t per_worker = index.estimated_mutation_bytes();
+      add(per_worker, m.training.dim, sizeof(T));
+      add(s.insert_worker_allowance_bytes, s.insert_threads_effective, 65536);
+      if (s.insert_threads_effective > 1) {
+        add(s.insert_worker_allowance_bytes, s.insert_threads_effective - 1,
+            per_worker);
+        rlimit     stack{};
+        const auto stack_bytes =
+            getrlimit(RLIMIT_STACK, &stack) == 0 &&
+                    stack.rlim_cur != RLIM_INFINITY
+                ? std::max<uint64_t>(8ull * 1024 * 1024, stack.rlim_cur)
+                : 8ull * 1024 * 1024;
+        add(s.insert_worker_allowance_bytes, s.insert_threads_effective,
+            stack_bytes);
+      }
+      add(s.bytes, s.insert_worker_allowance_bytes);
+      // Worst-case every input crosses a +16 boundary. Include replacement
+      // allocator allowance and old-list storage while growth copies run on
+      // distinct locked lists; retained_before conservatively covers all old
+      // list buffers, not just one worker's chosen list.
+      if (!inserts.empty()) {
+        add(s.insert_list_growth_allowance_bytes, inserts.size(),
+            16 * (uint64_t(m.chunks) + sizeof(uint32_t)) + 128);
+        add(s.insert_list_growth_allowance_bytes, retained_before);
+        add(s.bytes, s.insert_list_growth_allowance_bytes);
+      }
+      check(s.bytes <= budget,
+            s.input_policy == InsertInputPolicy::Staged
+                ? "CLI staged insertion exceeds workspace allowance"
+                : "CLI insertion workers exceed workspace allowance");
       for (auto id : inserts)
         check(
             id >= m.first_id && id < m.heap.id_capacity && !index.contains(id),
@@ -619,46 +728,126 @@ namespace ivf_cli {
         check(!std::binary_search(sorted_deletes.begin(), sorted_deletes.end(),
                                   id),
               "Insert/delete ID sets overlap");
-      const auto     identity = m.sources[0];
-      std::ifstream  input(source, std::ios::binary);
-      std::vector<T> row(m.training.dim);
-      auto           read_row = [&](uint32_t id) {
+      s.input_validation_s = input_validation.finish();
+      const auto    identity = m.sources[0];
+      std::ifstream input(source, std::ios::binary);
+      auto          read_row = [&](uint32_t id, std::span<T> row) {
         input.seekg(8 + uint64_t(id) * m.training.dim * sizeof(T));
         input.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
         check(bool(input), "Insert source row read failed");
-        for (auto value : row)
-          check(std::isfinite(double(value)), "Nonfinite insert coordinate");
       };
-      // Validate all requested coordinates before starting mutations, using
-      // bounded scratch.
-      for (auto id : inserts)
-        read_row(id);
+      // Validation/staging is outside the insertion timer. Staged rows are
+      // immutable worker inputs; streaming performs its second read inside it.
+      DriverProgress coordinates(s.input_policy == InsertInputPolicy::Staged
+                                     ? "coordinate_staging"
+                                     : "coordinate_validation",
+                                 inserts.size(), "validated_rows");
+      std::vector<T> staged;
+      if (s.input_policy == InsertInputPolicy::Staged) {
+        staged = stage_insert_rows<T>(
+            inserts, m.training.dim, s.insert_staged_bytes, read_row,
+            [&](uint64_t completed) { coordinates.observe(completed); });
+      } else {
+        std::vector<T> row(m.training.dim);
+        uint64_t       validated = 0;
+        for (auto id : inserts) {
+          read_row(id, row);
+          for (auto value : row)
+            check(std::isfinite(double(value)), "Nonfinite insert coordinate");
+          coordinates.observe(++validated);
+        }
+      }
+      s.coordinate_validation_s = coordinates.finish();
+      input.close();
+      // Open and allocate all independent inputs before delete/insert side
+      // effects; coordinate preflight above covers every requested row.
+      const auto readers = s.input_policy == InsertInputPolicy::Streaming
+                               ? s.insert_threads_effective
+                               : 0;
+      std::vector<std::ifstream>  inputs(readers);
+      std::vector<std::vector<T>> rows(readers);
+      for (uint32_t w = 0; w < readers; ++w) {
+        inputs[w].open(source, std::ios::binary);
+        check(bool(inputs[w]), "Insertion worker source open failed");
+        rows[w].resize(m.training.dim);
+      }
+      const auto     io_before = index.heap_io_counters();
+      DriverProgress deletion(
+          "delete", deletes.size(), "processed_delete_ids",
+          [&](std::ostream& out) {
+            heap_progress(out, index.heap_io_counters().since(io_before));
+          });
       auto start = Clock::now();
       for (auto id : deletes) {
         if (index.erase(id))
           ++s.deleted;
         else
           ++s.missing;
+        deletion.observe(s.deleted + s.missing);
       }
       s.delete_s = seconds(start);
+      deletion.finish();
+      const auto     insert_before = index.heap_io_counters();
+      DriverProgress insertion(
+          "insert", inserts.size(), "published_inserts",
+          [&](std::ostream& out) {
+            heap_progress(out, index.heap_io_counters().since(insert_before));
+          });
+      const auto mutation_bytes = index.estimated_mutation_bytes();
+      s.insert_runtime_threads_before_launch = uint32_t(
+          std::distance(std::filesystem::directory_iterator("/proc/self/task"),
+                        std::filesystem::directory_iterator{}));
       start = Clock::now();
-      for (auto id : inserts) {
-        read_row(id);
-        index.insert(id, row, {index.estimated_mutation_bytes(), false});
-        ++s.inserted;
-      }
+      const auto executed = run_insert_round(
+          inserts.size(), insert ? s.insert_threads_requested : 1,
+          [&](uint32_t w, uint64_t position) {
+            const auto id = inserts[size_t(position)];
+            if (s.input_policy == InsertInputPolicy::Staged) {
+              index.insert(
+                  id,
+                  std::span<const T>(staged).subspan(
+                      size_t(position) * m.training.dim, m.training.dim),
+                  {mutation_bytes, false});
+              return;
+            }
+            auto& in = inputs[w];
+            auto& values = rows[w];
+            in.seekg(8 + uint64_t(id) * m.training.dim * sizeof(T));
+            in.read(reinterpret_cast<char*>(values.data()),
+                    values.size() * sizeof(T));
+            check(bool(in), "Insertion worker source row read failed");
+            index.insert(id, values, {mutation_bytes, false});
+          },
+          [&](uint64_t completed) { insertion.observe(completed); });
+      s.inserted = executed.completed;
+      s.insert_peak_active = executed.peak_active;
       s.insert_s = seconds(start);
+      s.foreground_io = index.heap_io_counters().since(io_before);
+      insertion.finish();
+      DriverProgress source_after("source_identity_after");
       check(artifact_digest(source) == identity,
             "Update source changed during execution");
+      s.source_after_s = source_after.finish();
       // Growth may consume retained list allowance; verify final composed
       // budget too.
-      add(s.bytes, index.estimated_retained_bytes() - retained_before);
+      const auto growth = index.estimated_retained_bytes() - retained_before;
+      check(growth <= s.insert_list_growth_allowance_bytes,
+            "CLI insertion exceeded admitted retained growth allowance");
       check(s.bytes <= budget,
             "CLI post-growth update exceeds workspace allowance");
+      const auto     checkpoint_before = index.heap_io_counters();
+      DriverProgress checkpoint(
+          "checkpoint_flush_copy_verify", std::nullopt, "operations",
+          [&](std::ostream& out) {
+            heap_progress(out,
+                          index.heap_io_counters().since(checkpoint_before));
+          });
       start = Clock::now();
       index.checkpoint(args.require("--checkpoint_prefix"),
                        index.estimated_checkpoint_bytes());
       s.checkpoint_s = seconds(start);
+      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
+      checkpoint.finish();
       return s;
     }
     template<typename T>
@@ -674,16 +863,80 @@ namespace ivf_cli {
       emit("insert_time_s", s.insert_s);
       emit("delete_time_s", s.delete_s);
       emit("insert_qps", bufann_bench::safe_div(s.inserted, s.insert_s));
+      if (!mixed) {
+        const bool staged = s.input_policy == InsertInputPolicy::Staged;
+        emit("insert_input_policy", s.insert_threads_requested
+                                        ? (staged ? "staged" : "streaming")
+                                        : "not_applicable");
+        emit("insert_timing_contract_version",
+             s.insert_threads_requested ? (staged ? 2 : 1) : 0);
+        emit("insert_staged_coordinate_bytes", s.insert_staged_bytes);
+        emit("insert_input_preparation_time_s", s.coordinate_validation_s);
+        emit("insert_input_preparation_time_scope",
+             "alias_coordinate_validation_or_staging_time_not_additive");
+        emit("insert_threads_requested", s.insert_threads_requested);
+        emit("insert_threads_effective", s.insert_threads_effective);
+        emit("insert_peak_active", s.insert_peak_active);
+        emit("insert_runtime_threads_before_launch",
+             s.insert_runtime_threads_before_launch);
+        emit("insert_worker_allowance_bytes", s.insert_worker_allowance_bytes);
+        emit("insert_list_growth_allowance_bytes",
+             s.insert_list_growth_allowance_bytes);
+        emit("insert_worker_policy",
+             staged ? "bounded_joined_read_only_staged_coordinates_default_one"
+                    : "bounded_joined_independent_readers_default_one");
+        emit("insert_time_scope",
+             staged
+                 ? "completed_rows_mutation_progress_launch_join_no_source_"
+                   "reads_no_gt"
+                 : "completed_rows_reads_mutation_progress_launch_join_no_gt");
+        emit("insert_order_policy",
+             "parallel_publication_order_unspecified_distance_then_id_ties");
+      }
       emit("delete_qps",
            bufann_bench::safe_div(s.deleted + s.missing, s.delete_s));
       emit("checkpoint_time_s", s.checkpoint_s);
+      emit("source_identity_before_time_s", s.source_before_s);
+      emit("update_input_validation_time_s", s.input_validation_s);
+      emit("coordinate_validation_or_staging_time_s",
+           s.coordinate_validation_s);
+      emit("source_identity_after_time_s", s.source_after_s);
+      emit("foreground_heap_page_reads", s.foreground_io.page_reads);
+      emit("foreground_heap_page_writes", s.foreground_io.page_writes);
+      emit("foreground_heap_dirty_evictions", s.foreground_io.dirty_evictions);
+      emit("foreground_heap_flush_bytes", s.foreground_io.flush_bytes);
+      emit("foreground_heap_read_wait_ns", s.foreground_io.read_wait_ns);
+      emit("foreground_heap_eviction_write_ns",
+           s.foreground_io.eviction_write_ns);
+      emit("checkpoint_heap_page_writes", s.checkpoint_io.page_writes);
+      emit("checkpoint_heap_flush_bytes", s.checkpoint_io.flush_bytes);
+      emit("heap_io_counter_scope", mixed
+                                        ? "backend_pool_phase_deltas_includes_"
+                                          "concurrent_queries_not_device_io"
+                                        : "backend_pool_phase_deltas_excludes_"
+                                          "source_reads_not_device_io");
+      emit("checkpoint_heap_io_scope",
+           "pool_flush_only_excludes_checkpoint_file_copy_hash_metadata");
+      emit("mutation_completion_policy",
+           "joined_publications_then_quiescent_verified_checkpoint");
+      emit("checkpoint_completion_scope",
+           "flush_copy_hash_metadata_not_wal_or_crash_durability");
+      emit("driver_progress_policy",
+           "phase_boundaries_completed_counts_time_and_count_limited_no_"
+           "heartbeat_thread");
+      emit("driver_progress_timing_scope",
+           "periodic_reporting_inside_foreground_boundary_reporting_outside");
       emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
       emit("live_count", index.size());
       emit("retained_heap_records", index.retained_heap_records());
       emit("estimated_update_workspace_bytes", s.bytes);
       if (!mixed) {
-        emit("mutation_workers", 1);
-        emit("scheduler", "sequential_delete_then_insert_no_query_overlap");
+        emit("mutation_workers", std::max(s.insert_threads_effective,
+                                          s.deleted + s.missing ? 1u : 0u));
+        emit("scheduler",
+             s.insert_threads_effective > 1
+                 ? "serial_delete_then_bounded_parallel_insert_no_query_overlap"
+                 : "sequential_delete_then_insert_no_query_overlap");
         emit("mutation_timing_scope",
              "foreground_loops_excludes_open_validation_hash_checkpoint_and_"
              "post_update_query");
@@ -784,7 +1037,8 @@ namespace ivf_cli {
            "uncontrolled_after_full_source_and_bundle_hash_and_private_copy");
     }
     template<typename T>
-    void mutate_typed(const Arguments& args, DataType type) {
+    void mutate_typed(const Arguments& args, DataType type,
+                      Clock::time_point workflow_start) {
       args.reject_present(
           {"--query_file", "--gt_file", "--search_result_file",
            "--query_threads", "--recall_at", "--nprobe", "--rerank_factor",
@@ -792,10 +1046,12 @@ namespace ivf_cli {
           "not used by mutation-only execution; query the saved checkpoint "
           "separately");
       validate_driver_paths(args, true);
-      const auto  budget = budget_bytes(args.real("--memory_budget_gb", 1));
-      const auto  start = Clock::now();
-      auto        index = open_mutable<T>(args, budget);
-      const auto  open_time = seconds(start);
+      const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
+      DriverProgress opening("open_private_copy_verify");
+      const auto     start = Clock::now();
+      auto           index = open_mutable<T>(args, budget);
+      const auto     open_time = seconds(start);
+      opening.finish();
       const auto& m = index->origin_manifest();
       check(!args.has("--dim") || args.u32("--dim") == m.training.dim,
             "CLI/manifest dimension mismatch");
@@ -819,15 +1075,22 @@ namespace ivf_cli {
       bufann_bench::json_kv(record, first, "peak_process_rss_mb",
                             peak_process_rss_mb());
       emit_update(record, first, args, *index, s);
+      bufann_bench::json_kv(record, first, "driver_workflow_time_s",
+                            seconds(workflow_start));
+      bufann_bench::json_kv(record, first, "driver_workflow_time_scope",
+                            "driver_dispatch_through_completed_workload_before_"
+                            "canonical_record_write_not_process_lifetime");
       record << "}";
       publish_record(args, record.str());
     }
 
     template<typename T, typename Index>
     void search_typed(const Arguments& args, DataType type,
-                      std::unique_ptr<Index> index, double open_time) {
-      const bool is_mixed = args.require("--workload") == "mixed";
-      const bool updating =
+                      std::unique_ptr<Index> index, double open_time,
+                      Clock::time_point workflow_start) {
+      DriverProgress loading("query_input_validation_load");
+      const bool     is_mixed = args.require("--workload") == "mixed";
+      const bool     updating =
           args.require("--workload") == "search_after_update" || is_mixed;
       const auto  budget = budget_bytes(args.real("--memory_budget_gb", 1.0));
       const auto& manifest = cli_manifest(*index);
@@ -874,6 +1137,7 @@ namespace ivf_cli {
       GroundTruth gold;
       if (has_truth)
         gold = load_truth(args.require("--gt_file"), truth);
+      loading.finish();
       UpdateStats updates;
       MixedStats  mixed;
       if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
@@ -899,6 +1163,8 @@ namespace ivf_cli {
       std::vector<WorkerStats> stats(workers);
       std::atomic<uint32_t>    next{0};
       std::atomic_bool         failed{false};
+      DriverProgress           query_progress(updating ? "post_update_query"
+                                                       : "query_foreground");
       const auto               start = Clock::now();
       {
         // jthread joins even if later thread construction fails. No shared ef
@@ -934,11 +1200,13 @@ namespace ivf_cli {
             }
           });
       }
-      const auto   query_time = seconds(start);
-      const auto   total = sum_workers(stats);
-      const double recall =
+      const auto query_time = seconds(start);
+      const auto total = sum_workers(stats);
+      query_progress.finish();
+      DriverProgress scoring("recall_scoring_export_statistics");
+      const double   recall =
           has_truth ? score_recall(gold, ids, queries.rows, config.recall_at)
-                    : 0;
+                      : 0;
       if (args.has("--search_result_file"))
         write_neighbors(args.require("--search_result_file"), queries.rows,
                         config.recall_at, ids, distances);
@@ -946,7 +1214,8 @@ namespace ivf_cli {
       const double avg_latency =
           std::accumulate(latency.begin(), latency.end(), 0.0) / latency.size();
       const auto peak_rss = peak_process_rss_mb();
-      auto       percentile = [&](double p) {
+      scoring.finish();
+      auto percentile = [&](double p) {
         return latency[static_cast<size_t>(p * double(latency.size() - 1))];
       };
       std::ostringstream record;
@@ -1015,12 +1284,23 @@ namespace ivf_cli {
       emit("adc_us_total", total.adc);
       emit("scan_select_us_total", total.scan);
       emit("fetch_us_total", total.fetch);
+      emit("fetch_adapter_mutex_wait_us_total", total.fetch_adapter_wait);
+      emit("fetch_backend_pin_us_total", total.fetch_backend_pin);
+      emit("fetch_pin_admission_wait_us_total", total.fetch_pin_admission_wait);
+      emit("fetch_pin_admission_policy",
+           "fifo_aggregate_worst_shard_bounds_reads_and_writes");
+      emit("fetch_substage_timing_scope",
+           "subintervals_of_fetch_wall_not_additional_stages_backend_pin_"
+           "includes_"
+           "frame_lookup_wait_eviction_io_not_pure_device_time");
       emit("rerank_us_total", total.rerank);
       emit("estimated_workspace_bytes", bytes);
       emit("memory_budget_bytes", budget);
       emit("peak_process_rss_mb", peak_rss);
       if (!updating)
         emit("cache_policy", "uncontrolled_after_full_bundle_hash");
+      if (!updating)
+        emit("driver_progress_policy", "phase_boundaries_no_heartbeat_thread");
       emit("query_timing_scope",
            "workers_start_join_and_result_collection_excludes_gt_and_export");
       emit("stage_timing_scope",
@@ -1044,17 +1324,45 @@ namespace ivf_cli {
           emit_update(record, first, args, *index, updates,
                       is_mixed ? &mixed : nullptr);
       }
+      emit("explicit_warmup_query_count", 0);
+      if constexpr (std::is_same_v<Index, MutableIndex<T>>)
+        emit("query_cache_process_policy",
+             updating ? "same_process_live_mutable_session_after_checkpoint_no_"
+                        "reopen_no_explicit_warmup"
+                      : "private_mutable_copy_opened_in_this_process_no_"
+                        "explicit_warmup");
+      else
+        emit("query_cache_process_policy",
+             "immutable_bundle_opened_in_this_process_no_explicit_warmup");
+      emit("cache_state_claim",
+           "open_validation_may_touch_pages_os_cache_not_controlled");
+      emit("driver_workflow_time_s", seconds(workflow_start));
+      emit("driver_workflow_time_scope",
+           "driver_dispatch_through_completed_workload_query_scoring_export_"
+           "before_canonical_record_write_not_process_lifetime");
       record << "}";
       publish_record(args, record.str());
     }
     template<typename T>
     void driver_typed(const Arguments& args, DataType type) {
+      const auto workflow_start = Clock::now();
       const auto workload = args.require("--workload");
       const bool mixed = workload == "mixed";
       check(workload == "search_only" || workload == "insert_only" ||
                 workload == "delete_only" ||
                 workload == "search_after_update" || mixed,
             "Unsupported native workload");
+      if (args.has("--insert_threads")) {
+        check(workload == "insert_only" || workload == "search_after_update",
+              "insert_threads only applies to sequential insertion workloads");
+        effective_insert_workers(0, args.u32("--insert_threads"));
+      }
+      if (args.has("--insert_input_policy")) {
+        check(workload == "insert_only" || workload == "search_after_update",
+              "insert_input_policy only applies to sequential insertion "
+              "workloads");
+        parse_insert_input_policy(args.require("--insert_input_policy"));
+      }
       if (!mixed)
         args.reject_present({"--scheduler", "--pool_threads", "--query_ratio",
                              "--query_count", "--scheduler_seed"},
@@ -1064,7 +1372,7 @@ namespace ivf_cli {
         mkl_set_num_threads(1);
       }
       if (workload == "insert_only" || workload == "delete_only")
-        return mutate_typed<T>(args, type);
+        return mutate_typed<T>(args, type, workflow_start);
       const bool updating = workload == "search_after_update" || mixed;
       validate_driver_paths(args, updating);
       if (!updating)
@@ -1074,18 +1382,25 @@ namespace ivf_cli {
       const auto format = args.get("--index_format", "immutable");
       check(format == "immutable" || format == "mutable",
             "Unknown index_format");
-      const auto budget = budget_bytes(args.real("--memory_budget_gb", 1));
-      const auto start = Clock::now();
+      const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
+      DriverProgress opening("open_private_copy_verify");
+      const auto     start = Clock::now();
       if (updating || format == "mutable") {
-        auto index = open_mutable<T>(args, budget);
-        return search_typed<T>(args, type, std::move(index), seconds(start));
+        auto       index = open_mutable<T>(args, budget);
+        const auto open_time = seconds(start);
+        opening.finish();
+        return search_typed<T>(args, type, std::move(index), open_time,
+                               workflow_start);
       }
       args.reject_present({"--private_heap_path"},
                           "not used by immutable search");
       auto index =
           NativeIndex<T>::open(args.require("--index_prefix"),
                                {args.u32("--buffer_frames", 64), budget});
-      return search_typed<T>(args, type, std::move(index), seconds(start));
+      const auto open_time = seconds(start);
+      opening.finish();
+      return search_typed<T>(args, type, std::move(index), open_time,
+                             workflow_start);
     }
   }  // namespace
 

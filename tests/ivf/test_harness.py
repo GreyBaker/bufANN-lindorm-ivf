@@ -208,6 +208,11 @@ def main():
         assert not (work / "sweeps/collision").exists()
         record = json.loads((work / "result.json").read_text())
         assert record == json.loads((work / "native_result.json").read_text())
+        protocol = json.loads((work / "execution_protocol.json").read_text())
+        assert protocol["native_driver_process_count"] == 1 and protocol["mutation_process_wall_s"] is None
+        assert protocol["insert_input_policy"] is None
+        assert protocol["process_boundary_policy"] == "standalone_query_driver"
+        assert protocol["harness_workflow_wall_s"] >= protocol["query_process_wall_s"] >= record["driver_workflow_time_s"]
         assert (
             record["baseline"] == "IVF" and record["recall"] == 100 and record["query_count"] == 2
         )
@@ -324,6 +329,16 @@ def main():
             assert update["live_count"] == (4 if workload == "insert" else 2)
             assert final["recall"] == 100 and final["live_count"] == update["live_count"]
             assert final == json.loads((mutation_work / "native_result.json").read_text())
+            protocol = json.loads((mutation_work / "execution_protocol.json").read_text())
+            assert protocol["version"] == 1 and protocol["completed"] is True
+            assert protocol["native_driver_process_count"] == 2
+            assert "separate_query_driver_private_copy" in protocol["process_boundary_policy"]
+            assert protocol["application_cache_transfer_between_driver_processes"] is False
+            assert protocol["explicit_warmup_query_count"] == 0
+            assert protocol["canonical_native_query_metrics_rewritten"] is False
+            assert protocol["harness_workflow_wall_s"] >= protocol["mutation_process_wall_s"] + protocol["query_process_wall_s"]
+            assert protocol["query_process_wall_s"] >= final["driver_workflow_time_s"]
+            assert protocol["mutation_process_wall_s"] >= update["driver_workflow_time_s"]
             checkpoint = mutation_work / "checkpoint/tiny"
             assert (
                 Path(str(checkpoint) + ".mlists").is_file()
@@ -353,10 +368,25 @@ def main():
             run(mutation_prepare, env, False)
             assert checksum(mutation_work / "result.json") == result_identity
             env["IVF_RUN_TAG"] = "repeat"
+            if workload == "insert":
+                env["IVF_INSERT_INPUT_POLICY"] = "staged"
             run(mutation_run, env)
             assert (
                 json.loads((mutation_work / "runs/repeat/result.json").read_text())["recall"] == 100
             )
+            if workload == "insert":
+                repeated = json.loads((mutation_work / "runs/repeat/mutation_result.json").read_text())
+                assert repeated["insert_input_policy"] == "staged" and repeated["insert_timing_contract_version"] == 2
+                protocol = json.loads((mutation_work / "runs/repeat/execution_protocol.json").read_text())
+                assert protocol["insert_input_policy"] == "staged" and protocol["native_driver_process_count"] == 2
+                del env["IVF_INSERT_INPUT_POLICY"]
+            env["IVF_RUN_TAG"] = "protocol_collision"
+            collision = mutation_work / "runs/protocol_collision"
+            collision.mkdir()
+            (collision / "execution_protocol.json").write_text("owned evidence")
+            assert "run output exists" in run(mutation_run, env, False).stderr
+            assert (collision / "execution_protocol.json").read_text() == "owned evidence"
+            assert not (collision / "private.heap").exists()
             env["IVF_RUN_TAG"] = "changed_ids"
             saved_ids = ids.read_bytes()
             ids.write_bytes(struct.pack("<II", 1, 0))

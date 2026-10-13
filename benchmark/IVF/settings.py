@@ -84,6 +84,64 @@ def query_router_flags():
     ]
 
 
+def insertion_threads():
+    """Independent sequential-insert workers; never reinterpret NTHREADS/mixed."""
+    value = int(os.environ.get("IVF_INSERT_THREADS", "1"))
+    require(1 <= value <= 256, "IVF_INSERT_THREADS must be in [1, 256]")
+    return str(value)
+
+
+def insertion_input_policy():
+    policy = os.environ.get("IVF_INSERT_INPUT_POLICY", "streaming")
+    require(policy in ("streaming", "staged"),
+            "IVF_INSERT_INPUT_POLICY must be streaming or staged")
+    return policy
+
+
+def validate_insertion_staging(resources, rows, dim, dtype):
+    """Lower bound only: native composed row/worker/list admission is authoritative."""
+    validate_resources(resources)
+    require(isinstance(rows, int) and 0 <= rows <= 0x7FFFFFFF,
+            "invalid insertion staging row count")
+    require(isinstance(dim, int) and 0 < dim <= 0x7FFFFFFF,
+            "invalid insertion staging dimension")
+    require(dtype in ("float", "int8", "uint8"), "invalid insertion staging dtype")
+    staged = rows * dim * (4 if dtype == "float" else 1)
+    frames = int(resources["buffer_frames"]) * (int(resources["page_size"]) + 4096)
+    require(staged + frames <= float(resources["memory_budget_gb"]) * (1 << 30),
+            "insertion staging and frame allowance alone exceed IVF memory budget")
+
+
+def validate_resources(values):
+    """Cheap lower-bound gate; native composed admission remains authoritative."""
+    frames = int(values["buffer_frames"])
+    page = int(values["page_size"])
+    budget = float(values["memory_budget_gb"])
+    require(2 <= frames <= 0xFFFFFFFF, "IVF buffer_frames must be in [2, uint32 max]")
+    require(4096 <= page <= 65536 and page % 4096 == 0,
+            "IVF page_size must be a multiple of 4096 in [4096, 65536]")
+    require(math.isfinite(budget) and budget > 0, "IVF memory budget must be finite and positive")
+    # Match the native per-frame allowance (payload + metadata/alignment), not
+    # just payload. This excludes lists/router/locators/worker scratch and is
+    # deliberately insufficient to certify a whole workload fits.
+    minimum = frames * (page + 4096)
+    require(budget * (1 << 30) >= minimum,
+            f"IVF frame allowance alone requires {minimum} bytes; increase memory budget "
+            "or reduce frames (native composed admission still required)")
+
+
+def runtime_resources(page_size, query=False):
+    values = {
+        "buffer_frames": os.environ.get("IVF_BUFFER_FRAMES", BUILD_DEFAULTS["buffer_frames"]),
+        "page_size": str(page_size),
+        "memory_budget_gb": os.environ.get("IVF_MEMORY_BUDGET_GB", BUILD_DEFAULTS["memory_budget_gb"]),
+    }
+    if query:
+        values["memory_budget_gb"] = os.environ.get("IVF_QUERY_MEMORY_BUDGET_GB", values["memory_budget_gb"])
+    validate_resources(values)
+    return values
+
+
 def read_cost_model_report(path):
     path = Path(path)
     require(
@@ -293,4 +351,5 @@ def build_settings():
     require(
         result["nlist"] is not None, "set IVF_NLIST explicitly or provide IVF_COST_MODEL_REPORT"
     )
+    validate_resources(result)
     return result

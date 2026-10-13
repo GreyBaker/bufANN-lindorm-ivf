@@ -28,6 +28,28 @@ if(IVF_BUILD_CONTRACT_TESTS)
     target_link_libraries(ivf_list_routing_tests PRIVATE ivf_numeric_policy Threads::Threads)
     add_test(NAME ivf_list_routing_schedule COMMAND ivf_list_routing_tests)
     set_tests_properties(ivf_list_routing_schedule PROPERTIES TIMEOUT 30)
+    add_executable(ivf_insert_scheduler_tests ivf_insert_scheduler_tests.cpp)
+    target_link_libraries(ivf_insert_scheduler_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_insert_scheduler COMMAND ivf_insert_scheduler_tests)
+    set_tests_properties(ivf_insert_scheduler PROPERTIES TIMEOUT 30)
+    add_executable(ivf_insert_input_tests ivf_insert_input_tests.cpp)
+    target_link_libraries(ivf_insert_input_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_insert_input COMMAND ivf_insert_input_tests)
+    set_tests_properties(ivf_insert_input PROPERTIES TIMEOUT 30)
+    add_executable(ivf_driver_progress_tests ivf_driver_progress_tests.cpp)
+    target_link_libraries(ivf_driver_progress_tests PRIVATE Threads::Threads)
+    add_test(NAME ivf_driver_progress COMMAND ivf_driver_progress_tests)
+    set_tests_properties(ivf_driver_progress PROPERTIES TIMEOUT 30)
+    add_executable(ivf_fetch_timing_tests ivf_fetch_timing_tests.cpp)
+    target_include_directories(ivf_fetch_timing_tests PRIVATE "${IVF_ROOT}/include")
+    target_link_libraries(ivf_fetch_timing_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_fetch_timing COMMAND ivf_fetch_timing_tests)
+    set_tests_properties(ivf_fetch_timing PROPERTIES TIMEOUT 30)
+    add_executable(ivf_pin_admission_tests ivf_pin_admission_tests.cpp)
+    target_include_directories(ivf_pin_admission_tests PRIVATE "${IVF_ROOT}/include")
+    target_link_libraries(ivf_pin_admission_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_pin_admission COMMAND ivf_pin_admission_tests)
+    set_tests_properties(ivf_pin_admission PROPERTIES TIMEOUT 30)
     add_executable(ivf_centroid_tests ivf_centroid_tests.cpp)
     target_link_libraries(ivf_centroid_tests PRIVATE ivf_centroids)
     add_test(NAME ivf_centroid_training COMMAND ivf_centroid_tests
@@ -93,6 +115,31 @@ if(IVF_BUILD_CONTRACT_TESTS)
         add_test(NAME ivf_direct_io COMMAND ivf_direct_io_tests
                                             "${CMAKE_CURRENT_BINARY_DIR}/direct_io_fixtures")
         set_tests_properties(ivf_direct_io PROPERTIES TIMEOUT 60)
+        add_executable(ivf_read_io_tests ivf_read_io_tests.cpp)
+        target_link_libraries(ivf_read_io_tests PRIVATE ivf_heap Threads::Threads)
+        add_test(NAME ivf_read_io COMMAND ivf_read_io_tests
+                                         "${CMAKE_CURRENT_BINARY_DIR}/read_io_fixtures")
+        set_tests_properties(ivf_read_io PROPERTIES TIMEOUT 30)
+        add_executable(ivf_exact_aio_tests ivf_exact_aio_tests.cpp)
+        target_include_directories(ivf_exact_aio_tests PRIVATE "${IVF_ROOT}/include")
+        target_link_libraries(ivf_exact_aio_tests PRIVATE ivf_numeric_policy aio)
+        add_test(NAME ivf_exact_aio COMMAND ivf_exact_aio_tests)
+        set_tests_properties(ivf_exact_aio PROPERTIES TIMEOUT 30)
+        add_executable(ivf_batch_read_io_tests ivf_batch_read_io_tests.cpp)
+        target_link_libraries(ivf_batch_read_io_tests PRIVATE ivf_heap Threads::Threads)
+        add_test(NAME ivf_batch_read_io COMMAND ivf_batch_read_io_tests
+                                              "${CMAKE_CURRENT_BINARY_DIR}/batch_read_io_fixtures")
+        set_tests_properties(ivf_batch_read_io PROPERTIES TIMEOUT 30)
+        add_executable(ivf_mutable_locality_tests ivf_mutable_locality_tests.cpp)
+        target_link_libraries(ivf_mutable_locality_tests PRIVATE ivf_heap Threads::Threads)
+        add_test(NAME ivf_mutable_locality COMMAND ivf_mutable_locality_tests
+                                                 "${CMAKE_CURRENT_BINARY_DIR}/mutable_locality_fixtures")
+        set_tests_properties(ivf_mutable_locality PROPERTIES TIMEOUT 120)
+        add_executable(ivf_concurrent_fetch_tests ivf_concurrent_fetch_tests.cpp)
+        target_link_libraries(ivf_concurrent_fetch_tests PRIVATE ivf_heap Threads::Threads)
+        add_test(NAME ivf_concurrent_fetch COMMAND ivf_concurrent_fetch_tests
+                                                "${CMAKE_CURRENT_BINARY_DIR}/concurrent_fetch_fixtures")
+        set_tests_properties(ivf_concurrent_fetch PROPERTIES TIMEOUT 120)
     endif()
     add_executable(ivf_contract_tests ivf_contract_tests.cpp "${IVF_ROOT}/src/logger.cpp"
                                       "${IVF_ROOT}/src/ann_exception.cpp")
@@ -170,6 +217,16 @@ if(IVF_BUILD_CONTRACT_TESTS)
                                         "${IVF_ROOT}/src/ann_exception.cpp")
     target_link_libraries(ivf_pq_helper_parity PRIVATE ivf_contracts)
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_parallel_insert
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_parallel_insert.py"
+                         --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/parallel_insert_fixtures")
+        set_tests_properties(ivf_parallel_insert PROPERTIES TIMEOUT 240)
+        add_test(NAME ivf_insert_input_policy
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_insert_policy.py"
+                         --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/insert_policy_fixtures")
+        set_tests_properties(ivf_insert_input_policy PROPERTIES TIMEOUT 240)
         add_test(NAME ivf_parallel_list_build
                  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_list_parallel_build.py"
                          --build $<TARGET_FILE:ivf_build>

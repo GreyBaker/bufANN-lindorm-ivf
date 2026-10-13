@@ -166,6 +166,9 @@ namespace diskann::ivf {
     uint64_t missing_deletes() const {
       return _lists->missing_deletes();
     }
+    HeapIOCounters heap_io_counters() const {
+      return _heap->io_counters();
+    }
     ListSnapshot copy_list(uint32_t list,
                            uint64_t workspace_bytes = 64ull * 1024 *
                                                       1024) const {

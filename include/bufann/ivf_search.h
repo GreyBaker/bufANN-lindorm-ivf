@@ -27,6 +27,11 @@ namespace diskann::ivf {
     uint64_t heap_pages_read =
         0;  // Measured backend page reads; not device requests/IOPS.
     uint64_t logical_fetch_stages = 0;
+    // Nested fetch subintervals; backend pin time includes
+    // lookup/frame/eviction waits and I/O and therefore must not be labeled
+    // pure device time.
+    uint64_t fetch_adapter_mutex_wait_ns = 0, fetch_backend_pin_ns = 0;
+    uint64_t fetch_pin_admission_wait_ns = 0;
     uint64_t stale_candidates =
         0;  // Mutable queries only: removed by live revalidation.
     // Per-query wall microseconds; scan includes bounded candidate selection.

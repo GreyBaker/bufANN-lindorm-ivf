@@ -1,8 +1,10 @@
 
 #include "linux_aligned_file_reader.h"
+#include "bufann/exact_aio.h"
 
 #include <aio.h>
 #include <cassert>
+#include <climits>
 #include <cstdio>
 #include <iostream>
 #include "tsl/robin_map.h"
@@ -77,6 +79,41 @@ namespace {
   }
 }  // namespace
 
+namespace {
+  void execute_exact_io(io_context_t& ctx, int fd,
+                        const std::vector<AlignedRead>& requests) {
+    struct Ops {
+      io_context_t& context;
+      int submit(long n, iocb** blocks) { return io_submit(context, n, blocks); }
+      int collect(long minimum, long maximum, io_event* events) {
+        return io_getevents(context, minimum, maximum, events, nullptr);
+      }
+      int abort_pending() {
+        int result;
+        do {
+          result = io_destroy(context);  // Waits for all in-flight I/O.
+        } while (result == -EINTR);
+        if (result == 0)
+          context = (io_context_t)-1;
+        return result;
+      }
+    } ops{ctx};
+    for (size_t first = 0; first < requests.size(); first += MAX_EVENTS) {
+      const size_t count = std::min<size_t>(MAX_EVENTS, requests.size() - first);
+      std::array<iocb, MAX_EVENTS> blocks{};
+      for (size_t i = 0; i < count; ++i) {
+        const auto& request = requests[first + i];
+        if (!request.buf || !request.len || request.len > uint64_t(LONG_MAX) ||
+            request.offset > uint64_t(LLONG_MAX) || request.len % 512 ||
+            request.offset % 512 || uintptr_t(request.buf) % 512)
+          throw std::invalid_argument("Invalid exact aligned read request");
+        io_prep_pread(&blocks[i], fd, request.buf, request.len, request.offset);
+      }
+      diskann::inplace::detail::exact_aio_batch(ops, {blocks.data(), count});
+    }
+  }
+}  // namespace
+
 LinuxAlignedFileReader::LinuxAlignedFileReader() {
   this->file_desc = -1;
 }
@@ -104,11 +141,12 @@ LinuxAlignedFileReader::~LinuxAlignedFileReader() {
   }
 }
 
-void LinuxAlignedFileReader::use_external_fd(int fd) {
+void LinuxAlignedFileReader::use_external_fd(int fd, bool require_exact_reads) {
   assert(fd >= 0);
   assert(this->file_desc == -1);  // do not mix with open()
   this->file_desc = fd;
   this->owns_fd   = false;
+  this->exact_reads = require_exact_reads;
 }
 
 io_context_t &LinuxAlignedFileReader::get_ctx() {
@@ -121,10 +159,16 @@ io_context_t &LinuxAlignedFileReader::get_ctx() {
   }
 }
 
+IOContext LinuxAlignedFileReader::get_ctx_copy() {
+  std::lock_guard<std::mutex> lock(ctx_mut);
+  const auto found = ctx_map.find(std::this_thread::get_id());
+  return found == ctx_map.end() ? bad_ctx : found->second;
+}
+
 void LinuxAlignedFileReader::register_thread() {
   auto                         my_id = std::this_thread::get_id();
   std::unique_lock<std::mutex> lk(ctx_mut);
-  if (ctx_map.find(my_id) != ctx_map.end()) {
+  if (ctx_map.find(my_id) != ctx_map.end() && ctx_map[my_id] != bad_ctx) {
     return;
   }
   io_context_t ctx = 0;
@@ -132,6 +176,9 @@ void LinuxAlignedFileReader::register_thread() {
   if (ret != 0) {
     const int err = ret < 0 ? -ret : errno;
     lk.unlock();
+    if (exact_reads)
+      throw std::runtime_error("Exact batch read context setup failed: errno=" +
+                               std::to_string(err));
     assert(err != EAGAIN);
     assert(err != ENOMEM);
     std::cerr << "io_setup() failed; returned " << ret << ", errno=" << err
@@ -149,7 +196,7 @@ void LinuxAlignedFileReader::deregister_thread() {
 
   lk.unlock();
   io_context_t ctx = this->get_ctx();
-  io_destroy(ctx);
+  if (ctx != bad_ctx) io_destroy(ctx);
   //  assert(ret == 0);
   lk.lock();
   ctx_map.erase(my_id);
@@ -162,7 +209,7 @@ void LinuxAlignedFileReader::deregister_all_threads() {
 
   for (auto &iter : ctx_map) {
     io_context_t ctx = iter.second;
-    io_destroy(ctx);
+    if (ctx != bad_ctx) io_destroy(ctx);
     //  assert(ret == 0);
     //    std::cerr << "returned ctx from thread-id:" << iter.first <<
     //    std::endl;
@@ -206,7 +253,22 @@ void LinuxAlignedFileReader::close() {
 void LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
                                   io_context_t &ctx, bool async) {
   assert(this->file_desc != -1);
-  execute_io(ctx, this->file_desc, read_reqs);
+  if (exact_reads) {
+    const auto original = ctx;
+    try {
+      execute_exact_io(ctx, this->file_desc, read_reqs);
+    } catch (...) {
+      if (ctx == bad_ctx) {
+        std::lock_guard<std::mutex> lock(ctx_mut);
+        auto found = ctx_map.find(std::this_thread::get_id());
+        if (found != ctx_map.end() && found->second == original)
+          found.value() = bad_ctx;
+      }
+      throw;
+    }
+  } else {
+    execute_io(ctx, this->file_desc, read_reqs);
+  }
   if (async == true) {
     std::cerr << "async only supported in Windows for now." << std::endl;
   }

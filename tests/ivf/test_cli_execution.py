@@ -39,7 +39,30 @@ def run(command, phase=None):
         phases = [line.split("phase=", 1)[1].split()[0]
                   for line in result.stderr.splitlines() if line.startswith("[IVF build]")]
         assert phases == ["input_identity", "training", "final_router", "posting_lists",
-                          "coordinate_heap", "heap_checkpoint", "artifact_verification", "complete"], phases
+                           "coordinate_heap", "heap_checkpoint", "artifact_verification", "complete"], phases
+    else:
+        progress = [dict(item.split("=", 1) for item in line.split()[2:])
+                    for line in result.stderr.splitlines() if line.startswith("[IVF driver]")]
+        assert progress and progress[0]["phase"] == "open_private_copy_verify", result.stderr
+        assert not any(p["event"] in ("failed", "abandoned", "incomplete") for p in progress), result.stderr
+        if phase == "query":
+            record = records[0]
+            assert record["fetch_adapter_mutex_wait_us_total"] >= 0
+            assert record["fetch_backend_pin_us_total"] >= 0
+            assert record["fetch_pin_admission_wait_us_total"] >= 0
+            assert (record["fetch_adapter_mutex_wait_us_total"] + record["fetch_backend_pin_us_total"]
+                    + record["fetch_pin_admission_wait_us_total"]
+                    <= record["fetch_us_total"] * 1.01 + 1.0)
+            assert "bounds_reads_and_writes" in record["fetch_pin_admission_policy"]
+            assert "not_additional_stages" in record["fetch_substage_timing_scope"]
+        if phase in ("insert", "delete"):
+            for name, count in (("insert", records[0]["insert_count"]),
+                                ("delete", records[0]["delete_count"] + records[0]["missing_delete_count"])):
+                finished = [p for p in progress if p["phase"] == name and p["event"] == "complete"]
+                assert len(finished) == 1 and int(finished[0]["completed"]) == count, progress
+            assert records[0]["foreground_heap_flush_bytes"] == records[0]["foreground_heap_page_writes"] * 4096
+            assert records[0]["checkpoint_heap_flush_bytes"] == records[0]["checkpoint_heap_page_writes"] * 4096
+            assert "not_device_io" in records[0]["heap_io_counter_scope"]
     return records[0]
 
 
@@ -247,7 +270,9 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
     changed.write_bytes(data.read_bytes()[:-1] + bytes([data.read_bytes()[-1] ^ 1]))
     cmd, saved, _ = command("insert_only", ["--insert_ids_file", str(insert_ids)])
     cmd[cmd.index("--full_data_file") + 1] = str(changed)
-    assert "identity mismatch" in run(cmd).stderr and not Path(str(saved) + ".manifest").exists()
+    failed = run(cmd)
+    assert "identity mismatch" in failed.stderr and not Path(str(saved) + ".manifest").exists()
+    assert "phase=source_identity_before event=failed" in failed.stderr
     for extra in (
         ["--pq_prefix", "unused"],
         ["--memory_budget_gb", "0.001"],

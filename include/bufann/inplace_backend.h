@@ -30,7 +30,7 @@
 #include "utils.h"
 #include "tsl/robin_set.h"
 
-class AlignedFileReader;
+class LinuxAlignedFileReader;
 
 namespace diskann {
   template<typename T, typename TagT>
@@ -542,7 +542,7 @@ class BufferPool {
     std::unique_ptr<std::atomic<ResidencySegment*>[]> _resident_page_frames;
     int              _heap_fd     = -1;
     // Shared with _heap_fd via use_external_fd(); does not own the fd.
-    std::unique_ptr<AlignedFileReader> _aio_reader;
+    std::unique_ptr<LinuxAlignedFileReader> _aio_reader;
     std::atomic<uint32_t> _total_pages{0};
     uint32_t         _num_shards = 1;
     uint32_t         _flush_budget_pages_per_cycle = 32;
@@ -642,8 +642,8 @@ class InPlaceGraphStore {
     // Allocation
     uint32_t allocate_node();                  // reserve a fresh id + materialize its slot
     void     allocate_node(uint32_t node_id);  // materialize a caller-supplied id
-    // Quiescent bulk construction only: finish the current page before advancing.
-    // Existing allocation/mutation callers retain round-robin placement.
+    // Caller-serialized page filling: finish the current page before advancing.
+    // IVF bulk/mutable heaps opt in; generic allocation stays round-robin.
     void     allocate_node_sequential(uint32_t node_id);
     void     allocate_nodes_batch(const uint32_t* node_ids, size_t count);
     void     publish_node(uint32_t node_id);

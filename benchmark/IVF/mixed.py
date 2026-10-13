@@ -10,7 +10,7 @@ import struct
 import sys
 from common import command_log, digest, header, query_truth_shapes, read_json, require, write_json
 from harness import component_digests, prepare as prepare_base
-from settings import prepared_selection, profile, query_router_flags
+from settings import prepared_selection, profile, query_router_flags, runtime_resources
 
 
 def counted_identity(path, first, count):
@@ -109,11 +109,12 @@ def extract_round(dest):
 
 def run(args):
     w = args.work_dir.resolve()
+    base = read_json(w / "prepared.json")
+    resources = runtime_resources(base["settings"]["page_size"])
     path = w / "mixed_prepared.json"
     require(path.stat().st_size <= 8 << 20, "oversized mixed preparation metadata")
     prepared = json.loads(path.read_text())
     require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
-    base = read_json(w / "prepared.json")
     selection = prepared_selection(base)
     require(
         base["profile"] == profile(args) and digest(base["query"]) == base["query_identity"],
@@ -200,9 +201,9 @@ def run(args):
             "--checkpoint_prefix",
             str(saved),
             "--buffer_frames",
-            os.environ.get("IVF_BUFFER_FRAMES", "64"),
+            resources["buffer_frames"],
             "--memory_budget_gb",
-            os.environ.get("IVF_MEMORY_BUDGET_GB", "1"),
+            resources["memory_budget_gb"],
             "--result_file",
             str(dest / "native_result.json"),
             "--search_result_file",

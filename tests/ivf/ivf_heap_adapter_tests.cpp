@@ -101,7 +101,9 @@ namespace {
       require(result.backend_batch_calls ==
                   (ids.size() + storage.copy_batch_limit() - 1) /
                       storage.copy_batch_limit(),
-              "incorrect backend batch count");
+               "incorrect backend batch count");
+      require(result.backend_pin_wall_ns > 0,
+              "backend pin subinterval was not measured");
       for (size_t i = 0; i < ids.size(); ++i) {
         require(result.present[i] == (ids[i] != UINT32_MAX),
                 "batch presence mismatch");

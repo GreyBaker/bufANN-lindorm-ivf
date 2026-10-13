@@ -408,7 +408,7 @@ void BufferPool::init(uint32_t page_size, uint32_t num_frames,
                            __FUNCSIG__, __FILE__, __LINE__);
     }
     auto linux_reader = std::make_unique<LinuxAlignedFileReader>();
-    linux_reader->use_external_fd(_heap_fd);
+    linux_reader->use_external_fd(_heap_fd, true);
     _aio_reader = std::move(linux_reader);
     if (truncate_heap) {
         _total_pages.store(0, std::memory_order_release);
@@ -548,11 +548,31 @@ uint64_t thread_page_access_count() { return t_page_accesses; }
 uint64_t thread_physical_reads_count() { return t_phys_reads; }
 
 void BufferPool::read_page(uint32_t page_id, char* buf) {
-    ssize_t n = ::pread(_heap_fd, buf, _page_size,
-                        (off_t)page_id * _page_size);
-    if (n < 0) n = 0;
-    if ((size_t)n < _page_size) {
-        memset(buf + n, 0, _page_size - n);
+    check_io_failure();
+    const uint64_t offset = uint64_t(page_id) * _page_size;
+    ssize_t n = -1;
+    int error = EINVAL;
+    if (reinterpret_cast<uintptr_t>(buf) % 4096 == 0 &&
+        offset % 4096 == 0 && _page_size % 4096 == 0) {
+        do {
+            n = ::pread(_heap_fd, buf, _page_size, static_cast<off_t>(offset));
+            error = n < 0 ? errno : 0;
+        } while (n < 0 && error == EINTR);
+    }
+    if (n != static_cast<ssize_t>(_page_size)) {
+        // grow_heap extends the file before publishing its new pages. Sparse
+        // new pages return a full zero page; EOF/short I/O is not that case.
+        // Never retry an unaligned suffix or manufacture coordinate bytes.
+        try {
+            throw std::runtime_error("BufferPool page read failed: page_id=" +
+                std::to_string(page_id) + " offset=" + std::to_string(offset) +
+                " requested=" + std::to_string(_page_size) + " actual=" +
+                std::to_string(n) + " errno=" + std::to_string(error) +
+                " (" + std::string(std::strerror(error)) + ")");
+        } catch (...) {
+            record_io_failure(std::current_exception());
+            throw;
+        }
     }
     ++t_phys_reads;
 }
@@ -636,8 +656,8 @@ uint32_t BufferPool::evict_one(ShardState& shard, FrameRegion preferred,
         }
         f.page_id.store(INVALID_PAGE, std::memory_order_release);
         f.generation.fetch_add(1, std::memory_order_acq_rel);
-        f.pin_count.store(0, std::memory_order_release);
-        f.update_pin_count.store(0, std::memory_order_release);
+        // Do not reset counters: a stale residency lookup may still take and
+        // undo an optimistic pin after the drain check. Preserve that pair.
         f.ref_bit.store(0, std::memory_order_release);
         store_frame_state(f, FrameState::LOADING);
         if (was_dirty) {
@@ -828,41 +848,56 @@ PageFrame& BufferPool::pin(uint32_t page_id, FrameRegion hint) {
             used_eviction = evicted;
         }
 
+        // Initialize the loader before publishing its page-table entry. Use
+        // additive ownership to preserve late failed optimistic pin pairs.
+        const auto frame_setup_begin = std::chrono::steady_clock::now();
+        auto& f = _frames[frame_idx];
+        f.page_id.store(page_id, std::memory_order_release);
+        f.pin_count.fetch_add(1, std::memory_order_acq_rel);
+        if (hint != FrameRegion::QUERY)
+            f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
+        f.dirty.store(false, std::memory_order_release);
+        f.ref_bit.store(1, std::memory_order_release);
+        local_frame_setup_ns += elapsed_ns(frame_setup_begin);
         // Step 2: atomically insert into page_table.
         // If another thread beat us to this page_id, release our frame and retry.
         const auto page_table_begin = std::chrono::steady_clock::now();
-        bool we_won = shard.page_table.lazy_emplace_l(page_id,
-            [&](auto& kv) {
-                // Key already exists — another thread is loading page_id.
-                auto& claimed_f = _frames[frame_idx];
-                claimed_f.page_id.store(INVALID_PAGE, std::memory_order_release);
-                store_frame_state(claimed_f, FrameState::FREE);
-                loading_idx = kv.second;
-            },
-            [&](auto&& ctor) {
-                // Key not found — insert our (page_id, frame_idx) entry.
-                ctor(std::piecewise_construct,
-                     std::make_tuple(page_id),
-                     std::make_tuple(frame_idx));
-            });
+        bool we_won;
+        try {
+            we_won = shard.page_table.lazy_emplace_l(page_id,
+                [&](auto& kv) {
+                    // Key already exists — another thread is loading page_id.
+                    auto& claimed_f = _frames[frame_idx];
+                    unpin_frame(&claimed_f, false, hint);
+                    claimed_f.page_id.store(INVALID_PAGE, std::memory_order_release);
+                    store_frame_state(claimed_f, FrameState::FREE);
+                    loading_idx = kv.second;
+                },
+                [&](auto&& ctor) {
+                    // Key not found — insert our (page_id, frame_idx) entry.
+                    ctor(std::piecewise_construct,
+                         std::make_tuple(page_id),
+                         std::make_tuple(frame_idx));
+                });
+        } catch (...) {
+            record_io_failure(std::current_exception());
+            unpin_frame(&f, false, hint);
+            throw;
+        }
         local_page_table_ns += elapsed_ns(page_table_begin);
         // lazy_emplace_l returns true when key was NOT present (we inserted it).
         if (!we_won) continue;
 
-        // Step 3: set frame metadata — frame is ours (LOADING state, not visible to others yet).
-        const auto frame_setup_begin = std::chrono::steady_clock::now();
-        auto& f = _frames[frame_idx];
-        f.page_id.store(page_id, std::memory_order_release);
-        f.pin_count.store(1, std::memory_order_release);
-        f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
-                                 std::memory_order_release);
-        f.dirty.store(false, std::memory_order_release);
-        f.ref_bit.store(1, std::memory_order_release);
-        local_frame_setup_ns += elapsed_ns(frame_setup_begin);
-
         // Step 4: read page from disk — no lock held.
         auto io_begin = std::chrono::high_resolution_clock::now();
-        read_page(page_id, f.data);
+        try {
+            read_page(page_id, f.data);
+        } catch (...) {
+            // The pool is terminal and waiters were notified by read_page.
+            // Leave the failed frame non-READY, but release our ownership pin.
+            unpin_frame(&f, false, hint);
+            throw;
+        }
         auto io_end = std::chrono::high_resolution_clock::now();
         if (_stats) {
             const uint64_t page_in_ns = static_cast<uint64_t>(
@@ -915,10 +950,10 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
 
     // Lazy thread registration (PipeANN pattern). Hard-fail if io_setup fails.
     IOContext bad = (IOContext)(-1);
-    IOContext ctx = _aio_reader->get_ctx();
+    IOContext ctx = _aio_reader->get_ctx_copy();
     if (ctx == bad) {
         _aio_reader->register_thread();
-        ctx = _aio_reader->get_ctx();
+        ctx = _aio_reader->get_ctx_copy();
     }
     if (ctx == bad) {
         throw std::runtime_error(
@@ -962,6 +997,7 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
             while (true) {
                 check_io_failure();
                 PageFrame *hit_frame = nullptr;
+                PageFrame *wait_frame = nullptr;
                 uint32_t loading_idx = INVALID_PAGE;
                 shard.page_table.if_contains(page_id, [&](const auto &kv) {
                     auto &f = _frames[kv.second];
@@ -977,6 +1013,13 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                             publish_resident_frame(page_id, kv.second);
                         }
                         hit_frame = &f;
+                    } else if (st == FrameState::LOADING &&
+                               f.page_id.load(std::memory_order_acquire) == page_id) {
+                        // Retain the waiter pin while still under the page-table
+                        // lock. Dropping then reacquiring outside it permits the
+                        // completed frame to be evicted/reused in that gap.
+                        wait_frame = &f;
+                        loading_idx = kv.second;
                     } else {
                         if (hint != FrameRegion::QUERY) {
                             f.update_pin_count.fetch_sub(1, std::memory_order_acq_rel);
@@ -990,35 +1033,57 @@ void BufferPool::pin_batch(const uint32_t* page_ids, PageFrame** out_frames,
                     classified = u + 1;
                     break;
                 }
-                if (loading_idx != INVALID_PAGE) {
-                    // Another thread is loading this page; take a pin and wait later.
-                    auto &f = _frames[loading_idx];
-                    f.pin_count.fetch_add(1, std::memory_order_acq_rel);
-                    if (hint != FrameRegion::QUERY) {
-                        f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
-                    }
-                    entries[u] = Entry{&f, loading_idx, K_WAIT_OTHER, false};
+                if (wait_frame) {
+                    entries[u] = Entry{wait_frame, loading_idx, K_WAIT_OTHER, false};
                     classified = u + 1;
                     break;
+                }
+                if (loading_idx != INVALID_PAGE) {
+                    // Do not retain an UPDATE pin while waiting for FLUSHING:
+                    // the flusher may itself be draining update pins. Reclassify
+                    // the original page after the wait; the frame can change
+                    // identity while we do not own a pin on it.
+                    auto* waiter = _frame_waiters[loading_idx].get();
+                    std::unique_lock<std::mutex> wait_lk(waiter->mtx);
+                    waiter->cv.wait(wait_lk, [this, &f = _frames[loading_idx], hint] {
+                        if (_io_failed.load(std::memory_order_acquire)) return true;
+                        const auto state = load_frame_state(f);
+                        return state != FrameState::LOADING &&
+                               (state != FrameState::FLUSHING ||
+                                frame_state_allows_pin(f, state, hint));
+                    });
+                    continue;
                 }
                 // Slow path: claim a frame, race to insert.
                 bool used_eviction = false;
                 uint32_t frame_idx = evict_one(shard, hint, &used_eviction);
-                bool we_won = shard.page_table.lazy_emplace_l(page_id, [&](auto & /*kv*/) {
-                    auto& claimed_f = _frames[frame_idx];
-                    claimed_f.page_id.store(INVALID_PAGE, std::memory_order_release);
-                    store_frame_state(claimed_f, FrameState::FREE); }, [&](auto &&ctor) { ctor(std::piecewise_construct,
-                                                                                                                       std::make_tuple(page_id),
-                                                                                                                       std::make_tuple(frame_idx)); });
-                if (!we_won)
-                    continue;
                 auto &f = _frames[frame_idx];
                 f.page_id.store(page_id, std::memory_order_release);
-                f.pin_count.store(1, std::memory_order_release);
-                f.update_pin_count.store(hint == FrameRegion::QUERY ? 0u : 1u,
-                                         std::memory_order_release);
+                f.pin_count.fetch_add(1, std::memory_order_acq_rel);
+                if (hint != FrameRegion::QUERY)
+                    f.update_pin_count.fetch_add(1, std::memory_order_acq_rel);
                 f.dirty.store(false, std::memory_order_release);
                 f.ref_bit.store(1, std::memory_order_release);
+                bool we_won;
+                try {
+                    we_won = shard.page_table.lazy_emplace_l(page_id,
+                        [&](auto& /*kv*/) {
+                            auto& claimed_f = _frames[frame_idx];
+                            unpin_frame(&claimed_f, false, hint);
+                            claimed_f.page_id.store(INVALID_PAGE, std::memory_order_release);
+                            store_frame_state(claimed_f, FrameState::FREE);
+                        },
+                        [&](auto&& ctor) {
+                            ctor(std::piecewise_construct,
+                                 std::make_tuple(page_id),
+                                 std::make_tuple(frame_idx));
+                        });
+                } catch (...) {
+                    unpin_frame(&f, false, hint);
+                    throw;
+                }
+                if (!we_won)
+                    continue;
                 // State is LOADING (set by evict_one's finish_evict path).
                 entries[u] = Entry{&f, frame_idx, K_MISS_OURS, used_eviction};
                 classified = u + 1;
