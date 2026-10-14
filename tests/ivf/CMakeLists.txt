@@ -36,6 +36,10 @@ if(IVF_BUILD_CONTRACT_TESTS)
     target_link_libraries(ivf_insert_input_tests PRIVATE ivf_numeric_policy Threads::Threads)
     add_test(NAME ivf_insert_input COMMAND ivf_insert_input_tests)
     set_tests_properties(ivf_insert_input PROPERTIES TIMEOUT 30)
+    add_executable(ivf_query_warmup_tests ivf_query_warmup_tests.cpp)
+    target_link_libraries(ivf_query_warmup_tests PRIVATE ivf_numeric_policy Threads::Threads)
+    add_test(NAME ivf_query_warmup COMMAND ivf_query_warmup_tests)
+    set_tests_properties(ivf_query_warmup PROPERTIES TIMEOUT 30)
     add_executable(ivf_driver_progress_tests ivf_driver_progress_tests.cpp)
     target_link_libraries(ivf_driver_progress_tests PRIVATE Threads::Threads)
     add_test(NAME ivf_driver_progress COMMAND ivf_driver_progress_tests)
@@ -227,6 +231,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
                          --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
                          --scratch "${CMAKE_CURRENT_BINARY_DIR}/insert_policy_fixtures")
         set_tests_properties(ivf_insert_input_policy PROPERTIES TIMEOUT 240)
+        add_test(NAME ivf_query_warmup_cli
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_warmup.py"
+                         --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/warmup_fixtures")
+        set_tests_properties(ivf_query_warmup_cli PROPERTIES TIMEOUT 240)
         add_test(NAME ivf_parallel_list_build
                  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_list_parallel_build.py"
                          --build $<TARGET_FILE:ivf_build>

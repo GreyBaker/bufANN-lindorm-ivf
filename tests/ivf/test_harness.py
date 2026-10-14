@@ -220,6 +220,16 @@ def main():
             (0, 0.0),
             (2, 0.0),
         ]
+        warmed_env = dict(env, IVF_RUN_TAG="centroid_warmup", IVF_WARMUP_QUERIES="5")
+        run(query, warmed_env)
+        warmed = json.loads((work / "runs/centroid_warmup/result.json").read_text())
+        protocol = json.loads((work / "runs/centroid_warmup/execution_protocol.json").read_text())
+        assert warmed["query_count"] == record["query_count"] and warmed["explicit_warmup_query_count"] == 5
+        assert warmed["recall"] == record["recall"]
+        assert (work / "runs/centroid_warmup/neighbors.bin").read_bytes() == (work / "neighbors.bin").read_bytes()
+        assert protocol["explicit_warmup_query_count"] == 5
+        assert protocol["application_cache_transfer_between_driver_processes"] is False
+        assert "inside_query_driver_same_index_object" in protocol["warmup_process_policy"]
         before = checksum(work / "result.json")
         run(query, env, False)
         run(prepare, env, False)

@@ -98,6 +98,12 @@ def insertion_input_policy():
     return policy
 
 
+def warmup_queries():
+    value = int(os.environ.get("IVF_WARMUP_QUERIES", "0"))
+    require(0 <= value <= 100000, "IVF_WARMUP_QUERIES must be in [0, 100000]")
+    return str(value)
+
+
 def validate_insertion_staging(resources, rows, dim, dtype):
     """Lower bound only: native composed row/worker/list admission is authoritative."""
     validate_resources(resources)

@@ -10,7 +10,7 @@ import struct
 import sys
 from common import command_log, digest, header, query_truth_shapes, read_json, require, write_json
 from harness import component_digests, prepare as prepare_base
-from settings import prepared_selection, profile, query_router_flags, runtime_resources
+from settings import prepared_selection, profile, query_router_flags, runtime_resources, warmup_queries
 
 
 def counted_identity(path, first, count):
@@ -111,6 +111,7 @@ def run(args):
     w = args.work_dir.resolve()
     base = read_json(w / "prepared.json")
     resources = runtime_resources(base["settings"]["page_size"])
+    query_warmups = warmup_queries()
     path = w / "mixed_prepared.json"
     require(path.stat().st_size <= 8 << 20, "oversized mixed preparation metadata")
     prepared = json.loads(path.read_text())
@@ -219,8 +220,11 @@ def run(args):
         if args.query_count is not None:
             command += ["--query_count", str(args.query_count)]
         command += query_router_flags()
+        command += ["--warmup_queries", query_warmups]
         command_log(command, dest / "run.log")
         record = read_json(dest / "native_result.json")
+        require(record["explicit_warmup_query_count"] == int(query_warmups),
+                "native mixed final-pass warmup completion count mismatch")
         require(
             record["workload"] == "mixed"
             and record["insert_count"] == args.insert_cap

@@ -135,7 +135,8 @@ def main():
             assert json.loads((work / "mixed_prepared.json").read_text())["rounds"] == 2
             initial = {p: digest(p) for p in (work / "index").iterdir()}
             for scheduler in ("weighted", "fixed_8_8"):
-                env.update(IVF_SCHEDULER=scheduler, IVF_RUN_TAG=scheduler)
+                warmups = 3 if scheduler == "weighted" else 0
+                env.update(IVF_SCHEDULER=scheduler, IVF_RUN_TAG=scheduler, IVF_WARMUP_QUERIES=str(warmups))
                 run(execute, env)
                 output = work / "runs" / scheduler
                 summary = json.loads((output / "summary.json").read_text())
@@ -148,6 +149,9 @@ def main():
                     dest = output / f"rounds/round_{r}"
                     record = json.loads((dest / "result.json").read_text())
                     assert record == json.loads((dest / "native_result.json").read_text())
+                    assert record["explicit_warmup_query_count"] == warmups
+                    assert record["query_count"] == len(queries)
+                    assert "no_reopen" in record["query_cache_process_policy"]
                     assert (
                         record["insert_count"] == record["delete_count"] == 8
                         and record["live_count"] == 48

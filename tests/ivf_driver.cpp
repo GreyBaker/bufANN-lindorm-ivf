@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
                              "--gt_file",
                              "--recall_at",
                              "--query_threads",
+                             "--warmup_queries",
                              "--insert_threads",
                              "--insert_input_policy",
                              "--nlist",
@@ -55,6 +56,8 @@ int main(int argc, char** argv) {
              "search_only|insert_only|delete_only|search_after_update|mixed\n"
              "  [--pq_prefix PATH] [--gt_file PATH] [--recall_at N] "
              "[--query_threads N]\n"
+             "  [--warmup_queries 0..100000] (default 0, frozen base-centroid "
+             "inputs; no GT)\n"
              "  [--nprobe N] [--rerank_factor F] [--metric l2]\n"
              "  [--full_data_file PATH --insert_ids_file PATH "
              "--delete_ids_file PATH]\n"
@@ -117,7 +120,7 @@ int main(int argc, char** argv) {
          "--checkpoint_prefix", "--scheduler", "--pool_threads",
          "--query_ratio", "--query_count", "--scheduler_seed", "--router_mode",
          "--router_rerank_factor", "--router_breadth", "--insert_threads",
-         "--insert_input_policy"},
+         "--insert_input_policy", "--warmup_queries"},
         "execution-only setting");
     const auto     type = parse_data_type(args.get("--data_type", "float"));
     const uint32_t dim = args.u32("--dim");

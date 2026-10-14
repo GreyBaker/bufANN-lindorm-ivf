@@ -154,6 +154,7 @@ def main():
         run(driver + ["--workload", "search_after_update"], False)
         run(driver + ["--workload", "insert_only", "--insert_threads", "2"], False)
         run(driver + ["--workload", "insert_only", "--insert_input_policy", "staged"], False)
+        run(driver + ["--workload", "search_only", "--warmup_queries", "1"], False)
         for flag, value in (
             ("--scheduler", "fixed_8_8"),
             ("--query_count", "8"),

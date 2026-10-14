@@ -206,6 +206,25 @@ class SharedOrchestrationTests(unittest.TestCase):
             launch.assert_not_called()
             self.assertFalse(args.output_dir.exists())
 
+    def test_independent_warmup_setting_and_preflight(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.warmup_queries(), "0")
+            for value in ("0", "1", "100000"):
+                os.environ["IVF_WARMUP_QUERIES"] = value
+                self.assertEqual(settings.warmup_queries(), value)
+            for value in ("-1", "100001", "1.5", "invalid"):
+                os.environ["IVF_WARMUP_QUERIES"] = value
+                with self.assertRaises(ValueError):
+                    settings.warmup_queries()
+        common.write_json(self.root / "prepared.json", {"settings": {"page_size": "4096"}})
+        args = argparse.Namespace(work_dir=self.root, workload="query", output_dir=self.root / "runs")
+        for execute in (harness.run, mixed.run):
+            with patch.dict(os.environ, {"IVF_WARMUP_QUERIES": "100001"}, clear=True), \
+                 patch.object(common.subprocess, "Popen") as launch, self.assertRaisesRegex(ValueError, "IVF_WARMUP_QUERIES"):
+                execute(args)
+            launch.assert_not_called()
+            self.assertFalse(args.output_dir.exists())
+
     @unittest.skipUnless(sys.platform == "linux", "quickstart gate executes in Bash")
     def test_quickstart_gt_gate_stops_preparation(self):
         text = (Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md").read_text()

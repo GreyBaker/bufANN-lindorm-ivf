@@ -5,6 +5,7 @@
 #include "ivf_driver_progress.h"
 #include "ivf_insert_workload.h"
 #include "ivf_insert_input.h"
+#include "ivf_query_warmup.h"
 #include <omp.h>
 #include <mkl_service.h>
 
@@ -1105,6 +1106,8 @@ namespace ivf_cli {
                           args.u32("--query_threads", 1)};
       config.validate(manifest.training.nlist);
       const auto routing = query_routing_request(args, manifest.routing);
+      const auto warmup_requested = args.u32("--warmup_queries", 0);
+      validate_warmup_count(warmup_requested);
       const auto queries =
           inspect_vectors(args.require("--query_file"), type, dim);
       const bool  has_truth = args.has("--gt_file");
@@ -1126,6 +1129,12 @@ namespace ivf_cli {
       add(bytes, workers, 8ull * 1024 * 1024 + sizeof(WorkerStats));
       add(bytes,
           1024 * 1024);  // I/O streams, worker handles and control overhead
+      uint64_t warmup_row_bytes = 0;
+      if (warmup_requested) {
+        add(warmup_row_bytes, dim, sizeof(T));
+        add(warmup_row_bytes, 64);
+        add(bytes, warmup_row_bytes);
+      }
       check(bytes <= budget, "CLI composed search exceeds workspace allowance");
 
       std::ifstream input(args.require("--query_file"), std::ios::binary);
@@ -1155,6 +1164,23 @@ namespace ivf_cli {
           check(bytes <= budget,
                 "CLI post-update search exceeds workspace allowance");
         }
+      }
+      uint32_t warmup_completed = 0;
+      double   warmup_time_s = 0;
+      if (warmup_requested) {
+        DriverProgress warming("base_centroid_warmup", warmup_requested,
+                               "completed_warmup_queries");
+        const auto     warmup_start = Clock::now();
+        warmup_completed = run_centroid_warmup<T>(
+            index->router().centroids(), dim, warmup_requested,
+            [&index, &config, &routing,
+             query_bytes](std::span<const T> vector) {
+              (void) index->query(vector, config,
+                                  {query_bytes, false, routing});
+            },
+            [&](uint64_t completed) { warming.observe(completed); });
+        warmup_time_s = seconds(warmup_start);
+        warming.finish();
       }
       std::vector<uint32_t>    ids(result_count, UINT32_MAX);
       std::vector<float>       distances(result_count,
@@ -1324,16 +1350,45 @@ namespace ivf_cli {
           emit_update(record, first, args, *index, updates,
                       is_mixed ? &mixed : nullptr);
       }
-      emit("explicit_warmup_query_count", 0);
+      emit("explicit_warmup_query_count", warmup_completed);
+      emit("warmup_query_count_requested", warmup_requested);
+      emit("warmup_time_s", warmup_time_s);
+      emit("warmup_row_allowance_bytes", warmup_row_bytes);
+      emit("warmup_policy",
+           warmup_requested ? "frozen_base_centroid_grid_v1" : "none");
+      emit("warmup_source_policy",
+           "frozen_base_trained_centroids_only_not_final_queries_or_truth");
+      emit("warmup_centroid_selection",
+           "floor_i_times_nlist_over_requested_round_away_zero_clamp_integer_"
+           "dtype");
+      emit("warmup_timing_scope",
+           "caller_serial_queries_progress_excluded_from_query_time_included_"
+           "in_driver_workflow");
+      emit("warmup_results_policy",
+           "discarded_not_scored_not_exported_not_in_final_query_stats");
+      emit("warmup_cache_scope",
+           "same_index_object_buffer_pool_router_no_query_worker_tls_"
+           "continuity_claim_no_os_cache_control");
       if constexpr (std::is_same_v<Index, MutableIndex<T>>)
-        emit("query_cache_process_policy",
-             updating ? "same_process_live_mutable_session_after_checkpoint_no_"
-                        "reopen_no_explicit_warmup"
-                      : "private_mutable_copy_opened_in_this_process_no_"
-                        "explicit_warmup");
+        emit(
+            "query_cache_process_policy",
+            warmup_requested
+                ? (updating ? "same_process_live_mutable_session_after_"
+                              "checkpoint_no_reopen_frozen_base_centroid_warmup"
+                            : "private_mutable_copy_opened_in_this_process_"
+                              "frozen_base_centroid_warmup")
+            : updating
+                ? "same_process_live_mutable_session_after_checkpoint_no_"
+                  "reopen_no_explicit_warmup"
+                : "private_mutable_copy_opened_in_this_process_no_"
+                  "explicit_warmup");
       else
-        emit("query_cache_process_policy",
-             "immutable_bundle_opened_in_this_process_no_explicit_warmup");
+        emit(
+            "query_cache_process_policy",
+            warmup_requested
+                ? "immutable_bundle_opened_in_this_process_frozen_base_"
+                  "centroid_warmup"
+                : "immutable_bundle_opened_in_this_process_no_explicit_warmup");
       emit("cache_state_claim",
            "open_validation_may_touch_pages_os_cache_not_controlled");
       emit("driver_workflow_time_s", seconds(workflow_start));
@@ -1352,6 +1407,12 @@ namespace ivf_cli {
                 workload == "delete_only" ||
                 workload == "search_after_update" || mixed,
             "Unsupported native workload");
+      if (args.has("--warmup_queries")) {
+        check(workload == "search_only" || workload == "search_after_update" ||
+                  mixed,
+              "warmup_queries only applies to query-producing workloads");
+        validate_warmup_count(args.u32("--warmup_queries"));
+      }
       if (args.has("--insert_threads")) {
         check(workload == "insert_only" || workload == "search_after_update",
               "insert_threads only applies to sequential insertion workloads");

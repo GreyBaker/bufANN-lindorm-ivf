@@ -37,6 +37,7 @@ from settings import (
     insertion_threads,
     insertion_input_policy,
     validate_insertion_staging,
+    warmup_queries,
 )
 
 SUFFIXES = (
@@ -278,6 +279,7 @@ def run(args):
     mutation_resources = (runtime_resources(prepared["settings"]["page_size"])
                            if args.workload != "query" else None)
     insert_workers = insertion_threads() if args.workload == "insert" else None
+    query_warmups = warmup_queries()
     insert_policy = insertion_input_policy() if args.workload == "insert" else None
     if insert_policy == "staged":
         validate_insertion_staging(mutation_resources, args.update_count, args.dim, args.dtype)
@@ -444,6 +446,7 @@ def run(args):
     if mutation is not None:
         command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
     command += query_router_flags()
+    command += ["--warmup_queries", query_warmups]
     query_start = time.monotonic()
     command_log(command, output / "run.log")
     query_process_wall_s = time.monotonic() - query_start
@@ -455,6 +458,8 @@ def run(args):
         and "recall" in record,
         "missing canonical native query record",
     )
+    require(record["explicit_warmup_query_count"] == int(query_warmups),
+            "native warmup completion count differs from requested policy")
     write_json(output / "execution_protocol.json", {
         "version": 1,
         "kind": "ivf_sequential_harness_execution_protocol",
@@ -466,7 +471,10 @@ def run(args):
             "mutation_driver_verified_checkpoint_then_separate_query_driver_private_copy"
             if mutation is not None else "standalone_query_driver"),
         "application_cache_transfer_between_driver_processes": False,
-        "explicit_warmup_query_count": 0,
+        "warmup_query_count_requested": int(query_warmups),
+        "explicit_warmup_query_count": record["explicit_warmup_query_count"],
+        "warmup_policy": record["warmup_policy"],
+        "warmup_process_policy": "inside_query_driver_same_index_object_frozen_base_centroids_not_transferred_from_mutation_driver",
         "os_cache_policy": "not_controlled_validation_hash_and_copy_may_touch_pages",
         "mutation_process_wall_s": mutation_process_wall_s,
         "query_process_wall_s": query_process_wall_s,
