@@ -1,4 +1,6 @@
 #include "bufann/ivf_cost_model.h"
+#include "bufann/ivf_numeric_internal.h"
+#include "ivf_random_internal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,14 +21,6 @@ namespace diskann::ivf {
       check(!b || a <= UINT64_MAX / b, "Cost-model work/size overflow");
       return a * b;
     }
-    uint32_t bounded(std::mt19937_64& rng, uint64_t bound) {
-      const auto threshold = (uint64_t(0) - bound) % bound;
-      uint64_t   value;
-      do {
-        value = rng();
-      } while (value < threshold);
-      return static_cast<uint32_t>(value % bound);
-    }
   }  // namespace
   CalibrationSplit sample_calibration_rows(uint32_t base_count,
                                            uint32_t sample_count,
@@ -42,12 +36,12 @@ namespace diskann::ivf {
     std::iota(ids.begin(), ids.end(), 0);
     std::mt19937_64 rng(seed);
     for (uint32_t r = static_cast<uint32_t>(count); r < base_count; ++r) {
-      const auto slot = bounded(rng, uint64_t(r) + 1);
+      const auto slot = detail::bounded_random(rng, uint64_t(r) + 1);
       if (slot < count)
         ids[slot] = r;
     }
     for (uint32_t r = 0; r < count; ++r)
-      std::swap(ids[r], ids[r + bounded(rng, count - r)]);
+      std::swap(ids[r], ids[r + detail::bounded_random(rng, count - r)]);
     CalibrationSplit result;
     result.sample_ids.assign(ids.begin(), ids.begin() + sample_count);
     result.query_ids.assign(ids.begin() + sample_count, ids.end());
@@ -82,12 +76,9 @@ namespace diskann::ivf {
     for (uint32_t q = 0; q < query_count; ++q) {
       std::priority_queue<Hit> best;
       for (uint32_t r = 0; r < rows; ++r) {
-        double distance = 0;
-        for (uint32_t d = 0; d < dim; ++d) {
-          const double delta = double(queries[size_t(q) * dim + d]) -
-                               samples[size_t(r) * dim + d];
-          distance += delta * delta;
-        }
+        const double distance = detail::squared_l2_double_unchecked(
+            queries.data() + size_t(q) * dim,
+            samples.data() + size_t(r) * dim, dim);
         check(std::isfinite(distance), "Nonfinite calibration GT distance");
         const Hit hit{distance, r};
         if (best.size() < topk)

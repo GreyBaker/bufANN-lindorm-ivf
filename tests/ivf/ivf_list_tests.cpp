@@ -140,6 +140,19 @@ namespace {
     for (uint32_t r = 0; r < 20; ++r)
       require(tied.candidates[r] == PQCandidate{r + 5, 3},
               "ADC ties not stable by ID");
+    // Each +1 rounds away in float. Double accumulation or regrouping would
+    // produce 16777218 instead, even though all lookup values are finite.
+    std::fill_n(table.begin(), 256, 16777216.0f);
+    for (uint32_t budget : {1u, 20u, 200u}) {
+      const auto rounded = lists.scan(all, table, budget);
+      require(rounded.scanned_codes == base &&
+                  rounded.candidates.size() == std::min(budget, base),
+              "rounding scan changed population/budget");
+      for (uint32_t r = 0; r < rounded.candidates.size(); ++r)
+        require(rounded.candidates[r] == PQCandidate{r + 5, 16777216.0f},
+                "immutable ADC changed float chunk-order rounding/ID ties");
+    }
+    std::fill(table.begin(), table.end(), 1);
     const auto saved = root / "lists.bin";
     lists.save(saved.string());
     auto loaded = PostingLists::load(saved.string());

@@ -9,7 +9,7 @@ import struct
 import subprocess
 import tempfile
 
-from test_cli import write_pivots
+from ivf_test_support import write_matrix, write_pivots, write_truth
 
 
 def run(script, env, success=True):
@@ -450,12 +450,8 @@ def main():
                 root / (dataset + suffix) for suffix in (".bin", ".query", ".gt")
             )
             query_rows = [rows[3], rows[2]]
-            typed_data.write_bytes(
-                struct.pack("<II12" + fmt, 4, 3, *(v for row in rows for v in row))
-            )
-            typed_query.write_bytes(
-                struct.pack("<II6" + fmt, 2, 3, *(v for row in query_rows for v in row))
-            )
+            write_matrix(typed_data, rows, fmt)
+            write_matrix(typed_query, query_rows, fmt)
             exact = [
                 sorted(
                     [(i, sum((a - b) ** 2 for a, b in zip(q, row))) for i, row in enumerate(rows)],
@@ -463,11 +459,7 @@ def main():
                 )
                 for q in query_rows
             ]
-            typed_deep.write_bytes(
-                struct.pack("<II", 2, 4)
-                + b"".join(struct.pack("<I", vid) for row in exact for vid, _ in row)
-                + b"".join(struct.pack("<f", distance) for row in exact for _, distance in row)
-            )
+            write_truth(typed_deep, exact)
             typed_profile = profiles / (dataset + ".sh")
             typed_profile.write_text(
                 "\n".join(

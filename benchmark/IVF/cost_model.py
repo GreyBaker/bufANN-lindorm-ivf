@@ -9,9 +9,11 @@ import sys
 from common import (
     affinity,
     digest,
+    digests,
     execute,
     flags,
     require,
+    require_absent,
     runtime_environment,
     shared_module_paths,
     write_json,
@@ -37,7 +39,7 @@ def main():
     root, tool, data, pq = (
         p.resolve() for p in (args.output, args.tool, args.data, args.pq_prefix)
     )
-    require(not root.exists(), f"calibration output exists: {root}")
+    require_absent(root, f"calibration output exists: {root}")
     require(tool.is_file() and os.access(tool, os.X_OK), "missing native cost-model tool")
     paths = {
         "data": data,
@@ -53,7 +55,7 @@ def main():
         library = tool.parent.parent / "src" / name
         if library.is_file():
             paths[name] = library
-    identities = {key: digest(path) for key, path in paths.items()}
+    identities = digests(paths)
     settings = {key: getattr(args, key) for key in defaults}
     cpu = affinity(args.cpus)
     root.mkdir(parents=True)
@@ -86,7 +88,7 @@ def main():
         "native calibration did not choose an eligible candidate",
     )
     require(
-        identities == {key: digest(path) for key, path in paths.items()},
+        identities == digests(paths),
         "calibration input/tool changed",
     )
     # Freeze actual sample, queries, GT, routers and memberships, not just seeds.

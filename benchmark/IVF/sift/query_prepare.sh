@@ -9,18 +9,9 @@ source "$REPO_DIR/benchmark/IVF/common.sh"
 ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing pivots plus full-source PQ codes}"
 [[ -f "$DATA_BIN" && -f "$QUERY_BIN" ]] || error "stage the configured .bin inputs first"
-[[ ! -e "$WORK_DIR" && ! -L "$WORK_DIR" ]] || error "work tree already exists; preserve it or choose a fresh EVAL_TEMPFILES root"
-safe_mutable_path "$WORK_DIR" >/dev/null
-mkdir -p "$(dirname "$WORK_DIR")"
-mkdir "$WORK_DIR" # exclusive ownership; keep partial work on failure
-link_dataset_files "$WORK_DIR"
+ivf_prepare_work_dir
 GT_FILE="$WORK_DIR/groundtruth/${DATASET}_${NPTS_BASE}_gt${RECALL_AT}.bin"
-if [[ -n "${IVF_GT_FILE:-}" ]]; then
-    [[ -f "$IVF_GT_FILE" ]] || error "missing supplied base GT: $IVF_GT_FILE"
-    ln -s "$(readlink -f "$IVF_GT_FILE")" "$GT_FILE"
-else
-    resolve_incremental_gt "$GT_FILE" "$RECALL_AT" --base_trunc "$NPTS_BASE"
-fi
+ivf_stage_prefix_truth "$GT_FILE" "$RECALL_AT" "$NPTS_BASE"
 ivf_profile_args
 python3 "$REPO_DIR/benchmark/IVF/harness.py" prepare "${PROFILE_ARGS[@]}" \
     --pq-prefix "$IVF_PQ_PREFIX" --query "$WORK_DIR/data/query.bin" --truth "$GT_FILE" \

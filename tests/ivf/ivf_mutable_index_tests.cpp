@@ -121,6 +121,55 @@ namespace {
         std::filesystem::copy_file(from + suffix, to + suffix);
     std::filesystem::copy_file(from + ".manifest", to + ".manifest");
   }
+  template<typename T>
+  void manifest_framing_fixtures(const std::filesystem::path& root,
+                                 const std::string& checkpoint, bool native) {
+    for (bool origin : {false, true})
+      for (uint32_t edit = 0; edit < (native ? 3u : 2u); ++edit) {
+        const auto bad =
+            (root / (std::string(origin ? "origin" : "mutable") +
+                     " framing " + std::to_string(edit)))
+                .string();
+        copy_checkpoint(checkpoint, bad);
+        const auto path = bad + (origin ? ".origin" : ".manifest");
+        std::ifstream input(path, std::ios::binary);
+        std::string   text((std::istreambuf_iterator<char>(input)), {});
+        input.close();
+        if (edit == 0)
+          text += "unexpected trailing token\n";
+        else {
+          const std::string a =
+              edit == 1 ? index_component_suffixes[0] : native_router_suffixes[0];
+          const std::string b =
+              edit == 1 ? index_component_suffixes[1] : native_router_suffixes[1];
+          const auto first = text.find("\n" + a + " ");
+          const auto second = text.find("\n" + b + " ");
+          require(first != std::string::npos && second != std::string::npos &&
+                      first < second,
+                  "Missing ordered manifest fixture fields");
+          // Swap labels only: a parser must require suffix order, not merely
+          // accept a set of known fields or rely on later digest checks.
+          text.replace(second + 1, b.size(), a);
+          text.replace(first + 1, a.size(), b);
+        }
+        {
+          std::ofstream output(path, std::ios::binary);
+          output << text;
+          output.close();
+          require(bool(output), "Manifest framing fixture write failed");
+        }
+        if (origin)
+          rehash_manifest(bad);  // Exercise inner framing, not its outer hash.
+        const auto output = bad + ".private.heap";
+        rejects([&] { MutableIndex<T>::reopen(bad, output, {2}); },
+                edit != 0 ? "Invalid IVF manifest field"
+                          : (origin ? "Trailing IVF manifest data"
+                                    : "Trailing mutable IVF manifest data"));
+        require(!std::filesystem::exists(output) &&
+                    !std::filesystem::exists(output + ".pq.bin"),
+                "Manifest framing refusal claimed private copy artifacts");
+      }
+  }
   // Restrict only this fixture process, and restore even when a check throws.
   // Growth fixtures have no dirty pages; output-copy fixtures have a clean
   // source.
@@ -692,6 +741,8 @@ namespace {
     for (size_t i = 0; i < checkpoint_identity.size(); ++i)
       checkpoint_identity[i] =
           artifact_digest(checkpoint + mutable_component_suffixes[i]);
+    require(artifact_digest(checkpoint + ".origin") == source_identity.back(),
+            "Checkpoint origin reserialization changed manifest bytes");
     auto reopened = MutableIndex<T>::reopen(
         checkpoint, (root / "reopened live.heap").string(), {2});
     std::vector<ExactHit> checkpoint_oracle;
@@ -757,6 +808,7 @@ namespace {
                   checkpoint_identity[i],
               "continued mutation modified checkpoint family");
     if constexpr (std::is_same_v<T, float>) {
+      manifest_framing_fixtures<T>(root, checkpoint, routing.native_modes);
       uint32_t corruption = 0;
       auto     bad_case = [&](auto edit, bool preflight = false) {
         const auto bad =
@@ -883,7 +935,8 @@ namespace {
       {
         RefuseFileGrowth refuse(
             4096);  // Router/lists succeed; the new heap copy fails.
-        rejects([&] { index->checkpoint(failed_output); });
+        rejects([&] { index->checkpoint(failed_output); },
+                "Mutable IVF heap copy write failure");
       }
       require(!index->failed() && index->query(query, config).hits == oracle(),
               "checkpoint output failure poisoned/changed healthy session");

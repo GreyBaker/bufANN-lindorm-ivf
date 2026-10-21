@@ -8,22 +8,7 @@ import struct
 import subprocess
 
 
-def write_pivots(path):
-    dim = 3
-    blocks = [
-        struct.pack("<II", 256, dim) + struct.pack("<768f", *([0.0] * 768)),
-        struct.pack("<II3f", dim, 1, 1.0, 2.0, 3.0),
-        struct.pack("<II3I", dim, 1, 0, 1, 2),
-        struct.pack("<II3I", 3, 1, 0, 1, 3),
-    ]
-    offsets = [4096]
-    for block in blocks:
-        offsets.append(offsets[-1] + len(block))
-    with path.open("wb") as out:
-        out.write(struct.pack("<II5Q", 5, 1, *offsets))
-        out.seek(offsets[0])
-        for block in blocks:
-            out.write(block)
+from ivf_test_support import write_ids, write_matrix, write_pivots, write_truth
 
 
 def run(command, succeeds=True):
@@ -61,17 +46,17 @@ def main():
     args.scratch.mkdir(parents=True, exist_ok=True)
     prefix = args.scratch / "fixture"
     write_pivots(Path(str(prefix) + "_pq_pivots.bin"))
-    Path(str(prefix) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 2, 2) + bytes(4))
+    write_matrix(Path(str(prefix) + "_pq_compressed.bin"), [bytes(2)] * 2, "B")
     truth = args.scratch / "truth.bin"
-    truth.write_bytes(struct.pack("<IIIIff", 1, 2, 0, 1, 0.0, 1.0))
+    write_truth(truth, [[(0, 0.0), (1, 1.0)]])
     ids = args.scratch / "ids.bin"
-    ids.write_bytes(struct.pack("<II", 1, 1))
+    write_ids(ids, [1])
 
     for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
         data = args.scratch / f"{dtype}.bin"
-        data.write_bytes(struct.pack("<II6" + fmt, 2, 3, 1, 2, 3, 4, 5, 6))
+        write_matrix(data, [(1, 2, 3), (4, 5, 6)], fmt)
         query = args.scratch / f"{dtype}_query.bin"
-        query.write_bytes(struct.pack("<II3" + fmt, 1, 3, 1, 2, 3))
+        write_matrix(query, [(1, 2, 3)], fmt)
         build = [
             args.build,
             "--validate_inputs",

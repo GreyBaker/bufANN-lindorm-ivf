@@ -240,6 +240,31 @@ print("generator stdout must not contaminate the returned path")
                 self.assertEqual(stdout, "")
                 self.assertEqual(calls, [])
 
+    def test_invalid_plan_is_rejected_before_evidence_directory(self):
+        for extra, error in ((["--base-count", "100"], "require 0 < base"),
+                             (["--insert-count", "5"], "mixed inserts: count must divide rounds"),
+                             (["--k-out", "81"], "K exceeds a declared live population")):
+            with self.subTest(extra=extra):
+                code, stdout, stderr, calls = self.run_manager(extra)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertEqual(calls, [])
+                self.assertIn(error, stderr)
+                self.assertFalse((self.root / ".gt").exists())
+
+    def test_generation_scratch_admission_boundary_precedes_generator_lookup(self):
+        args = manager.parser().parse_args(self.args())
+        args.gt_generator = None
+        for full_count, k, error in ((100, 101, "GT depth exceeds preflight admission"),
+                                     (600000, 524289, "GT depth exceeds preflight admission"),
+                                     (600000, 524288, "GT generator not found")):
+            args.full_count = full_count
+            with self.subTest(full_count=full_count, k=k), \
+                    patch.object(manager.subprocess, "run", side_effect=AssertionError("must reject before generation")), \
+                    self.assertRaisesRegex(ValueError, error):
+                manager.generate(args, self.root / "uncreated", k)
+        self.assertFalse((self.root / "uncreated").exists())
+
     def test_input_changes_prevent_managed_cache_reuse(self):
         first = self.run_manager(["--generate", "--initial-k", "30"])
         self.assertEqual(first[0], 0, first[2])

@@ -217,13 +217,241 @@ class SharedOrchestrationTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     settings.warmup_queries()
         common.write_json(self.root / "prepared.json", {"settings": {"page_size": "4096"}})
-        args = argparse.Namespace(work_dir=self.root, workload="query", output_dir=self.root / "runs")
+        args = argparse.Namespace(work_dir=self.root, workload="insert", output_dir=self.root / "runs")
         for execute in (harness.run, mixed.run):
             with patch.dict(os.environ, {"IVF_WARMUP_QUERIES": "100001"}, clear=True), \
+                 patch.object(harness, "mutation_identity") as mutation_identity, \
+                 patch.object(mixed, "identity") as mixed_identity, \
                  patch.object(common.subprocess, "Popen") as launch, self.assertRaisesRegex(ValueError, "IVF_WARMUP_QUERIES"):
                 execute(args)
             launch.assert_not_called()
+            mutation_identity.assert_not_called()
+            mixed_identity.assert_not_called()
             self.assertFalse(args.output_dir.exists())
+
+    def test_counted_source_ranges_and_compatibility(self):
+        path = self.root / "insert_ids.bin"
+        first, count = 17, 4101
+        raw = struct.pack("<" + "I" * (count + 1), count, *range(first, first + count))
+        path.write_bytes(raw)
+        expected = common.digest(path)
+        self.assertEqual(common.counted_range_identity(path, first, count), expected)
+        self.assertEqual(mixed.counted_identity(path, first, count), expected)
+        (self.root / "data").mkdir()
+        source = self.root / "data/full.bin"
+        source.write_bytes(b"entire source identity, including rows outside the update range")
+        args = argparse.Namespace(workload="insert", update_count=count, base_count=first,
+                                  full_count=first + count)
+        self.assertEqual(harness.mutation_identity(args, self.root), {
+            "workload": "insert", "count": count, "first_id": first,
+            "ids_identity": expected, "source_identity": common.digest(source),
+        })
+        for malformed, message, mixed_message in (
+            (raw[:-1], "framing", "length mismatch"),
+            (raw + b"extra", "framing", "length mismatch"),
+            (struct.pack("<I", count - 1) + raw[4:], "count mismatch", "count mismatch"),
+            # Swap two IDs strictly beyond the first 4096-row validation block.
+            (raw[:4 + 4097 * 4] + raw[4 + 4098 * 4:4 + 4099 * 4]
+             + raw[4 + 4097 * 4:4 + 4098 * 4] + raw[4 + 4099 * 4:],
+             "source-row range", "source-row ranges"),
+        ):
+            path.write_bytes(malformed)
+            with self.subTest(message=message), patch.object(common, "digest") as hash_file:
+                with self.assertRaisesRegex(ValueError, message):
+                    common.counted_range_identity(path, first, count)
+                with self.assertRaisesRegex(ValueError, mixed_message):
+                    mixed.counted_identity(path, first, count)
+                hash_file.assert_not_called()
+
+    def test_absent_destinations_include_dangling_symlinks(self):
+        missing = self.root / "new-output"
+        common.require_absent(missing, "occupied")
+        for path in (self.root / "file", self.root / "directory"):
+            if path.name == "file":
+                path.write_bytes(b"preserved")
+            else:
+                path.mkdir()
+            with self.assertRaisesRegex(ValueError, "occupied"):
+                common.require_absent(path, "occupied")
+        self.assertEqual((self.root / "file").read_bytes(), b"preserved")
+        dangling = self.root / "dangling"
+        try:
+            dangling.symlink_to(missing)
+        except OSError as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        self.assertFalse(dangling.exists())
+        with self.assertRaisesRegex(ValueError, "occupied"):
+            common.require_absent(dangling, "occupied")
+        live = self.root / "live-link"
+        live.symlink_to(self.root / "file")
+        with self.assertRaisesRegex(ValueError, "occupied"):
+            common.require_absent(live, "occupied")
+
+    def test_named_hash_parity_and_order(self):
+        one, two = self.root / "one", self.root / "two"
+        one.write_bytes(b"first")
+        two.write_bytes(b"second")
+        named = {"second": two, "first": one, "alias": two}
+        expected = {name: common.digest(path) for name, path in named.items()}
+        with patch.object(common, "digest", wraps=common.digest) as hash_file:
+            actual = common.digests(named)
+        self.assertEqual(actual, expected)
+        self.assertEqual(list(actual), list(named))
+        self.assertEqual([call.args[0] for call in hash_file.call_args_list], [two, one, two])
+        self.assertEqual(common.digests({}), {})
+        two.write_bytes(b"changed")
+        self.assertNotEqual(common.digests(named), expected)
+
+    def test_query_flags_preserve_defaults_order_and_validated_warmups(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.query_search_flags(), [
+                "--nprobe", "1", "--rerank_factor", "2", "--query_threads", "1",
+            ])
+            self.assertEqual(settings.query_policy_flags(settings.warmup_queries()),
+                             ["--warmup_queries", "0"])
+            os.environ.update(IVF_NPROBE="4", IVF_RERANK_FACTOR="3.0", QUERY_THREADS="2",
+                              IVF_ROUTER_MODE="pca", IVF_ROUTER_RERANK_FACTOR="5",
+                              IVF_ROUTER_BREADTH="64", IVF_WARMUP_QUERIES="7")
+            validated = settings.warmup_queries()
+            # Flag formatting must not reread/revalidate the preflight warmup policy.
+            os.environ["IVF_WARMUP_QUERIES"] = "invalid"
+            self.assertEqual(settings.query_search_flags(), [
+                "--nprobe", "4", "--rerank_factor", "3.0", "--query_threads", "2",
+            ])
+            with patch.object(settings, "warmup_queries", side_effect=AssertionError):
+                self.assertEqual(settings.query_policy_flags(validated), [
+                    "--router_mode", "pca", "--router_rerank_factor", "5",
+                    "--router_breadth", "64", "--warmup_queries", "7",
+                ])
+        args = argparse.Namespace(dtype="uint8", metric="l2", dim=128)
+        with patch.dict(os.environ, {"IVF_DRIVER_BIN": "driver"}, clear=True):
+            self.assertEqual(harness.driver_open_command(args, "8", self.root), [
+                "driver", "--validate_inputs", "0", "--data_type", "uint8",
+                "--metric", "l2", "--dim", "128", "--nlist", "8",
+                "--index_prefix", str(self.root),
+            ])
+
+    def test_query_record_recognition_leaves_workload_checks_local(self):
+        record = {"baseline": "IVF", "phase": "query", "workload": "mixed"}
+        self.assertTrue(common.is_query_record(record, "mixed"))
+        self.assertNotIn("recall", record)  # Recognition does not certify scoring/counts.
+        self.assertFalse(common.is_query_record(record, "query"))
+        for key, value in (("baseline", "other"), ("phase", "insert")):
+            self.assertFalse(common.is_query_record({**record, key: value}, "mixed"))
+        with self.assertRaises(KeyError):
+            common.is_query_record({}, "query")
+
+    def test_json_read_size_limits_are_explicit_and_inclusive(self):
+        path = self.root / "metadata.json"
+        raw = b'{"ok": true}'
+        path.write_bytes(raw)
+        self.assertEqual(common.read_json(path, max_bytes=len(raw)), {"ok": True})
+        with self.assertRaisesRegex(ValueError, "oversized"):
+            common.read_json(path, max_bytes=len(raw) - 1)
+        path.write_bytes(raw + b" " * (65537 - len(raw)))
+        with self.assertRaisesRegex(ValueError, "oversized"):
+            common.read_json(path)
+        self.assertEqual(common.read_json(path, max_bytes=8 << 20), {"ok": True})
+
+    def test_runner_argv_and_native_records_remain_owned_by_driver(self):
+        work = self.root.resolve()
+        for directory in ("data", "index", "ids", "groundtruth/rounds"):
+            (work / directory).mkdir(parents=True)
+        data, query = work / "data/full.bin", work / "data/query.bin"
+        truth = work / "groundtruth/rounds/round_0_gt1.bin"
+        data.write_bytes(struct.pack("<II8f", 4, 2, *range(8)))
+        query.write_bytes(struct.pack("<II2f", 1, 2, 0, 1))
+        truth.write_bytes(struct.pack("<IIIf", 1, 1, 0, 0))
+        prefix = work / "index/tiny"
+        for suffix in harness.SUFFIXES:
+            Path(str(prefix) + suffix).write_text("IVFINDEX1\n" if suffix == ".manifest" else suffix)
+        for name, row in (("insert", 3), ("delete", 2)):
+            (work / f"ids/round_0_{name}.bin").write_bytes(struct.pack("<II", 1, row))
+        args = argparse.Namespace(
+            dataset="tiny", dtype="float", metric="l2", dim=2, full_count=4, base_count=3,
+            recall_at=1, work_dir=work, output_dir=work / "query-run", workload="query",
+            update_count=0, rounds=1, insert_cap=1, delete_cap=1, insert_count=1,
+            delete_count=1, query_count=5,
+        )
+        common.write_json(work / "prepared.json", {
+            "version": 1, "profile": settings.profile(args),
+            "settings": {"page_size": "4096", "nlist": "2"},
+            "query": str(query), "query_identity": common.digest(query),
+            "truth": str(truth), "truth_identity": common.digest(truth),
+            "manifest_identity": common.digest(Path(str(prefix) + ".manifest")),
+        })
+        common.write_json(work / "mixed_prepared.json", mixed.identity(args))
+        commands, native_bytes = [], {}
+
+        def native_driver(command, log):
+            commands.append(command)
+            Path(log).write_text("fake native execution\n")
+            result = Path(command[command.index("--result_file") + 1])
+            workload = "mixed" if command[command.index("--workload") + 1] == "mixed" else "query"
+            record = {
+                "baseline": "IVF", "phase": "query", "workload": workload, "recall": 100,
+                "explicit_warmup_query_count": 7, "warmup_policy": "fixture",
+                "insert_count": 1, "delete_count": 1, "live_count": 3,
+                "mixed_wall_s": 0.25, "concurrent_query_count": 5, "overlapping_query_count": 3,
+                "native_only_field": "must survive without a Python rewrite",
+            }
+            raw = ("  " + json.dumps(record, separators=(",", ":")) + "\n\n").encode()
+            with result.open("xb") as out:
+                out.write(raw)
+            native_bytes[result] = raw
+
+        env = {
+            "IVF_DRIVER_BIN": "fake-driver", "IVF_MEMORY_BUDGET_GB": "3",
+            "IVF_QUERY_MEMORY_BUDGET_GB": "2", "IVF_WARMUP_QUERIES": "7",
+            "IVF_ROUTER_MODE": "pca", "IVF_SCHEDULER": "weighted", "NTHREADS": "8",
+        }
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(harness, "command_log", side_effect=native_driver), \
+             patch.object(mixed, "command_log", side_effect=native_driver):
+            harness.run(args)
+            with self.assertRaisesRegex(ValueError, "run output exists"):
+                harness.run(args)
+            args.output_dir = work / "mixed-run"
+            mixed.run(args)
+            with self.assertRaisesRegex(ValueError, "mixed output exists"):
+                mixed.run(args)
+        self.assertEqual(len(commands), 2)
+        opening = [
+            "fake-driver", "--validate_inputs", "0", "--data_type", "float", "--metric", "l2",
+            "--dim", "2", "--nlist", "2", "--index_prefix", str(prefix),
+        ]
+        search = ["--nprobe", "1", "--rerank_factor", "2", "--query_threads", "1"]
+        policy = ["--router_mode", "pca", "--warmup_queries", "7"]
+        query_out = work / "query-run"
+        self.assertEqual(commands[0], opening + [
+            "--workload", "search_only", "--query_file", str(query), "--gt_file", str(truth),
+            "--recall_at", "1",
+        ] + search + [
+            "--buffer_frames", "64", "--memory_budget_gb", "2",
+            "--result_file", str(query_out / "result.json"),
+            "--search_result_file", str(query_out / "neighbors.bin"),
+        ] + policy)
+        round_out = work / "mixed-run/rounds/round_0"
+        self.assertEqual(commands[1], opening + [
+            "--index_format", "immutable", "--workload", "mixed", "--scheduler", "weighted",
+            "--pool_threads", "8", "--full_data_file", str(data), "--query_file", str(query),
+            "--insert_ids_file", str(work / "ids/round_0_insert.bin"),
+            "--delete_ids_file", str(work / "ids/round_0_delete.bin"),
+            "--gt_file", str(truth), "--recall_at", "1",
+        ] + search + [
+            "--private_heap_path", str(round_out / "private.heap"),
+            "--checkpoint_prefix", str(round_out / "checkpoint/tiny"),
+            "--buffer_frames", "64", "--memory_budget_gb", "3",
+            "--result_file", str(round_out / "result.json"),
+            "--search_result_file", str(round_out / "neighbors.bin"),
+            "--query_ratio", "80", "--scheduler_seed", str(0xA5A5A5A5), "--query_count", "5",
+        ] + policy)
+        for path, raw in native_bytes.items():
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertFalse(path.with_name("native_result.json").exists())
+        protocol = common.read_json(query_out / "execution_protocol.json")
+        self.assertFalse(protocol["canonical_native_query_metrics_rewritten"])
+        self.assertEqual(protocol["warmup_query_count_requested"], 7)
 
     @unittest.skipUnless(sys.platform == "linux", "quickstart gate executes in Bash")
     def test_quickstart_gt_gate_stops_preparation(self):
@@ -304,10 +532,13 @@ class SharedOrchestrationTests(unittest.TestCase):
 
     def test_compatibility_exports_and_shared_provenance(self):
         for name in (
+            "counted_range_identity",
             "digest",
             "flags",
             "header",
             "require",
+            "require_absent",
+            "is_query_record",
             "read_json",
             "write_json",
             "command_log",
@@ -319,6 +550,8 @@ class SharedOrchestrationTests(unittest.TestCase):
             "nlist_selection",
             "prepared_selection",
             "query_router_flags",
+            "query_search_flags",
+            "query_policy_flags",
         ):
             self.assertIs(getattr(harness, name), getattr(settings, name))
         self.assertEqual(set(common.shared_module_paths()), {"python_common", "settings"})

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <iosfwd>
 #include <string>
 
 namespace diskann::ivf {
@@ -16,6 +17,9 @@ namespace diskann::ivf {
   // POSIX callers may preserve an existing creation-mode contract.
   void claim_artifact(const std::string& path, unsigned permissions);
 #endif
+  // Copy bytes only. Callers own opening/claiming, stream-state checks,
+  // closing, and any separate integrity verification.
+  void           copy_artifact_stream(std::istream& input, std::ostream& output);
   uint64_t       artifact_hash_file(const std::string& path);
   uint64_t       artifact_hash_prefix(const std::string& path, uint64_t bytes);
   ArtifactDigest artifact_digest(const std::string& path);

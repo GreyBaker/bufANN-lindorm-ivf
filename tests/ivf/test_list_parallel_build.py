@@ -8,7 +8,7 @@ import struct
 import subprocess
 import tempfile
 
-from test_cli import write_pivots
+from ivf_test_support import write_pivots
 
 
 def digest(path):

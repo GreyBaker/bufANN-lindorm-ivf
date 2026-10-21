@@ -418,6 +418,35 @@ eviction, explicit/background flushing, reopen, failed-checkpoint admission,
 write errors, short writes and interruption retries without requiring an ext3
 server. These fixtures do not establish crash durability or full-scale results.
 
+### Maintaining shared code without merging different contracts
+
+Use the existing small helpers when adding IVF behavior; keep workload policy at
+the call site rather than creating another orchestration layer:
+
+| Shared owner | Responsibility |
+|---|---|
+| `benchmark/IVF/common.py` | File identities, counted source-row ranges, exclusive-path checks, bounded JSON and process primitives |
+| `benchmark/IVF/settings.py` | Declared settings, admission and query flag formatting; callers validate warmup before any mutation |
+| `benchmark/IVF/harness.py` | Bundle ownership and common native-open arguments; sequential workload sequencing stays explicit |
+| `benchmark/IVF/common.sh` | Fresh work-directory claims, run-tag output selection and query/sequential prefix GT staging |
+| `benchmark/scripts/check_gt_coverage.py` | Ordered live-state plans, GT plane layout and cached-row scratch estimates |
+| `include/bufann/ivf_numeric_internal.h` | Unchecked ordered float ADC, double exact-L2 and distance/ID ordering; caller validation remains local |
+| `src/bufann/ivf_random_internal.h` | Deterministic bounded draws; training/calibration sampling strategies stay separate |
+| `src/bufann/ivf_artifacts.cpp` | Byte-copy mechanics; callers still own claims, stream checks, close and independent verification |
+| `src/bufann/ivf_index.cpp` | Ordered component digest operations below each manifest family's explicit schema |
+| `tests/ivf_training_settings.h` | Identical build/calibration training-option parsing; diagnostic defaults remain separate |
+| `tests/ivf_cli_execution.cpp` | Native checkpoint progress, counter snapshots and timing shared by sequential/mixed updates |
+| `tests/ivf/ivf_test_support.py` | Test-only binary framing and shared synthetic populations, with no import-time I/O or production oracle dependency |
+
+Some apparent repetition is intentional. Do not merge immutable/mutable visibility
+checks or memory policies, streaming/staged timing boundaries, sequential/mixed
+schedulers, diagnostic defaults, atomic GT-record publication or heap poison/unwind
+paths. Ordered manifest component helpers preserve each format's separate version
+and suffix schema. Hashes before/after operations are integrity boundaries, not
+redundant reads to cache away. Test fixture sharing must not share mutable files or
+replace independent distance/recall oracles with production calculations. Keep the
+grid guide's terminal blocks copyable; they are not executable Markdown templates.
+
 
 # Quickstart: SIFT
 SIFT IVF testing from a new Linux computer.
@@ -567,6 +596,11 @@ Keep final queries out of tuning: freeze settings using base-only calibration or
 a separate tuning set before scoring them.
 
 ## 4. Configure and run all four workloads
+
+For a **query-only grid over nlist, nprobe and router breadth**, use the
+[copyable multi-nlist terminal instructions](../../docs/grid-search-guide.md#multi-nlist-alternative-budgeted-query-only-search)
+**instead of this step** after completing steps 1–3. No separate orchestrator
+script is needed; use a fresh work root and declare the grid/time budgets first.
 
 **Training limit:** SIFT100M uses **10 passes on all 90M base rows**, plus final
 assignment: 990M searches, below the native 1B guard. The default 15 passes would

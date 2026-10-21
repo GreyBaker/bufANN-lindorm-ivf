@@ -153,6 +153,9 @@ if(IVF_BUILD_CONTRACT_TESTS)
         Python3
         COMPONENTS Interpreter
         REQUIRED)
+    add_test(NAME ivf_test_support
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_test_support.py")
+    set_tests_properties(ivf_test_support PROPERTIES TIMEOUT 30)
     add_test(
         NAME ivf_cmake_scope
         COMMAND

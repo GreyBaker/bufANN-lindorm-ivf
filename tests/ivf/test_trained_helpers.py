@@ -12,6 +12,8 @@ import struct
 import subprocess
 import tempfile
 
+from ivf_test_support import write_matrix, write_truth
+
 
 def command(args, env, log):
     result = subprocess.run(
@@ -58,17 +60,9 @@ def main():
                 for _ in range(rows)
             ]
             data, query, truth = (root / f"{dtype}_{name}.bin" for name in ("data", "query", "gt"))
-            data.write_bytes(
-                struct.pack("<II", rows, dim)
-                + struct.pack(f"<{rows * dim}{fmt}", *(value for row in vectors for value in row))
-            )
+            write_matrix(data, vectors, fmt)
             queries = [vectors[i] for i in (0, 127, 513, 1001, 3501)]
-            query.write_bytes(
-                struct.pack("<II", len(queries), dim)
-                + struct.pack(
-                    f"<{len(queries) * dim}{fmt}", *(value for row in queries for value in row)
-                )
-            )
+            write_matrix(query, queries, fmt)
             oracle = [
                 sorted(
                     [
@@ -79,11 +73,7 @@ def main():
                 )
                 for q in queries
             ]
-            truth.write_bytes(
-                struct.pack("<II", len(queries), base_count)
-                + b"".join(struct.pack("<I", i) for row in oracle for i, _ in row)
-                + b"".join(struct.pack("<f", d) for row in oracle for _, d in row)
-            )
+            write_truth(truth, oracle)
             prefix = root / f"{dtype} standalone"
             command(
                 [args.pivot_helper, dtype, data, prefix, chunks], env, root / f"{dtype}_train.log"

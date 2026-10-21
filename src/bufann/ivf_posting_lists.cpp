@@ -1,4 +1,5 @@
 #include "bufann/ivf_posting_lists.h"
+#include "bufann/ivf_numeric_internal.h"
 
 #include <algorithm>
 #include <bit>
@@ -39,10 +40,7 @@ namespace diskann::ivf {
             "Mutable IVF list buffer exceeds addressable memory");
       return bytes;
     }
-    bool nearer(const PQCandidate& a, const PQCandidate& b) {
-      return a.squared_distance < b.squared_distance ||
-             (a.squared_distance == b.squared_distance && a.id < b.id);
-    }
+    using detail::candidate_nearer;
     template<typename T>
     T read(std::istream& in) {
       T value{};
@@ -551,26 +549,24 @@ namespace diskann::ivf {
       const auto&      list = checked_list(owner);
       std::shared_lock lock(list.mutex);
       for (uint32_t r = 0; r < list.length; ++r) {
-        float distance = 0;
-        for (uint32_t c = 0; c < chunks(); ++c)
-          distance +=
-              distances[size_t(c) * 256 + list.codes[size_t(r) * chunks() + c]];
+        const float distance = detail::adc_distance_unchecked(
+            list.codes.get() + size_t(r) * chunks(), distances.data(), chunks());
         check(std::isfinite(distance), "Mutable IVF ADC sum overflow");
         const PQCandidate candidate{list.ids[r], distance};
         if (best.size() < limit) {
           best.push_back(candidate);
-          std::push_heap(best.begin(), best.end(), nearer);
-        } else if (nearer(candidate, best.front())) {
-          std::pop_heap(best.begin(), best.end(), nearer);
+          std::push_heap(best.begin(), best.end(), candidate_nearer<PQCandidate>);
+        } else if (candidate_nearer(candidate, best.front())) {
+          std::pop_heap(best.begin(), best.end(), candidate_nearer<PQCandidate>);
           best.back() = candidate;
-          std::push_heap(best.begin(), best.end(), nearer);
+          std::push_heap(best.begin(), best.end(), candidate_nearer<PQCandidate>);
         }
       }
       result.scanned_codes += list.length;
     }
     result.candidates.resize(best.size());
     for (size_t i = best.size(); i > 0; --i) {
-      std::pop_heap(best.begin(), best.end(), nearer);
+      std::pop_heap(best.begin(), best.end(), candidate_nearer<PQCandidate>);
       result.candidates[i - 1] = best.back();
       best.pop_back();
     }

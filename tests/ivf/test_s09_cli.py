@@ -4,11 +4,9 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
-import struct
 import sys
 import tempfile
-from test_cli import write_pivots
-from test_cli_execution import run
+from ivf_test_support import run_native_cli as run, write_ids, write_matrix, write_pivots
 
 
 def reject_historical_producers(search, path, original):
@@ -40,19 +38,14 @@ def main():
         for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
             pq = root / (dtype + "_pq")
             write_pivots(Path(str(pq) + "_pq_pivots.bin"))
-            Path(str(pq) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 33, 2) + bytes(66))
+            write_matrix(Path(str(pq) + "_pq_compressed.bin"), [bytes(2)] * 33, "B")
             values = [
                 ((r % 4) * 20 + (r // 4) % 5, d, d) for r, d in ((r, r % 3) for r in range(33))
             ]
             data = root / (dtype + ".bin")
-            data.write_bytes(
-                struct.pack("<II", 33, 3)
-                + struct.pack("<" + fmt * 99, *(v for row in values for v in row))
-            )
+            write_matrix(data, values, fmt)
             query = root / (dtype + "_query.bin")
-            query.write_bytes(
-                struct.pack("<II", 2, 3) + struct.pack("<" + fmt * 6, *values[0], *values[10])
-            )
+            write_matrix(query, [values[0], values[10]], fmt)
             base = [
                 args.build,
                 "--validate_inputs",
@@ -182,7 +175,7 @@ def main():
                     assert observed[key] == record[key]
                 if native:
                     ids = root / (dtype + ".ids")
-                    ids.write_bytes(struct.pack("<II", 1, 32))
+                    write_ids(ids, [32])
                     saved = root / (dtype + "_" + mode + "_checkpoint")
                     update = run(
                         [
@@ -310,7 +303,7 @@ def main():
                     and metrics["training_breadth"] == 7
                 )
                 ids = root / (dtype + "_legacy" + str(version) + ".ids")
-                ids.write_bytes(struct.pack("<II", 1, 32))
+                write_ids(ids, [32])
                 saved = root / (dtype + "_legacy_saved" + str(version))
                 run(
                     [

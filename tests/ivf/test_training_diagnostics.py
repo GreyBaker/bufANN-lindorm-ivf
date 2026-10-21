@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+from ivf_test_support import write_matrix
+
 
 def run(command, success=True):
     result = subprocess.run([str(v) for v in command], text=True, capture_output=True, timeout=120)
@@ -32,8 +34,7 @@ def main():
             data = root / (dtype + ".bin")
             rows = [[(r % 3) * 30 + r // 3 + d for d in range(3)] for r in range(24)]
             tail = [[float("nan")] * 3] * 6 if dtype == "float" else [[120] * 3] * 6
-            flat = [v for row in rows + tail for v in row]
-            data.write_bytes(struct.pack("<II", 30, 3) + struct.pack("<" + fmt * len(flat), *flat))
+            write_matrix(data, rows + tail, fmt)
             output = root / (dtype + " results")
             command = [
                 sys.executable,

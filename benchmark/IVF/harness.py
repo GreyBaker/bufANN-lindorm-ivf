@@ -11,19 +11,21 @@ import os
 from pathlib import Path
 import re
 import shutil
-import struct
 import sys
 import time
 
 # Re-export shared helpers for existing local callers; workload ownership stays here.
 from common import (
     command_log,
+    counted_range_identity,
     digest,
     flags,
     header,
+    is_query_record,
     query_truth_shapes,
     read_json,
     require,
+    require_absent,
     write_json,
 )
 from settings import (
@@ -32,6 +34,8 @@ from settings import (
     prepared_selection,
     profile,
     query_router_flags,
+    query_search_flags,
+    query_policy_flags,
     read_cost_model_report,
     runtime_resources,
     insertion_threads,
@@ -110,21 +114,12 @@ def mutation_identity(args, work):
     )
     first = args.base_count if args.workload == "insert" else args.base_count - count
     ids = work / (args.workload + "_ids.bin")
-    require(ids.stat().st_size == 4 + 4 * count, "invalid prepared counted-ID framing")
-    with ids.open("rb") as source:
-        require(source.read(4) == struct.pack("<I", count), "counted-ID count mismatch")
-        for offset in range(0, count, 4096):
-            length = min(4096, count - offset)
-            require(
-                source.read(4 * length)
-                == struct.pack("<" + "I" * length, *range(first + offset, first + offset + length)),
-                "prepared update IDs differ from IVF source-row range",
-            )
+    ids_identity = counted_range_identity(ids, first, count)
     return {
         "workload": args.workload,
         "count": count,
         "first_id": first,
-        "ids_identity": digest(ids),
+        "ids_identity": ids_identity,
         "source_identity": digest(work / "data/full.bin"),
     }
 
@@ -270,6 +265,19 @@ def prepare(args):
         write_json(work / "mutation_prepared.json", mutation)
 
 
+def driver_open_command(args, nlist, prefix):
+    """Common native open arguments only; workloads and resource policies stay local."""
+    return [
+        os.environ["IVF_DRIVER_BIN"],
+        "--validate_inputs", "0",
+        "--data_type", args.dtype,
+        "--metric", args.metric,
+        "--dim", str(args.dim),
+        "--nlist", nlist,
+        "--index_prefix", str(prefix),
+    ]
+
+
 def run(args):
     workflow_start = time.monotonic()
     mutation_process_wall_s = None
@@ -326,8 +334,8 @@ def run(args):
         "execution_protocol.json",
     ):
         path = output / name
-        require(
-            not path.exists() and not path.is_symlink(),
+        require_absent(
+            path,
             f"run output exists: {path}; use a fresh IVF_RUN_TAG",
         )
     # The driver writes canonical metrics directly; provenance stays separate.
@@ -343,24 +351,11 @@ def run(args):
             "checkpoint",
         ):
             path = output / name
-            require(not path.exists() and not path.is_symlink(), f"mutation output exists: {path}")
+            require_absent(path, f"mutation output exists: {path}")
         checkpoint = output / "checkpoint"
         checkpoint.mkdir()
         saved = checkpoint / args.dataset
-        command = [
-            os.environ["IVF_DRIVER_BIN"],
-            "--validate_inputs",
-            "0",
-            "--data_type",
-            args.dtype,
-            "--metric",
-            args.metric,
-            "--dim",
-            str(args.dim),
-            "--nlist",
-            prepared["settings"]["nlist"],
-            "--index_prefix",
-            str(prefix),
+        command = driver_open_command(args, prepared["settings"]["nlist"], prefix) + [
             "--workload",
             args.workload + "_only",
             "--full_data_file",
@@ -403,20 +398,7 @@ def run(args):
             "missing mutable checkpoint family",
         )
         prefix = saved
-    command = [
-        os.environ["IVF_DRIVER_BIN"],
-        "--validate_inputs",
-        "0",
-        "--data_type",
-        args.dtype,
-        "--metric",
-        args.metric,
-        "--dim",
-        str(args.dim),
-        "--nlist",
-        prepared["settings"]["nlist"],
-        "--index_prefix",
-        str(prefix),
+    command = driver_open_command(args, prepared["settings"]["nlist"], prefix) + [
         "--workload",
         "search_only",
         "--query_file",
@@ -425,12 +407,7 @@ def run(args):
         prepared["truth"],
         "--recall_at",
         str(args.recall_at),
-        "--nprobe",
-        os.environ.get("IVF_NPROBE", "1"),
-        "--rerank_factor",
-        os.environ.get("IVF_RERANK_FACTOR", "2"),
-        "--query_threads",
-        os.environ.get("QUERY_THREADS", "1"),
+    ] + query_search_flags() + [
         "--buffer_frames",
         query_resources["buffer_frames"],
         "--memory_budget_gb",
@@ -442,16 +419,13 @@ def run(args):
     ]
     if mutation is not None:
         command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
-    command += query_router_flags()
-    command += ["--warmup_queries", query_warmups]
+    command += query_policy_flags(query_warmups)
     query_start = time.monotonic()
     command_log(command, output / "run.log")
     query_process_wall_s = time.monotonic() - query_start
     record = read_json(output / "result.json")
     require(
-        record["baseline"] == "IVF"
-        and record["phase"] == "query"
-        and record["workload"] == "query"
+        is_query_record(record, "query")
         and "recall" in record,
         "missing canonical native query record",
     )

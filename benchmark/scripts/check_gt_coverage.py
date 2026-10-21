@@ -20,6 +20,42 @@ import struct
 import sys
 
 
+GT_HEADER_BYTES = 8
+GT_VALUE_BYTES = 4
+CACHED_ROW_SCRATCH_BYTES_PER_NEIGHBOR = 128
+CACHED_ROW_SCRATCH_LIMIT = 64 * 1024 * 1024
+
+
+def row_scratch_bytes(cached_k):
+    return cached_k * CACHED_ROW_SCRATCH_BYTES_PER_NEIGHBOR
+
+
+def fits_row_scratch(cached_k):
+    # Estimate only: this is not an enforced RSS cap.
+    return row_scratch_bytes(cached_k) <= CACHED_ROW_SCRATCH_LIMIT
+
+
+@dataclass(frozen=True)
+class GTLayout:
+    queries: int
+    cached_k: int
+
+    @property
+    def cells(self):
+        return self.queries * self.cached_k
+
+    def plane_offset(self, index, first_query=0):
+        return GT_HEADER_BYTES + (index * self.cells + first_query * self.cached_k) * GT_VALUE_BYTES
+
+    def byte_size(self, with_tags):
+        return GT_HEADER_BYTES + self.cells * GT_VALUE_BYTES * (3 if with_tags else 2)
+
+    def identity_tags(self, size):
+        require(size in (self.byte_size(False), self.byte_size(True)),
+                "GT framing mismatch: require header + IDs/distances, optionally identity tags")
+        return size == self.byte_size(True)
+
+
 @dataclass(frozen=True)
 class State:
     name: str
@@ -101,10 +137,10 @@ def sha256(file):
 
 def plane(file, offset, cells, code):
     file.seek(offset)
-    raw = file.read(cells * 4)
-    require(len(raw) == cells * 4, "GT changed or truncated during preflight")
+    raw = file.read(cells * GT_VALUE_BYTES)
+    require(len(raw) == cells * GT_VALUE_BYTES, "GT changed or truncated during preflight")
     values = array(code)
-    require(values.itemsize == 4, "platform lacks required 32-bit array types")
+    require(values.itemsize == GT_VALUE_BYTES, "platform lacks required 32-bit array types")
     values.frombytes(raw)
     if sys.byteorder != "little":
         values.byteswap()
@@ -128,30 +164,28 @@ def check_cache(path, full_count, states, k_out, expected_queries=None, worst_qu
         # Windows can expose different timestamp snapshots through stat/fstat.
         # Compare identity across APIs and stability within each API, plus hashes.
         require(path_before[:3] == before[:3], "GT path changed during open")
-        header = file.read(8)
-        require(len(header) == 8, "truncated GT header")
+        header = file.read(GT_HEADER_BYTES)
+        require(len(header) == GT_HEADER_BYTES, "truncated GT header")
         queries, cached_k = struct.unpack("<II", header)
         require(0 < queries <= 0x7FFFFFFF and 0 < cached_k <= 0x7FFFFFFF,
                 "GT query count/depth must be positive int32 values")
         require(expected_queries is None or queries == expected_queries,
                 f"GT query count mismatch: expected {expected_queries}, got {queries}")
-        cells = queries * cached_k
+        layout = GTLayout(queries, cached_k)
         size = before[2]
-        require(size in (8 + cells * 8, 8 + cells * 12),
-                "GT framing mismatch: require header + IDs/distances, optionally identity tags")
-        with_tags = size == 8 + cells * 12
+        with_tags = layout.identity_tags(size)
         # Sorting/validation needs one whole cached row; refuse extravagant rows
         # before allocation. This is a scratch estimate, not an enforced RSS cap.
-        require(cached_k * 128 <= 64 * 1024 * 1024, "cached row exceeds 64MiB scratch estimate")
-        rows_per_block = max(1, min(256, (8 * 1024 * 1024) // (cached_k * 12)))
+        require(fits_row_scratch(cached_k), "cached row exceeds 64MiB scratch estimate")
+        rows_per_block = max(1, min(256, (8 * 1024 * 1024) // (cached_k * GT_VALUE_BYTES * 3)))
         digest_before = sha256(file)
         for first in range(0, queries, rows_per_block):
             count = min(rows_per_block, queries - first)
             n = count * cached_k
-            ids = plane(file, 8 + first * cached_k * 4, n, "I")
-            distances = plane(file, 8 + cells * 4 + first * cached_k * 4, n, "f")
+            ids = plane(file, layout.plane_offset(0, first), n, "I")
+            distances = plane(file, layout.plane_offset(1, first), n, "f")
             if with_tags:
-                tags = plane(file, 8 + cells * 8 + first * cached_k * 4, n, "I")
+                tags = plane(file, layout.plane_offset(2, first), n, "I")
                 require(tags == ids, f"GT tags differ from source IDs near query {first}")
             for local in range(count):
                 query = first + local
@@ -212,7 +246,8 @@ def check_cache(path, full_count, states, k_out, expected_queries=None, worst_qu
             "states": stats}
 
 
-def planned_states(args):
+def resolved_plan(args):
+    """Return ordered states and the coverage report's resolved plan fields."""
     inserts = args.insert_count if args.insert_count is not None else args.full_count - args.base_count
     deletes = args.delete_count if args.delete_count is not None else args.full_count - args.base_count
     states = make_states(args.full_count, args.base_count, inserts, deletes, args.mixed_rounds,
@@ -220,7 +255,16 @@ def planned_states(args):
                          args.insert_round_cap, args.delete_round_cap)
     require(args.k_out <= min(s.prefix - (s.delete_end - s.delete_begin) for s in states),
             "K exceeds a declared live population")
-    return states
+    plan = {"base_count": args.base_count, "insert_count": inserts,
+            "delete_count": deletes, "mixed_rounds": args.mixed_rounds,
+            "mixed_insert_cap": round_cap(inserts, args.mixed_rounds, args.mixed_insert_cap, "mixed inserts"),
+            "mixed_delete_cap": round_cap(deletes, args.mixed_rounds, args.mixed_delete_cap, "mixed deletes"),
+            "insert_round_cap": args.insert_round_cap, "delete_round_cap": args.delete_round_cap}
+    return states, plan
+
+
+def planned_states(args):
+    return resolved_plan(args)[0]
 
 
 def parser(cached_required=True, report_option=True):
@@ -248,16 +292,10 @@ def main(argv=None):
     try:
         if args.json_output:
             require(not os.path.lexists(args.json_output), "JSON output already exists; choose a fresh path")
-        inserts = args.insert_count if args.insert_count is not None else args.full_count - args.base_count
-        deletes = args.delete_count if args.delete_count is not None else args.full_count - args.base_count
-        states = planned_states(args)
+        states, plan = resolved_plan(args)
         report = check_cache(args.cached_gt, args.full_count, states, args.k_out,
                              args.expected_queries, args.worst_queries)
-        report["plan"] = {"base_count": args.base_count, "insert_count": inserts,
-                          "delete_count": deletes, "mixed_rounds": args.mixed_rounds,
-                          "mixed_insert_cap": round_cap(inserts, args.mixed_rounds, args.mixed_insert_cap, "mixed inserts"),
-                          "mixed_delete_cap": round_cap(deletes, args.mixed_rounds, args.mixed_delete_cap, "mixed deletes"),
-                          "insert_round_cap": args.insert_round_cap, "delete_round_cap": args.delete_round_cap}
+        report["plan"] = plan
         print(f"Cached GT: Q={report['queries']} K={report['cached_k']} K_out={args.k_out} "
               f"bytes={report['cache_bytes']} SHA256={report['cached_gt_sha256']}")
         for state in report["states"]:

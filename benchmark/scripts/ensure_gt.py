@@ -78,7 +78,7 @@ def candidates(args, inputs):
 
 
 def generate(args, attempt, k):
-    coverage.require(k <= args.full_count and k * 128 <= 64 * 1024 * 1024,
+    coverage.require(k <= args.full_count and coverage.fits_row_scratch(k),
                      "GT depth exceeds preflight admission; consider direct per-state GT")
     coverage.require(args.gt_generator is not None and args.gt_generator.is_file(),
                      "GT generator not found; set IVF_BUILD_DIR or pass --gt-generator")

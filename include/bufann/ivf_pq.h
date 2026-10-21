@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "bufann/ivf_io.h"
+#include "bufann/ivf_numeric_internal.h"
 #include "pq_table.h"
 
 namespace diskann::ivf {
@@ -56,10 +57,7 @@ namespace diskann::ivf {
           distances.size() != static_cast<size_t>(256) * chunks()) {
         throw std::invalid_argument("invalid PQ lookup buffers");
       }
-      float result = 0;
-      for (uint32_t c = 0; c < chunks(); ++c)
-        result += distances[static_cast<size_t>(256) * c + code[c]];
-      return result;
+      return detail::adc_distance_unchecked(code, distances.data(), chunks());
     }
 
    private:

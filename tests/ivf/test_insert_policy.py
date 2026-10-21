@@ -6,34 +6,19 @@ import json
 from pathlib import Path
 import struct
 
-from test_cli import write_pivots
-from test_cli_execution import run, read_results, write_truth
-from test_parallel_insert import attempt, ids
+from ivf_test_support import (
+    build_tiny_population, read_results, reserve_attempt as attempt,
+    run_native_cli as run, write_truth,
+)
 
 
 def fixture(args, root, dtype, fmt):
-    work = root / dtype
-    work.mkdir()
-    vectors = [tuple((i * 7 + d * 3) % 31 - (16 if dtype == "int8" else 0)
-                     for d in range(3)) for i in range(64)]
-    queries = vectors[::8]
-    data, query, prefix = work / "source.bin", work / "queries.bin", work / "base"
-    data.write_bytes(struct.pack("<II", 64, 3) + struct.pack("<192" + fmt, *(v for row in vectors for v in row)))
-    query.write_bytes(struct.pack("<II", 8, 3) + struct.pack("<24" + fmt, *(v for row in queries for v in row)))
-    pq = work / "pq"
-    write_pivots(Path(str(pq) + "_pq_pivots.bin"))
-    Path(str(pq) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 64, 2) + bytes(128))
-    build = [args.build, "--validate_inputs", "0", "--data_type", dtype,
-             "--data_file", str(data), "--pq_prefix", str(pq), "--index_prefix", str(prefix),
-             "--dim", "3", "--base_count", "8", "--nlist", "2", "--max_reps", "2",
-             "--build_threads", "2", "--query_breadth", "2", "--insert_breadth", "2"]
-    run(build, "build")
-    source_hash = hashlib.sha256(data.read_bytes()).hexdigest()
-    originals = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in work.glob("base.*")}
-    insert_ids, delete_ids, empty = work / "insert.ids", work / "delete.ids", work / "empty.ids"
-    ids(insert_ids, reversed(range(8, 64)))
-    ids(delete_ids, [0])
-    ids(empty, [])
+    population = build_tiny_population(args.build, root, dtype, fmt,
+        reverse_insert_ids=True, include_empty_ids=True, run_build=run)
+    work, vectors, queries = population.work, population.vectors, population.queries
+    data, query, prefix = population.data, population.query, population.prefix
+    build, source_hash, originals = population.build, population.source_hash, population.originals
+    insert_ids, delete_ids, empty = population.insert_ids, population.delete_ids, population.empty_ids
     ordinal = 0
 
     def update(policy, workers=1, frames=2, workload="insert_only", extra=()):

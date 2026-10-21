@@ -10,6 +10,7 @@ import sys
 from common import (
     affinity,
     digest,
+    digests,
     execute,
     finite,
     positive,
@@ -69,7 +70,7 @@ def main():
     }
     for suffix in (".centroids.bin", ".hnsw", ".router", ".patched.hnsw", ".refined.hnsw", ".pca"):
         inputs[suffix] = Path(args.index_prefix + suffix).resolve()
-    identities = {name: digest(path) for name, path in inputs.items()}
+    identities = digests(inputs)
     args.output.mkdir(parents=True, exist_ok=False)
     settings = {
         key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
@@ -141,7 +142,7 @@ def main():
                             "invalid router measurement",
                         )
                         require(
-                            {name: digest(item) for name, item in inputs.items()} == identities,
+                            digests(inputs) == identities,
                             "router sweep input/tool identity changed",
                         )
                     except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:

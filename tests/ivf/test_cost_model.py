@@ -14,15 +14,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from test_cli import write_pivots
-
-
-def matrix(path, fmt):
-    raw = path.read_bytes()
-    rows, dim = struct.unpack_from("<II", raw)
-    values = struct.unpack_from("<" + fmt * (rows * dim), raw, 8)
-    assert len(raw) == 8 + struct.calcsize(fmt) * rows * dim
-    return [values[r * dim : (r + 1) * dim] for r in range(rows)]
+from ivf_test_support import read_matrix as matrix, write_matrix, write_pivots
 
 
 def run(command, success=True, env=None):
@@ -57,10 +49,7 @@ def main():
                 # calibration must never read it as a training/query row.
                 vectors[160:] = [(math.nan, math.nan, math.nan)] * 8
             data, pq = root / (dtype + ".bin"), root / (dtype + "_pq")
-            data.write_bytes(
-                struct.pack("<II", 168, 3)
-                + struct.pack("<" + fmt * 504, *(v for row in vectors for v in row))
-            )
+            write_matrix(data, vectors, fmt)
             write_pivots(Path(str(pq) + "_pq_pivots.bin"))
             Path(str(pq) + "_pq_compressed.bin").write_bytes(
                 struct.pack("<II", 168, 2) + bytes(336)

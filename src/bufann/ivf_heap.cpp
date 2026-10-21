@@ -693,9 +693,7 @@ namespace diskann::ivf {
       std::ifstream input(_heap_path, std::ios::binary);
       std::ofstream output(path, std::ios::binary);
       check(bool(input) && bool(output), "Cannot copy mutable IVF heap");
-      char bytes[8192];
-      while (input.read(bytes, sizeof(bytes)) || input.gcount())
-        output.write(bytes, input.gcount());
+      copy_artifact_stream(input, output);
       check(input.eof() && !input.bad(), "Mutable IVF heap copy read failure");
       output.close();
       check(bool(output), "Mutable IVF heap copy write failure");

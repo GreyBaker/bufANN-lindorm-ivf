@@ -7,11 +7,7 @@ WORKLOAD=query
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 source "$REPO_DIR/benchmark/IVF/common.sh"
 [[ -f "$WORK_DIR/prepared.json" ]] || error "missing completed IVF preparation; run query_prepare.sh first"
-OUTPUT_DIR="$WORK_DIR"
-if [[ -n "${IVF_RUN_TAG:-}" ]]; then
-    [[ "$IVF_RUN_TAG" =~ ^[a-zA-Z0-9_-]+$ ]] || error "unsafe IVF_RUN_TAG"
-    OUTPUT_DIR="$WORK_DIR/runs/$IVF_RUN_TAG"
-fi
+ivf_select_output_dir
 ivf_profile_args
 python3 "$REPO_DIR/benchmark/IVF/harness.py" run "${PROFILE_ARGS[@]}" \
     --output-dir "$OUTPUT_DIR" --recall-at "$RECALL_AT"

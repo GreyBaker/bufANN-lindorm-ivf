@@ -21,9 +21,24 @@ namespace {
     }
     require(failed, "Expected cost-model rejection");
   }
+  void exact_l2_numeric_policy() {
+    // Float subtraction would tie these rows and incorrectly select ID 0.
+    const std::vector<float> samples{-1, 0}, query{16777216};
+    require(calibration_ground_truth(samples, query, 1, 2, 2, 4096) ==
+                std::vector<uint32_t>({1, 0}),
+            "Exact L2 stopped converting to double before subtraction");
+    // Each unit contribution rounds away after 2^54. Preserve dimension-order
+    // accumulation rather than grouping the four units into a retained +4.
+    const std::vector<float> ordered_samples{0, 0, 0, 0, 0, 0, 1, 1, 1, 1},
+        ordered_query{134217728, 1, 1, 1, 1};
+    require(calibration_ground_truth(ordered_samples, ordered_query, 5, 2, 2,
+                                     4096) == std::vector<uint32_t>({0, 1}),
+            "Exact L2 changed double dimension-order rounding/ID ties");
+  }
 }  // namespace
 int main() {
   try {
+    exact_l2_numeric_policy();
     const auto split = sample_calibration_rows(256, 128, 16, 17, 4096);
     const auto again = sample_calibration_rows(256, 128, 16, 17, 4096);
     require(split.sample_ids == again.sample_ids &&

@@ -5,11 +5,7 @@ ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing full-source PQ}"
 [[ -z "${IVF_GT_FILE:-}" ]] || error "mixed prepare derives per-round GT; IVF_GT_FILE is not a per-round GT family"
 ensure_dataset
-[[ ! -e "$WORK_DIR" && ! -L "$WORK_DIR" ]] || error "work tree exists; preserve it or choose a fresh EVAL_TEMPFILES root"
-safe_mutable_path "$WORK_DIR" >/dev/null
-mkdir -p "$(dirname "$WORK_DIR")"
-mkdir "$WORK_DIR"
-link_dataset_files "$WORK_DIR"
+ivf_prepare_work_dir
 write_counted_ids_range "$WORK_DIR/ids/insert_ids.bin" "$BASE_POINTS" "$INSERT_POINTS"
 write_counted_ids_range "$WORK_DIR/ids/delete_ids.bin" "$((BASE_POINTS - DELETE_POINTS))" "$DELETE_POINTS"
 for ((r = 0; r < UPDATE_ROUNDS; ++r)); do

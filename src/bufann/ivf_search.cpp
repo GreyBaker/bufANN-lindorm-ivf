@@ -1,4 +1,5 @@
 #include "bufann/ivf_search.h"
+#include "bufann/ivf_numeric_internal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,6 +23,17 @@ namespace diskann::ivf {
     double elapsed_us(Clock::time_point start) {
       return std::chrono::duration<double, std::micro>(Clock::now() - start)
           .count();
+    }
+    template<typename T>
+    size_t aligned_row_stride(uint32_t aligned_dim) {
+      return ((uint64_t(aligned_dim) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    }
+    void accumulate_fetch(QueryResult& result, const BatchCopyResult& copied) {
+      result.backend_batch_calls += copied.backend_batch_calls;
+      result.heap_pages_read += copied.heap_pages_read;
+      result.fetch_adapter_mutex_wait_ns += copied.adapter_mutex_wait_ns;
+      result.fetch_backend_pin_ns += copied.backend_pin_wall_ns;
+      result.fetch_pin_admission_wait_ns += copied.pin_admission_wait_ns;
     }
   }  // namespace
 
@@ -50,8 +62,7 @@ namespace diskann::ivf {
           "Invalid IVF query candidate budget");
     // Retained PQ candidates/exact hits plus scan heap growth, LUT, routing
     // scratch/visited allowance and one bounded, aligned coordinate batch.
-    const size_t stride =
-        ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t stride = aligned_row_stride<T>(heap.aligned_dim());
     const size_t batch = std::min<size_t>(budget, heap.copy_batch_limit());
     uint64_t     bytes = 65536;
     add_product(bytes, budget, 96);
@@ -82,8 +93,7 @@ namespace diskann::ivf {
     check(bytes <= limits.workspace_bytes,
           "IVF query exceeds workspace allowance");
     const auto   budget = config.candidate_budget(lists.size());
-    const size_t stride =
-        ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t stride = aligned_row_stride<T>(heap.aligned_dim());
     const size_t batch = std::min<size_t>(budget, heap.copy_batch_limit());
     QueryResult  result;
     auto         start = Clock::now();
@@ -122,21 +132,14 @@ namespace diskann::ivf {
       start = Clock::now();
       auto copied = heap.copy_coordinates_batch(
           ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
-      result.backend_batch_calls += copied.backend_batch_calls;
-      result.heap_pages_read += copied.heap_pages_read;
-      result.fetch_adapter_mutex_wait_ns += copied.adapter_mutex_wait_ns;
-      result.fetch_backend_pin_ns += copied.backend_pin_wall_ns;
-      result.fetch_pin_admission_wait_ns += copied.pin_admission_wait_ns;
+      accumulate_fetch(result, copied);
       result.fetch_us += elapsed_us(start);
       start = Clock::now();
       for (size_t i = 0; i < count; ++i) {
         check(copied.present[i], "IVF posting references a missing heap ID");
         const auto* vector = static_cast<const T*>(scratch.get()) + i * stride;
-        double      distance = 0;
-        for (uint32_t d = 0; d < router.dim(); ++d) {
-          const double difference = double(query[d]) - double(vector[d]);
-          distance += difference * difference;
-        }
+        const double distance = detail::squared_l2_double_unchecked(
+            query.data(), vector, router.dim());
         check(std::isfinite(distance), "Nonfinite IVF exact distance");
         result.hits.push_back({ids[i], distance});
       }
@@ -144,12 +147,8 @@ namespace diskann::ivf {
     }
     result.reranked_vectors = result.hits.size();
     start = Clock::now();
-    std::sort(
-        result.hits.begin(), result.hits.end(),
-        [](const ExactHit& a, const ExactHit& b) {
-          return a.squared_distance < b.squared_distance ||
-                 (a.squared_distance == b.squared_distance && a.id < b.id);
-        });
+    std::sort(result.hits.begin(), result.hits.end(),
+              detail::candidate_nearer<ExactHit>);
     if (result.hits.size() > config.recall_at)
       result.hits.resize(config.recall_at);
     result.rerank_us += elapsed_us(start);
@@ -208,8 +207,7 @@ namespace diskann::ivf {
         config.candidate_budget(lists.id_capacity() - lists.first_id());
     check(budget > 0 && budget <= UINT32_MAX,
           "Invalid mutable IVF query candidate budget");
-    const size_t stride =
-        ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t stride = aligned_row_stride<T>(heap.aligned_dim());
     uint64_t bytes = 65536;
     add_product(bytes, budget,
                 128);  // Scan/output/filtered candidates, ID validation, hits.
@@ -269,8 +267,7 @@ namespace diskann::ivf {
     if (active.empty())
       return result;
     result.logical_fetch_stages = 1;
-    const size_t stride =
-        ((uint64_t(heap.aligned_dim()) * sizeof(T) + 63) / 64) * 64 / sizeof(T);
+    const size_t stride = aligned_row_stride<T>(heap.aligned_dim());
     const size_t batch =
         std::min<size_t>(active.size(), heap.copy_batch_limit());
     std::unique_ptr<void, decltype(&std::free)> scratch(
@@ -288,11 +285,7 @@ namespace diskann::ivf {
       auto       start = Clock::now();
       const auto copied = heap.copy_coordinates_batch(
           ids, {static_cast<T*>(scratch.get()), count * stride}, stride);
-      result.backend_batch_calls += copied.backend_batch_calls;
-      result.heap_pages_read += copied.heap_pages_read;
-      result.fetch_adapter_mutex_wait_ns += copied.adapter_mutex_wait_ns;
-      result.fetch_backend_pin_ns += copied.backend_pin_wall_ns;
-      result.fetch_pin_admission_wait_ns += copied.pin_admission_wait_ns;
+      accumulate_fetch(result, copied);
       result.fetch_us += elapsed_us(start);
       start = Clock::now();
       for (size_t i = 0; i < count; ++i) {
@@ -303,11 +296,8 @@ namespace diskann::ivf {
         check(copied.present[i],
               "Live mutable IVF posting references a missing heap ID");
         const auto* vector = static_cast<const T*>(scratch.get()) + i * stride;
-        double      distance = 0;
-        for (uint32_t d = 0; d < router.dim(); ++d) {
-          const double delta = double(query[d]) - double(vector[d]);
-          distance += delta * delta;
-        }
+        const double distance = detail::squared_l2_double_unchecked(
+            query.data(), vector, router.dim());
         check(std::isfinite(distance), "Nonfinite mutable IVF exact distance");
         result.hits.push_back({ids[i], distance});
       }
@@ -315,12 +305,8 @@ namespace diskann::ivf {
     }
     result.reranked_vectors = result.hits.size();
     auto start = Clock::now();
-    std::sort(
-        result.hits.begin(), result.hits.end(),
-        [](const ExactHit& a, const ExactHit& b) {
-          return a.squared_distance < b.squared_distance ||
-                 (a.squared_distance == b.squared_distance && a.id < b.id);
-        });
+    std::sort(result.hits.begin(), result.hits.end(),
+              detail::candidate_nearer<ExactHit>);
     std::erase_if(result.hits, [&](auto hit) {
       if (lists.contains(hit.id))
         return false;

@@ -35,6 +35,11 @@ namespace diskann::ivf {
       throw std::runtime_error("IVF artifact close failed");
   }
 #endif
+  void copy_artifact_stream(std::istream& input, std::ostream& output) {
+    char buffer[8192];
+    while (input.read(buffer, sizeof(buffer)) || input.gcount())
+      output.write(buffer, input.gcount());
+  }
   uint64_t artifact_hash_file(const std::string& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input)

@@ -8,7 +8,7 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
-from test_cli import write_pivots
+from ivf_test_support import write_matrix, write_pivots, write_truth
 
 
 def run(script, env, success=True):
@@ -54,8 +54,8 @@ def main():
             rows = [(r * 3 + (32 if dtype == "uint8" else -100), 2, 3) for r in range(64)]
             queries = [rows[60], rows[40]]
             data, query, deep = (root / (dataset + suffix) for suffix in (".bin", ".query", ".gt"))
-            data.write_bytes(struct.pack("<II192" + fmt, 64, 3, *(v for row in rows for v in row)))
-            query.write_bytes(struct.pack("<II6" + fmt, 2, 3, *(v for row in queries for v in row)))
+            write_matrix(data, rows, fmt)
+            write_matrix(query, queries, fmt)
             gold = [
                 sorted(
                     [(i, sum((a - b) ** 2 for a, b in zip(q, v))) for i, v in enumerate(rows)],
@@ -63,11 +63,7 @@ def main():
                 )
                 for q in queries
             ]
-            deep.write_bytes(
-                struct.pack("<II", 2, 64)
-                + b"".join(struct.pack("<I", i) for row in gold for i, _ in row)
-                + b"".join(struct.pack("<f", d) for row in gold for _, d in row)
-            )
+            write_truth(deep, gold)
             pq = root / (dataset + "_pq")
             write_pivots(Path(str(pq) + "_pq_pivots.bin"))
             Path(str(pq) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 64, 2) + bytes(128))

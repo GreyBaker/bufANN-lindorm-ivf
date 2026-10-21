@@ -6,25 +6,25 @@ import json
 import os
 from pathlib import Path
 import re
-import struct
 import sys
-from common import command_log, digest, header, query_truth_shapes, read_json, require, write_json
-from harness import component_digests, prepare as prepare_base
-from settings import prepared_selection, profile, query_router_flags, runtime_resources, warmup_queries
+from common import (
+    command_log, counted_range_identity, digest, header, is_query_record,
+    query_truth_shapes, read_json, require, require_absent, write_json,
+)
+from harness import component_digests, driver_open_command, prepare as prepare_base
+from settings import (
+    prepared_selection, profile, query_policy_flags, query_router_flags, query_search_flags,
+    runtime_resources, warmup_queries,
+)
 
 
 def counted_identity(path, first, count):
-    require(path.stat().st_size == 4 + count * 4, "mixed counted-ID length mismatch")
-    with path.open("rb") as source:
-        require(source.read(4) == struct.pack("<I", count), "mixed counted-ID count mismatch")
-        for offset in range(0, count, 4096):
-            n = min(4096, count - offset)
-            require(
-                source.read(n * 4)
-                == struct.pack("<" + "I" * n, *range(first + offset, first + offset + n)),
-                "mixed IDs differ from prepared IVF source-row ranges",
-            )
-    return digest(path)
+    return counted_range_identity(
+        path, first, count,
+        framing_message="mixed counted-ID length mismatch",
+        count_message="mixed counted-ID count mismatch",
+        range_message="mixed IDs differ from prepared IVF source-row ranges",
+    )
 
 
 def identity(args):
@@ -87,8 +87,7 @@ def run(args):
     resources = runtime_resources(base["settings"]["page_size"])
     query_warmups = warmup_queries()
     path = w / "mixed_prepared.json"
-    require(path.stat().st_size <= 8 << 20, "oversized mixed preparation metadata")
-    prepared = json.loads(path.read_text())
+    prepared = read_json(path, max_bytes=8 << 20)
     require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
     selection = prepared_selection(base)
     require(
@@ -105,7 +104,7 @@ def run(args):
     require(output == w or w in output.parents, "mixed outputs must stay under prepared work")
     for name in ("rounds", "result.json", "summary.json", "nlist_selection.json"):
         dest = output / name
-        require(not dest.exists() and not dest.is_symlink(), f"mixed output exists: {dest}")
+        require_absent(dest, f"mixed output exists: {dest}")
     scheduler = os.environ.get("IVF_SCHEDULER", "update_driven")
     threads = os.environ.get("NTHREADS", "16")
     require(
@@ -132,20 +131,7 @@ def run(args):
         dest.mkdir()
         (dest / "checkpoint").mkdir()
         saved = dest / "checkpoint" / args.dataset
-        command = [
-            os.environ["IVF_DRIVER_BIN"],
-            "--validate_inputs",
-            "0",
-            "--data_type",
-            args.dtype,
-            "--metric",
-            args.metric,
-            "--dim",
-            str(args.dim),
-            "--nlist",
-            base["settings"]["nlist"],
-            "--index_prefix",
-            str(prefix),
+        command = driver_open_command(args, base["settings"]["nlist"], prefix) + [
             "--index_format",
             "mutable" if r else "immutable",
             "--workload",
@@ -166,12 +152,7 @@ def run(args):
             str(w / f"groundtruth/rounds/round_{r}_gt{args.recall_at}.bin"),
             "--recall_at",
             str(args.recall_at),
-            "--nprobe",
-            os.environ.get("IVF_NPROBE", "1"),
-            "--rerank_factor",
-            os.environ.get("IVF_RERANK_FACTOR", "2"),
-            "--query_threads",
-            os.environ.get("QUERY_THREADS", "1"),
+        ] + query_search_flags() + [
             "--private_heap_path",
             str(dest / "private.heap"),
             "--checkpoint_prefix",
@@ -194,16 +175,13 @@ def run(args):
             ]
         if args.query_count is not None:
             command += ["--query_count", str(args.query_count)]
-        command += query_router_flags()
-        command += ["--warmup_queries", query_warmups]
+        command += query_policy_flags(query_warmups)
         command_log(command, dest / "run.log")
         record = read_json(dest / "result.json")
         require(record["explicit_warmup_query_count"] == int(query_warmups),
                 "native mixed final-pass warmup completion count mismatch")
         require(
-            record["baseline"] == "IVF"
-            and record["phase"] == "query"
-            and record["workload"] == "mixed"
+            is_query_record(record, "mixed")
             and record["insert_count"] == args.insert_cap
             and record["delete_count"] == args.delete_cap
             and "recall" in record

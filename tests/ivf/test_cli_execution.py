@@ -9,76 +9,15 @@ import subprocess
 import sys
 import tempfile
 
-from test_cli import write_pivots
-
-
-def run(command, phase=None):
-    result = subprocess.run(command, text=True, capture_output=True, timeout=90)
-
-    def unique_fields(pairs):
-        assert len(dict(pairs)) == len(pairs), ("duplicate JSON metric field", pairs)
-        return dict(pairs)
-
-    records = [
-        json.loads(line, object_pairs_hook=unique_fields)
-        for line in result.stdout.splitlines()
-        if line.startswith('{"baseline":')
-    ]
-    if phase is None:
-        assert result.returncode != 0 and "ERROR:" in result.stderr, (
-            command,
-            result.stdout,
-            result.stderr,
-        )
-        assert not records, result.stdout
-        return result
-    assert result.returncode == 0, (command, result.stdout, result.stderr)
-    assert len(records) == 1 and records[0]["phase"] == phase, result.stdout
-    assert records[0]["baseline"] == "IVF"
-    if phase == "build":
-        phases = [line.split("phase=", 1)[1].split()[0]
-                  for line in result.stderr.splitlines() if line.startswith("[IVF build]")]
-        assert phases == ["input_identity", "training", "final_router", "posting_lists",
-                           "coordinate_heap", "heap_checkpoint", "artifact_verification", "complete"], phases
-    else:
-        progress = [dict(item.split("=", 1) for item in line.split()[2:])
-                    for line in result.stderr.splitlines() if line.startswith("[IVF driver]")]
-        assert progress and progress[0]["phase"] == "open_private_copy_verify", result.stderr
-        assert not any(p["event"] in ("failed", "abandoned", "incomplete") for p in progress), result.stderr
-        if phase == "query":
-            record = records[0]
-            assert record["fetch_adapter_mutex_wait_us_total"] >= 0
-            assert record["fetch_backend_pin_us_total"] >= 0
-            assert record["fetch_pin_admission_wait_us_total"] >= 0
-            assert (record["fetch_adapter_mutex_wait_us_total"] + record["fetch_backend_pin_us_total"]
-                    + record["fetch_pin_admission_wait_us_total"]
-                    <= record["fetch_us_total"] * 1.01 + 1.0)
-            assert "bounds_reads_and_writes" in record["fetch_pin_admission_policy"]
-            assert "not_additional_stages" in record["fetch_substage_timing_scope"]
-        if phase in ("insert", "delete"):
-            for name, count in (("insert", records[0]["insert_count"]),
-                                ("delete", records[0]["delete_count"] + records[0]["missing_delete_count"])):
-                finished = [p for p in progress if p["phase"] == name and p["event"] == "complete"]
-                assert len(finished) == 1 and int(finished[0]["completed"]) == count, progress
-            assert records[0]["foreground_heap_flush_bytes"] == records[0]["foreground_heap_page_writes"] * 4096
-            assert records[0]["checkpoint_heap_flush_bytes"] == records[0]["checkpoint_heap_page_writes"] * 4096
-            assert "not_device_io" in records[0]["heap_io_counter_scope"]
-    return records[0]
-
-
-def write_truth(path, rows):
-    width = len(rows[0])
-    path.write_bytes(
-        struct.pack("<II", len(rows), width)
-        + b"".join(struct.pack("<I", vid) for row in rows for vid, _ in row)
-        + b"".join(struct.pack("<f", distance) for row in rows for _, distance in row)
-    )
+from ivf_test_support import (
+    read_results, run_native_cli as run, write_ids, write_matrix, write_pivots, write_truth,
+)
 
 
 def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
     insert_ids, delete_ids = root / f"{dtype}_insert.ids", root / f"{dtype}_delete.ids"
-    insert_ids.write_bytes(struct.pack("<II", 1, 3))
-    delete_ids.write_bytes(struct.pack("<II", 1, 2))
+    write_ids(insert_ids, [3])
+    write_ids(delete_ids, [2])
     original = {p: p.read_bytes() for p in root.glob(prefix.name + ".*")}
     base = [
         args.driver,
@@ -296,14 +235,6 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
     assert all(p.read_bytes() == raw for p, raw in original.items())
 
 
-def read_results(path):
-    data = path.read_bytes()
-    rows, k = struct.unpack_from("<II", data)
-    assert len(data) == 8 + rows * k * 8
-    entries = list(struct.iter_unpack("<If", data[8:]))
-    return [entries[q * k : (q + 1) * k] for q in range(rows)]
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", required=True)
@@ -319,7 +250,7 @@ def main():
             pq_prefix = root / f"{dtype}_pq"
             write_pivots(Path(str(pq_prefix) + "_pq_pivots.bin"))
             codes = Path(str(pq_prefix) + "_pq_compressed.bin")
-            codes.write_bytes(struct.pack("<II", 4, 2) + bytes(8))
+            write_matrix(codes, [bytes(2)] * 4, "B")
             # Last row is reserved tail, must not be returned even though it is
             # closest to the first query. Nontrivial negative int8 coordinates.
             offset = -5 if dtype == "int8" else 5
@@ -327,9 +258,9 @@ def main():
             vectors = base + [(offset, 2, 3)]
             queries = [(offset, 2, 3), base[2], base[0]]
             data = root / f"{dtype}_data.bin"
-            data.write_bytes(struct.pack("<II12" + fmt, 4, 3, *(v for row in vectors for v in row)))
+            write_matrix(data, vectors, fmt)
             query = root / f"{dtype}_queries.bin"
-            query.write_bytes(struct.pack("<II9" + fmt, 3, 3, *(v for row in queries for v in row)))
+            write_matrix(query, queries, fmt)
             truth = root / f"{dtype}_gt.bin"
             oracle = [
                 sorted(
@@ -561,10 +492,7 @@ def main():
             # Canonical helper GT has a third, identity tags plane. Consume it
             # unchanged; do not silently score unsupported tag-space remaps.
             tagged_truth = root / f"{dtype}_tagged_gt.bin"
-            tagged_truth.write_bytes(
-                truth.read_bytes()
-                + b"".join(struct.pack("<I", vid) for row in gold for vid, _ in row)
-            )
+            write_truth(tagged_truth, gold, tags=[[vid for vid, _ in row] for row in gold])
             tagged = driver.copy()
             tagged[tagged.index("--gt_file") + 1] = str(tagged_truth)
             assert run(tagged, "query")["recall"] == 100

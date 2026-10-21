@@ -5,11 +5,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import struct
 import subprocess
 import sys
 import tempfile
-from test_cli import write_pivots
+from ivf_test_support import write_ids, write_matrix, write_pivots
 
 
 def run(command, success=True):
@@ -40,15 +39,15 @@ def main():
         for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
             pq = root / (dtype + "_pq")
             write_pivots(Path(str(pq) + "_pq_pivots.bin"))
-            Path(str(pq) + "_pq_compressed.bin").write_bytes(struct.pack("<II", 4, 2) + bytes(8))
+            write_matrix(Path(str(pq) + "_pq_compressed.bin"), [bytes(2)] * 4, "B")
             offset = -5 if dtype == "int8" else 5
             vectors = [(offset + 1, 2, 3), (offset - 1, 2, 3), (offset + 4, 2, 3), (offset, 2, 3)]
             queries = [vectors[2], vectors[0]]
             data, query, prefix = (
                 root / (dtype + suffix) for suffix in (".bin", "_queries.bin", "_index")
             )
-            data.write_bytes(struct.pack("<II12" + fmt, 4, 3, *(x for row in vectors for x in row)))
-            query.write_bytes(struct.pack("<II6" + fmt, 2, 3, *(x for row in queries for x in row)))
+            write_matrix(data, vectors, fmt)
+            write_matrix(query, queries, fmt)
             record = run(
                 [
                     args.build,
@@ -133,7 +132,7 @@ def main():
             ):
                 run(command + extra, False)
             ids = root / (dtype + ".ids")
-            ids.write_bytes(struct.pack("<II", 1, 3))
+            write_ids(ids, [3])
             saved = root / (dtype + "_checkpoint")
             inserted = run(
                 [

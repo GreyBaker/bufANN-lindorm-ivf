@@ -115,15 +115,16 @@ def scan_source(np, source, rows, dim, chunk_rows, callback, phase, progress_row
 def recommend(args):
     states = coverage.planned_states(args)
     with args.cached_gt.open("rb") as file:
-        header = file.read(8)
-    coverage.require(len(header) == 8, "truncated GT header")
+        header = file.read(coverage.GT_HEADER_BYTES)
+    coverage.require(len(header) == coverage.GT_HEADER_BYTES, "truncated GT header")
     query_count, cached_width = struct.unpack("<II", header)
-    planning_workspace = (16 * 1024 * 1024 + cached_width * 128
+    planning_workspace = (16 * 1024 * 1024 + coverage.row_scratch_bytes(cached_width)
                           + query_count * len(states) * 128)
     coverage.require(planning_workspace <= args.memory_budget_mb * 1024 * 1024,
                      "preflight/task scratch estimate exceeds --memory-budget-mb")
     cached = coverage.check_cache(args.cached_gt, args.full_count, states, args.k_out,
                                   args.expected_queries, args.worst_queries, collect_scan_queries=True)
+    layout = coverage.GTLayout(cached["queries"], cached["cached_k"])
     # Keep the existing width as a floor: shrinking is a different optimization.
     coverage.require(cached["cached_k"] <= args.full_count, "cached depth exceeds source population")
     tasks = {}
@@ -159,7 +160,7 @@ def recommend(args):
             except ImportError as error:
                 raise ValueError("NumPy is required for exact scans (use an environment with numpy installed)") from error
             workspace = (planning_workspace + args.chunk_rows * (5 * dim + 64)
-                         + len(tasks) * cached["cached_k"] * 128
+                         + len(tasks) * coverage.row_scratch_bytes(cached["cached_k"])
                          + sum(len(v) for v in tasks.values()) * args.k_out * 128
                          + 32 * 1024 * 1024)
             coverage.require(workspace <= args.memory_budget_mb * 1024 * 1024,
@@ -172,9 +173,8 @@ def recommend(args):
                 raw = queries.file.read(dim)
                 coverage.require(len(raw) == dim, "query truncated")
                 qvectors[query] = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
-                ids = coverage.plane(gt.file, 8 + query * cached["cached_k"] * 4, cached["cached_k"], "I")
-                distances = coverage.plane(gt.file, 8 + cached["queries"] * cached["cached_k"] * 4
-                                            + query * cached["cached_k"] * 4, cached["cached_k"], "f")
+                ids = coverage.plane(gt.file, layout.plane_offset(0, query), cached["cached_k"], "I")
+                distances = coverage.plane(gt.file, layout.plane_offset(1, query), cached["cached_k"], "f")
                 cached_rows[query] = (sorted(ids), dict(zip(ids, distances)), list(distances))
                 observed[query], full_best[query] = 0, []
                 for name in cases:
@@ -254,9 +254,10 @@ def recommend(args):
     report["recommended_k"] = min(args.full_count, ((needed + args.round_up - 1) // args.round_up) * args.round_up)
     report["recommendation_policy"] = "all_Kth_boundary_ties_included_existing_cache_width_floor_then_round_up"
     report["round_up"] = args.round_up
-    report["tagged_cache_bytes"] = 8 + cached["queries"] * report["recommended_k"] * 12
-    report["two_plane_cache_bytes"] = 8 + cached["queries"] * report["recommended_k"] * 8
-    report["fits_coverage_row_scratch_guard"] = report["recommended_k"] * 128 <= 64 * 1024 * 1024
+    recommended_layout = coverage.GTLayout(cached["queries"], report["recommended_k"])
+    report["tagged_cache_bytes"] = recommended_layout.byte_size(True)
+    report["two_plane_cache_bytes"] = recommended_layout.byte_size(False)
+    report["fits_coverage_row_scratch_guard"] = coverage.fits_row_scratch(report["recommended_k"])
     report["new_cache_preflight_required"] = True
     return report
 

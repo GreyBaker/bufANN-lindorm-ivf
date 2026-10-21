@@ -395,11 +395,25 @@ namespace {
                          immutable.codes(c).begin(), immutable.codes(c).end()),
           "conversion altered IDs/PQ bytes");
     }
-    const auto                    distances = table();
+    auto                          distances = table();
     const std::array<uint32_t, 3> all{2, 0, 1};
     require(mutable_lists->scan(all, distances, 64).candidates ==
                 immutable.scan(all, distances, 64).candidates,
-            "conversion changed ADC");
+             "conversion changed ADC");
+    std::fill(distances.begin(), distances.end(), 1);
+    std::fill_n(distances.begin(), 256, 16777216.0f);
+    for (uint32_t budget : {1u, 3u, 64u}) {
+      const auto frozen = immutable.scan(all, distances, budget);
+      const auto mutable_scan = mutable_lists->scan(all, distances, budget);
+      require(frozen.candidates == mutable_scan.candidates &&
+                  frozen.scanned_codes == base &&
+                  mutable_scan.scanned_codes == base &&
+                  frozen.candidates.size() == std::min(budget, base),
+              "immutable/mutable ADC rounding parity changed");
+      for (uint32_t r = 0; r < frozen.candidates.size(); ++r)
+        require(frozen.candidates[r] == PQCandidate{r + 5, 16777216.0f},
+                "ADC changed float chunk-order rounding/ID ties");
+    }
     mutable_lists->insert(9, 2, code(9));
     mutable_lists->erase(5);
     audit(*mutable_lists);

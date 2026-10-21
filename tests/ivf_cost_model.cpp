@@ -2,6 +2,7 @@
 // predictor.
 #include "ivf_cli.h"
 #include "ivf_training_json.h"
+#include "ivf_training_settings.h"
 #include "bufann/ivf_artifacts.h"
 #include "bufann/ivf_cost_model.h"
 #include "bufann/ivf_lists.h"
@@ -278,12 +279,7 @@ int main(int argc, char** argv) {
     config.build_threads = args.u32("--build_threads", 1);
     config.memory_budget_gb =
         double(budget - retained) / (1024.0 * 1024 * 1024);
-    config.trainer_mode =
-        parse_trainer_mode(args.get("--trainer_mode", "ann-reuse-seeded"));
-    config.init = parse_centroid_init(args.get("--init", "random_partition"));
-    config.training_breadth = args.u32("--training_breadth", 64);
-    config.training_rerank_factor = args.real("--training_rerank_factor", 3);
-    config.training_refine_breadth = args.u32("--training_refine_breadth", 128);
+    ivf_cli::read_training_settings(args, config);
     RouterOptions routing;
     routing.mode = parse_router_mode(args.get("--router_mode", "hnswlib"));
     const auto optimized = args.u32("--optimized_modes", 0);

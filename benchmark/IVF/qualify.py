@@ -17,13 +17,16 @@ import sys
 from common import (
     affinity,
     digest,
+    digests,
     execute,
     finite,
     flags,
     header,
+    is_query_record,
     positive,
     read_json,
     require,
+    require_absent,
     runtime_environment,
     shared_module_paths,
     values,
@@ -59,7 +62,7 @@ def aggregate(records, fields):
 
 def train(args):
     data, trainer, output = args.data.resolve(), args.trainer.resolve(), args.output.resolve()
-    require(not output.exists(), f"training output already exists: {output}")
+    require_absent(output, f"training output already exists: {output}")
     require(
         trainer.is_file() and os.access(trainer, os.X_OK),
         "missing routing-enabled training diagnostic tool",
@@ -153,9 +156,7 @@ def train(args):
         "source_identity": digest(data),
         "trainer_identity": digest(trainer),
         "orchestrator_identity": digest(__file__),
-        "shared_module_identities": {
-            key: digest(path) for key, path in shared_module_paths().items()
-        },
+        "shared_module_identities": digests(shared_module_paths()),
         "affinity": affinity(args.cpus),
         "runtime_environment": runtime_environment(),
         "timeout_s_per_mode": args.timeout,
@@ -205,8 +206,7 @@ def train(args):
             "source/trainer changed during comparison",
         )
         require(
-            {key: digest(path) for key, path in shared_module_paths().items()}
-            == plan["shared_module_identities"],
+            digests(shared_module_paths()) == plan["shared_module_identities"],
             "shared module changed during comparison",
         )
     require(
@@ -307,7 +307,7 @@ def sweep(args):
         "manifest": work / "index" / (dataset + ".manifest"),
         **shared_module_paths(),
     }
-    identities = {name: digest(path) for name, path in inputs.items()}
+    identities = digests(inputs)
     require(
         identities["query"] == prepared["query_identity"]
         and identities["truth"] == prepared["truth_identity"]
@@ -329,14 +329,12 @@ def sweep(args):
             warmup = trial < args.warmups
             tag = f"{args.tag}_c{c}_{'w' if warmup else 'r'}{trial if warmup else trial - args.warmups}"
             path = work / "runs" / tag
-            require(
-                not path.exists() and not path.is_symlink(), f"sweep run destination exists: {path}"
-            )
+            require_absent(path, f"sweep run destination exists: {path}")
             trials.append({"config": c, "warmup": warmup, "run_tag": tag})
     for directory in (work / "sweeps", work / "runs"):
         require(not directory.is_symlink(), "sweep/run parent must not be a symlink")
     root = work / "sweeps" / args.tag
-    require(not root.exists() and not root.is_symlink(), f"sweep destination exists: {root}")
+    require_absent(root, f"sweep destination exists: {root}")
     plan = {
         "version": 1,
         "kind": "ivf_query_sweep",
@@ -375,9 +373,7 @@ def sweep(args):
         path = work / "runs" / trial["run_tag"]
         record = read_json(path / "result.json")
         require(
-            record["baseline"] == "IVF"
-            and record["phase"] == "query"
-            and record["workload"] == "query",
+            is_query_record(record, "query"),
             "unexpected metrics",
         )
         require(
@@ -389,7 +385,7 @@ def sweep(args):
         require(0 <= record["recall"] <= 100, "invalid recall")
         aggregate([record], ("query_qps", "query_lat_p99_us", "peak_process_rss_mb", "recall"))
         require(
-            {name: digest(path) for name, path in inputs.items()} == identities,
+            digests(inputs) == identities,
             "sweep input/tool identity changed",
         )
         records.append(

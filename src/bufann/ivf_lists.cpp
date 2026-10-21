@@ -1,6 +1,7 @@
 #include "bufann/ivf_lists.h"
 #include "bufann/ivf_io.h"
 #include "bufann/ivf_artifacts.h"
+#include "bufann/ivf_numeric_internal.h"
 #include "ivf_lists_internal.h"
 
 #include <algorithm>
@@ -36,10 +37,7 @@ namespace diskann::ivf {
       check(bool(in) && shape[0] == expected.rows && shape[1] == expected.cols,
             "IVF list input header changed");
     }
-    bool nearer(const PQCandidate& a, const PQCandidate& b) {
-      return a.squared_distance < b.squared_distance ||
-             (a.squared_distance == b.squared_distance && a.id < b.id);
-    }
+    using detail::candidate_nearer;
     template<typename T>
     T read(std::istream& in) {
       T value{};
@@ -339,21 +337,20 @@ namespace diskann::ivf {
         std::adjacent_find(selected.begin(), selected.end()) == selected.end(),
         "Duplicate IVF scan list ID");
     std::priority_queue<PQCandidate, std::vector<PQCandidate>,
-                        decltype(&nearer)>
-             best(&nearer);
+                        decltype(&candidate_nearer<PQCandidate>)>
+             best(&candidate_nearer<PQCandidate>);
     ListScan result;
     for (uint32_t list : lists) {
       const auto list_ids = ids(list);
       const auto list_codes = codes(list);
       for (size_t r = 0; r < list_ids.size(); ++r) {
-        float distance = 0;
-        for (uint32_t c = 0; c < _chunks; ++c)
-          distance += distances[size_t(c) * 256 + list_codes[r * _chunks + c]];
+        const float distance = detail::adc_distance_unchecked(
+            list_codes.data() + r * _chunks, distances.data(), _chunks);
         check(std::isfinite(distance), "IVF ADC sum overflow");
         const PQCandidate candidate{list_ids[r], distance};
         if (best.size() < budget)
           best.push(candidate);
-        else if (nearer(candidate, best.top())) {
+        else if (candidate_nearer(candidate, best.top())) {
           best.pop();
           best.push(candidate);
         }

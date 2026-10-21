@@ -1,6 +1,7 @@
 #include "bufann/ivf_router.h"
 #include "bufann/ivf_artifacts.h"
 #include "bufann/ivf_io.h"
+#include "bufann/ivf_numeric_internal.h"
 #include "bufann/ivf_patched_graph.h"
 #include "bufann/ivf_pca.h"
 #include "ivf_centroids_internal.h"
@@ -358,13 +359,8 @@ namespace diskann::ivf {
     check(std::isfinite(factor) && factor >= 1,
           "Invalid centroid rerank factor");
     auto distance = [&](uint32_t id) {
-      double result = 0;
-      for (uint32_t d = 0; d < _dim; ++d) {
-        const double diff =
-            double(query[d]) - _centroids[size_t(id) * _dim + d];
-        result += diff * diff;
-      }
-      return result;
+      return detail::squared_l2_double_unchecked(
+          query.data(), _centroids.data() + size_t(id) * _dim, _dim);
     };
     std::vector<CentroidHit> hits;
     if (exact || mode == RouterMode::Exact || count == nlist()) {
@@ -778,12 +774,9 @@ namespace diskann::ivf {
         double   best = std::numeric_limits<double>::infinity();
         uint32_t label = UINT32_MAX;
         for (auto hit : hits) {
-          double distance = 0;
-          for (uint32_t d = 0; d < dimension; ++d) {
-            const double delta =
-                double(vector[d]) - coordinates[size_t(hit.id) * dimension + d];
-            distance += delta * delta;
-          }
+          const double distance = detail::squared_l2_double_unchecked(
+              vector.data(), coordinates.data() + size_t(hit.id) * dimension,
+              dimension);
           if (distance < best || (distance == best && hit.id < label)) {
             best = distance;
             label = hit.id;

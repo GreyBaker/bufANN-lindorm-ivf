@@ -1,6 +1,7 @@
 #include "bufann/ivf_config.h"
 #include "bufann/ivf_io.h"
 #include "ivf_cli.h"
+#include "ivf_training_settings.h"
 #ifdef IVF_NATIVE_EXECUTION
 #include "ivf_cli_execution.h"
 #include "ann_exception.h"
@@ -104,12 +105,7 @@ int main(int argc, char** argv) {
     config.build_threads = args.u32("--build_threads", 1);
     config.seed = args.integer("--seed");
     config.memory_budget_gb = args.real("--memory_budget_gb", 1.0);
-    config.trainer_mode =
-        parse_trainer_mode(args.get("--trainer_mode", "ann-reuse-seeded"));
-    config.init = parse_centroid_init(args.get("--init", "random_partition"));
-    config.training_breadth = args.u32("--training_breadth", 64);
-    config.training_rerank_factor = args.real("--training_rerank_factor", 3);
-    config.training_refine_breadth = args.u32("--training_refine_breadth", 128);
+    ivf_cli::read_training_settings(args, config);
     config.validate();
     const auto vectors = inspect_vectors(args.require("--data_file"),
                                          config.data_type, config.dim);

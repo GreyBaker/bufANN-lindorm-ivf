@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -74,6 +75,29 @@ namespace {
            (a.squared_distance == b.squared_distance && a.id < b.id);
   }
   template<typename T>
+  void pq_adc_numeric_policy(const PQCodebook<T>& pq) {
+    const std::array<uint8_t, chunks> code{3, 7, 11};
+    std::vector<float> distances(chunks * 256, 1);
+    std::fill_n(distances.begin(), 256, 16777216.0f);
+    require(pq.distance(code.data(), distances) == 16777216.0f,
+            "public PQ distance changed float chunk-order rounding");
+    // Unlike list scanners, the public lookup deliberately propagates
+    // nonfinite values/sums; extracting its kernel must not add validation.
+    distances[code[0]] = std::numeric_limits<float>::quiet_NaN();
+    require(std::isnan(pq.distance(code.data(), distances)),
+            "public PQ distance stopped propagating NaN");
+    distances[code[0]] = std::numeric_limits<float>::infinity();
+    require(std::isinf(pq.distance(code.data(), distances)),
+            "public PQ distance stopped propagating infinity");
+    std::fill(distances.begin(), distances.end(),
+              std::numeric_limits<float>::max());
+    require(std::isinf(pq.distance(code.data(), distances)),
+            "public PQ distance stopped propagating sum overflow");
+    rejects([&] { pq.distance(nullptr, distances); });
+    distances.resize(1);
+    rejects([&] { pq.distance(code.data(), distances); });
+  }
+  template<typename T>
   void exercise(const std::filesystem::path& root, DataType type) {
     std::filesystem::create_directories(root);
     const auto vectors = (root / "vectors.bin").string(),
@@ -81,6 +105,7 @@ namespace {
     const auto pivot_path = (root / "pivots.bin").string();
     pivots(pivot_path);
     PQCodebook<T> pq(pivot_path, dim);
+    pq_adc_numeric_policy(pq);
     rejects([&] { PQCodebook<T> mismatch(pivot_path, dim - 1); });
     rejects([&] { PQCodebook<T> mismatch(pivot_path, 0); });
     rejects([&] { PQCodebook<T> mismatch(pivot_path, dim, chunks + 1); });

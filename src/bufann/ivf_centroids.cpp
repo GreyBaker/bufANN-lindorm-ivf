@@ -1,6 +1,8 @@
 #include "bufann/ivf_centroids.h"
 #include "bufann/ivf_io.h"
+#include "bufann/ivf_numeric_internal.h"
 #include "ivf_centroids_internal.h"
+#include "ivf_random_internal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,14 +34,6 @@ namespace diskann::ivf {
       check(total <= UINT64_MAX - amount, "Centroid workspace overflow");
       total += amount;
     }
-    uint32_t bounded(std::mt19937_64& rng, uint64_t bound) {
-      const uint64_t threshold = (uint64_t(0) - bound) % bound;
-      uint64_t       value;
-      do {
-        value = rng();
-      } while (value < threshold);
-      return static_cast<uint32_t>(value % bound);
-    }
     uint32_t u32(const unsigned char* p) {
       return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 |
              uint32_t(p[3]) << 24;
@@ -66,7 +60,8 @@ namespace diskann::ivf {
         for (T value : row)
           check(std::isfinite(float(value)),
                 "Non-finite initial-base coordinate");
-        const uint32_t slot = r < count ? r : bounded(rng, uint64_t(r) + 1);
+        const uint32_t slot =
+            r < count ? r : detail::bounded_random(rng, uint64_t(r) + 1);
         if (slot >= count)
           continue;
         ids[slot] = r;
@@ -152,7 +147,8 @@ namespace diskann::ivf {
     result.centroids.resize(static_cast<size_t>(centroid_cells));
     if (config.init == CentroidInit::Sample) {
       for (uint32_t c = 0; c < config.nlist; ++c) {
-        std::swap(order[c], order[c + bounded(rng, uint64_t(count) - c)]);
+        std::swap(order[c],
+                  order[c + detail::bounded_random(rng, uint64_t(count) - c)]);
         std::copy_n(samples.data() + size_t(order[c]) * config.dim, config.dim,
                     result.centroids.data() + size_t(c) * config.dim);
       }
@@ -161,7 +157,8 @@ namespace diskann::ivf {
       // round-robin. Every initial partition is nonempty, including nlist ==
       // sample count.
       for (uint32_t r = 0; r < count; ++r)
-        std::swap(order[r], order[r + bounded(rng, uint64_t(count) - r)]);
+        std::swap(order[r],
+                  order[r + detail::bounded_random(rng, uint64_t(count) - r)]);
     }
     std::vector<uint32_t> assignment(count, UINT32_MAX);
     std::vector<double>   distances(count);
@@ -252,13 +249,10 @@ namespace diskann::ivf {
               const uint32_t first = index ? label : 0;
               const uint32_t last = index ? label + 1 : config.nlist;
               for (uint32_t c = first; c < last; ++c) {
-                double dist = 0;
-                for (uint32_t d = 0; d < config.dim; ++d) {
-                  const double diff =
-                      double(samples[r * config.dim + d]) -
-                      result.centroids[size_t(c) * config.dim + d];
-                  dist += diff * diff;
-                }
+                const double dist = detail::squared_l2_double_unchecked(
+                    samples.data() + r * config.dim,
+                    result.centroids.data() + size_t(c) * config.dim,
+                    config.dim);
                 if (dist < best) {
                   best = dist;
                   label = c;

@@ -52,6 +52,39 @@ namespace diskann::ivf {
       in >> value;
       check(bool(in) && value == expected, "Invalid IVF manifest field");
     }
+    // Suffix order is persisted. Keep these operations mechanical; each
+    // manifest family owns its framing, native flag, and verification phases.
+    template<size_t N>
+    void read_component_digests(
+        std::istream& in, const std::array<const char*, N>& suffixes,
+        std::array<ArtifactDigest, N>& digests) {
+      for (size_t i = 0; i < N; ++i) {
+        word(in, suffixes[i]);
+        digests[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
+      }
+    }
+    template<size_t N>
+    void write_component_digests(
+        std::ostream& out, const std::array<const char*, N>& suffixes,
+        const std::array<ArtifactDigest, N>& digests) {
+      for (size_t i = 0; i < N; ++i)
+        out << suffixes[i] << ' ' << digests[i].bytes << ' ' << digests[i].hash
+            << '\n';
+    }
+    template<size_t N>
+    void collect_component_digests(
+        const std::string& prefix, const std::array<const char*, N>& suffixes,
+        std::array<ArtifactDigest, N>& digests) {
+      for (size_t i = 0; i < N; ++i)
+        digests[i] = artifact_digest(prefix + suffixes[i]);
+    }
+    template<size_t N>
+    void verify_component_digests(
+        const std::string& prefix, const std::array<const char*, N>& suffixes,
+        const std::array<ArtifactDigest, N>& digests, const char* message) {
+      for (size_t i = 0; i < N; ++i)
+        check(artifact_digest(prefix + suffixes[i]) == digests[i], message);
+    }
     uint64_t budget_bytes(const BuildConfig& config) {
       const long double bytes =
           static_cast<long double>(config.memory_budget_gb) * 1024 * 1024 *
@@ -226,16 +259,9 @@ namespace diskann::ivf {
         word(in, "source");
         digest = {integer<uint64_t>(in), integer<uint64_t>(in)};
       }
-      for (size_t i = 0; i < m.components.size(); ++i) {
-        word(in, index_component_suffixes[i]);
-        m.components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
-      }
+      read_component_digests(in, index_component_suffixes, m.components);
       if (m.routing.native_modes)
-        for (size_t i = 0; i < m.native_components.size(); ++i) {
-          word(in, native_router_suffixes[i]);
-          m.native_components[i] = {integer<uint64_t>(in),
-                                    integer<uint64_t>(in)};
-        }
+        read_component_digests(in, native_router_suffixes, m.native_components);
       in >> std::ws;
       check(in.eof(), "Trailing IVF manifest data");
       validate(m);
@@ -288,14 +314,10 @@ namespace diskann::ivf {
             << m.routing.native_work_limit << ' ' << m.pca_retained_dim << '\n';
       for (auto digest : m.sources)
         out << "source " << digest.bytes << ' ' << digest.hash << '\n';
-      for (size_t i = 0; i < m.components.size(); ++i)
-        out << index_component_suffixes[i] << ' ' << m.components[i].bytes
-            << ' ' << m.components[i].hash << '\n';
+      write_component_digests(out, index_component_suffixes, m.components);
       if (m.routing.native_modes)
-        for (size_t i = 0; i < m.native_components.size(); ++i)
-          out << native_router_suffixes[i] << ' '
-              << m.native_components[i].bytes << ' '
-              << m.native_components[i].hash << '\n';
+        write_component_digests(out, native_router_suffixes,
+                                m.native_components);
       out.close();
       check(bool(out), "IVF manifest write failed");
     }
@@ -307,9 +329,7 @@ namespace diskann::ivf {
       std::ifstream input(from, std::ios::binary);
       std::ofstream output(to, std::ios::binary);
       check(bool(input) && bool(output), "Cannot copy IVF component");
-      char buffer[8192];
-      while (input.read(buffer, sizeof(buffer)) || input.gcount())
-        output.write(buffer, input.gcount());
+      copy_artifact_stream(input, output);
       check(input.eof() && !input.bad(), "IVF component copy read failed");
       output.close();
       check(bool(output), "IVF component copy write failed");
@@ -368,16 +388,9 @@ namespace diskann::ivf {
       m.native = version == "IVFMUTABLE2";
       m.live = integer<uint32_t>(in);
       m.retained = integer<uint32_t>(in);
-      for (size_t i = 0; i < m.components.size(); ++i) {
-        word(in, mutable_component_suffixes[i]);
-        m.components[i] = {integer<uint64_t>(in), integer<uint64_t>(in)};
-      }
+      read_component_digests(in, mutable_component_suffixes, m.components);
       if (m.native)
-        for (size_t i = 0; i < m.native_components.size(); ++i) {
-          word(in, native_router_suffixes[i]);
-          m.native_components[i] = {integer<uint64_t>(in),
-                                    integer<uint64_t>(in)};
-        }
+        read_component_digests(in, native_router_suffixes, m.native_components);
       in >> std::ws;
       check(in.eof(), "Trailing mutable IVF manifest data");
       return m;
@@ -518,12 +531,10 @@ namespace diskann::ivf {
                                                      artifact_digest(pivots),
                                                      artifact_digest(codes)},
           "IVF source changed during build");
-    for (size_t i = 0; i < m.components.size(); ++i)
-      m.components[i] = artifact_digest(prefix + index_component_suffixes[i]);
+    collect_component_digests(prefix, index_component_suffixes, m.components);
     if (routing.native_modes)
-      for (size_t i = 0; i < m.native_components.size(); ++i)
-        m.native_components[i] =
-            artifact_digest(prefix + native_router_suffixes[i]);
+      collect_component_digests(prefix, native_router_suffixes,
+                                m.native_components);
     write_manifest(
         prefix, m);  // Last successful operation; not an atomic/fsync commit.
     progress("complete");
@@ -551,15 +562,12 @@ namespace diskann::ivf {
     add(bytes, pq_allowance(m));
     check(bytes <= options.memory_budget_bytes && bytes <= SIZE_MAX,
           "IVF composed open exceeds workspace allowance");
-    for (size_t i = 0; i < m.components.size(); ++i)
-      check(artifact_digest(prefix + index_component_suffixes[i]) ==
-                m.components[i],
-            "IVF index component integrity mismatch");
+    verify_component_digests(prefix, index_component_suffixes, m.components,
+                             "IVF index component integrity mismatch");
     if (m.routing.native_modes)
-      for (size_t i = 0; i < m.native_components.size(); ++i)
-        check(artifact_digest(prefix + native_router_suffixes[i]) ==
-                  m.native_components[i],
-              "IVF native component integrity mismatch");
+      verify_component_digests(prefix, native_router_suffixes,
+                               m.native_components,
+                               "IVF native component integrity mismatch");
     auto result = std::unique_ptr<NativeIndex>(new NativeIndex);
     result->_manifest = m;
     result->_estimated_open_bytes = bytes;
@@ -687,15 +695,12 @@ namespace diskann::ivf {
                                                         source + ".heap.meta");
     check(result->_heap->size() == result->_lists->size(),
           "Mutable IVF fork heap/list population mismatch");
-    for (size_t i = 0; i < m.components.size(); ++i)
-      check(artifact_digest(source + index_component_suffixes[i]) ==
-                m.components[i],
-            "Immutable IVF source changed during fork");
+    verify_component_digests(source, index_component_suffixes, m.components,
+                             "Immutable IVF source changed during fork");
     if (m.routing.native_modes)
-      for (size_t i = 0; i < m.native_components.size(); ++i)
-        check(artifact_digest(source + native_router_suffixes[i]) ==
-                  m.native_components[i],
-              "Native IVF source changed during fork");
+      verify_component_digests(source, native_router_suffixes,
+                               m.native_components,
+                               "Native IVF source changed during fork");
     return result;
   }
   template<typename T>
@@ -860,26 +865,20 @@ namespace diskann::ivf {
     current.live = _lists->size();
     current.retained = _heap->retained_size();
     current.native = _origin.routing.native_modes;
-    for (size_t i = 0; i < current.components.size(); ++i)
-      current.components[i] =
-          artifact_digest(prefix + mutable_component_suffixes[i]);
+    collect_component_digests(prefix, mutable_component_suffixes,
+                              current.components);
     if (current.native)
-      for (size_t i = 0; i < current.native_components.size(); ++i)
-        current.native_components[i] =
-            artifact_digest(prefix + native_router_suffixes[i]);
+      collect_component_digests(prefix, native_router_suffixes,
+                                current.native_components);
     validate_frozen_components(current, _origin);
     std::ofstream out(prefix + ".manifest", std::ios::binary);
     out.imbue(std::locale::classic());
     out << (current.native ? "IVFMUTABLE2" : "IVFMUTABLE1") << ' '
         << current.live << ' ' << current.retained << '\n';
-    for (size_t i = 0; i < current.components.size(); ++i)
-      out << mutable_component_suffixes[i] << ' ' << current.components[i].bytes
-          << ' ' << current.components[i].hash << '\n';
+    write_component_digests(out, mutable_component_suffixes, current.components);
     if (current.native)
-      for (size_t i = 0; i < current.native_components.size(); ++i)
-        out << native_router_suffixes[i] << ' '
-            << current.native_components[i].bytes << ' '
-            << current.native_components[i].hash << '\n';
+      write_component_digests(out, native_router_suffixes,
+                              current.native_components);
     out.close();
     check(bool(out), "Mutable IVF checkpoint manifest write failure");
   }
@@ -892,15 +891,13 @@ namespace diskann::ivf {
     require_new_artifact(heap_path);
     require_new_artifact(heap_path + ".pq.bin");
     const auto current = read_mutable_manifest(prefix);
-    for (size_t i = 0; i < current.components.size(); ++i)
-      check(artifact_digest(prefix + mutable_component_suffixes[i]) ==
-                current.components[i],
-            "Mutable IVF checkpoint integrity mismatch");
+    verify_component_digests(prefix, mutable_component_suffixes,
+                             current.components,
+                             "Mutable IVF checkpoint integrity mismatch");
     if (current.native)
-      for (size_t i = 0; i < current.native_components.size(); ++i)
-        check(artifact_digest(prefix + native_router_suffixes[i]) ==
-                  current.native_components[i],
-              "Mutable native component integrity mismatch");
+      verify_component_digests(prefix, native_router_suffixes,
+                               current.native_components,
+                               "Mutable native component integrity mismatch");
     auto origin = read_manifest_file(prefix + ".origin");
     validate_frozen_components(current, origin);
     check(origin.training.data_type == type<T>(),
@@ -956,15 +953,13 @@ namespace diskann::ivf {
               result->_heap->retained_size() == current.retained,
           "Mutable IVF checkpoint heap population mismatch");
     result->validate_checkpoint_membership();
-    for (size_t i = 0; i < current.components.size(); ++i)
-      check(artifact_digest(prefix + mutable_component_suffixes[i]) ==
-                current.components[i],
-            "Mutable IVF checkpoint changed during reopen");
+    verify_component_digests(prefix, mutable_component_suffixes,
+                             current.components,
+                             "Mutable IVF checkpoint changed during reopen");
     if (current.native)
-      for (size_t i = 0; i < current.native_components.size(); ++i)
-        check(artifact_digest(prefix + native_router_suffixes[i]) ==
-                  current.native_components[i],
-              "Mutable native checkpoint changed during reopen");
+      verify_component_digests(prefix, native_router_suffixes,
+                               current.native_components,
+                               "Mutable native checkpoint changed during reopen");
     return result;
   }
   template class MutableIndex<float>;

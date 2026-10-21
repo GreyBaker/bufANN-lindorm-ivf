@@ -39,7 +39,52 @@ def write_cache(path, base, queries, k, custom_ids=None, tags=True):
     path.write_bytes(struct.pack("<II", len(queries), k)
                      + np.asarray(all_ids, dtype="<u4").tobytes()
                      + np.asarray(all_distances, dtype="<f4").tobytes()
-                     + (np.asarray(all_ids, dtype="<u4").tobytes() if tags else b""))
+                      + (np.asarray(all_ids, dtype="<u4").tobytes() if tags else b""))
+
+
+class DepthLayoutTests(unittest.TestCase):
+    """Coverage-only advice and admission do not require NumPy."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gt_depth_layout_")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source, self.queries, self.cache = [self.root / name for name in ("base.bin", "query.bin", "gt.bin")]
+        self.source.write_bytes(struct.pack("<II", 100, 1) + bytes(range(100)))
+        self.queries.write_bytes(struct.pack("<II", 2, 1) + b"\x00\x00")
+
+    def arguments(self, extra=()):
+        return depth.parser().parse_args([
+            "--cached-gt", str(self.cache), "--base-file", str(self.source), "--query-file", str(self.queries),
+            "--full-count", "100", "--base-count", "90", "--k-out", "2", *extra])
+
+    def test_both_layouts_report_same_sizes_and_admission_without_scans(self):
+        ids = struct.pack("<6I", 0, 1, 2, 0, 1, 2)
+        distances = struct.pack("<6f", 0, 1, 4, 0, 1, 4)
+        for tags in (False, True):
+            self.cache.write_bytes(struct.pack("<II", 2, 3) + ids + distances + (ids if tags else b""))
+            with self.subTest(tags=tags), \
+                    patch.object(depth, "scan_source", side_effect=AssertionError("must not scan covered rows")):
+                report = depth.recommend(self.arguments(["--round-up", "4"]))
+            self.assertEqual(report["recommended_k"], 4)
+            self.assertEqual(report["tagged_cache_bytes"], 104)
+            self.assertEqual(report["two_plane_cache_bytes"], 72)
+            self.assertTrue(report["fits_coverage_row_scratch_guard"])
+            self.assertEqual(report["source_distance_passes"], 0)
+            self.assertIsNone(report["source_sha256"])
+            self.assertEqual(report["cached_coverage"]["with_identity_tags"], tags)
+
+    def test_planning_memory_guard_still_precedes_cache_framing(self):
+        self.cache.write_bytes(struct.pack("<II", 2, 1000000))
+        with self.assertRaisesRegex(ValueError, "preflight/task scratch estimate exceeds"):
+            depth.recommend(self.arguments(["--memory-budget-mb", "1"]))
+        with self.assertRaisesRegex(ValueError, "GT framing mismatch"):
+            depth.recommend(self.arguments())
+
+    def test_truncated_header_still_precedes_memory_guard(self):
+        self.cache.write_bytes(b"short")
+        with self.assertRaisesRegex(ValueError, "truncated GT header"):
+            depth.recommend(self.arguments(["--memory-budget-mb", "1"]))
 
 
 @unittest.skipUnless(np is not None, "exact GT depth tests require NumPy")

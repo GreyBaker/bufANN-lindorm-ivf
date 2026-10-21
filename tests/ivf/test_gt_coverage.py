@@ -65,6 +65,103 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(states[3].contains(90_000_000))
         self.assertFalse(states[3].contains(91_000_000))
 
+    def plan_args(self, extra=()):
+        return coverage.parser().parse_args([
+            "--cached-gt", str(self.gt), "--full-count", "100", "--base-count", "90", "--k-out", "2", *extra])
+
+    def test_resolved_plan_defaults_and_cli_report(self):
+        args = self.plan_args()
+        states, plan = coverage.resolved_plan(args)
+        self.assertEqual(states, self.states)
+        self.assertEqual(states, coverage.planned_states(args))
+        self.assertEqual([s.name for s in states], ["query", "insert", "delete"]
+                         + [f"mixed_round_{r}" for r in range(1, 11)])
+        self.assertEqual(plan, {"base_count": 90, "insert_count": 10, "delete_count": 10,
+                               "mixed_rounds": 10, "mixed_insert_cap": 1, "mixed_delete_cap": 1,
+                               "insert_round_cap": None, "delete_round_cap": None})
+        self.assertIsNone(args.insert_count)
+        self.assertIsNone(args.delete_count)
+        write_gt(self.gt, [[1, 2, 3]])
+        output = self.root / "plan.json"
+        result = self.cli(["--json-output", str(output)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(output.read_text())
+        self.assertEqual(report["plan"], plan)
+        self.assertEqual([s["name"] for s in report["states"]], [s.name for s in states])
+
+    def test_resolved_plan_independent_caps_and_state_order(self):
+        extra = ["--base-count", "80", "--insert-count", "6", "--delete-count", "8",
+                 "--mixed-rounds", "3", "--mixed-insert-cap", "5", "--mixed-delete-cap", "7",
+                 "--insert-round-cap", "3", "--delete-round-cap", "2"]
+        args = self.plan_args(extra)
+        states, plan = coverage.resolved_plan(args)
+        expected = [coverage.State("query", 80), coverage.State("insert", 86), coverage.State("delete", 72),
+                    coverage.State("insert_round_1", 83), coverage.State("insert_round_2", 86)]
+        expected += [coverage.State(f"delete_round_{r}", 80, 72, 72 + r * 2) for r in range(1, 5)]
+        expected += [coverage.State(f"mixed_round_{r}", 80 + r * 5, 59, 59 + r * 7) for r in range(1, 4)]
+        self.assertEqual(states, expected)
+        self.assertEqual(coverage.planned_states(args), expected)
+        self.assertEqual(plan, {"base_count": 80, "insert_count": 6, "delete_count": 8,
+                               "mixed_rounds": 3, "mixed_insert_cap": 5, "mixed_delete_cap": 7,
+                               "insert_round_cap": 3, "delete_round_cap": 2})
+        write_gt(self.gt, [[1, 2, 3]])
+        output = self.root / "custom-plan.json"
+        result = self.cli([*extra, "--json-output", str(output)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(output.read_text())["plan"], plan)
+
+    def test_resolved_plan_retains_validation_order(self):
+        for extra, error in ((["--base-count", "100", "--k-out", "1000"], "require 0 < base"),
+                             (["--insert-count", "5"], "mixed inserts: count must divide rounds"),
+                             (["--k-out", "81"], "K exceeds a declared live population")):
+            for resolve in (coverage.resolved_plan, coverage.planned_states):
+                with self.subTest(extra=extra, resolve=resolve.__name__), self.assertRaisesRegex(ValueError, error):
+                    resolve(self.plan_args(extra))
+
+    def test_layout_and_row_scratch_boundary(self):
+        layout = coverage.GTLayout(3, 5)
+        self.assertEqual(layout.cells, 15)
+        for index in range(3):
+            self.assertEqual(layout.plane_offset(index), 8 + index * 15 * 4)
+            self.assertEqual(layout.plane_offset(index, 2), 8 + (index * 15 + 10) * 4)
+        for tags, size in ((False, 128), (True, 188)):
+            self.assertEqual(layout.byte_size(tags), size)
+            self.assertEqual(layout.identity_tags(size), tags)
+        with self.assertRaisesRegex(ValueError, "GT framing mismatch"):
+            layout.identity_tags(129)
+        limit = 524288
+        self.assertEqual(coverage.row_scratch_bytes(limit), 64 * 1024 * 1024)
+        self.assertTrue(coverage.fits_row_scratch(limit))
+        self.assertFalse(coverage.fits_row_scratch(limit + 1))
+
+    def test_framing_and_scratch_checks_precede_hashing(self):
+        width = 524289
+        self.gt.write_bytes(struct.pack("<II", 1, width))
+        with patch.object(coverage, "sha256", side_effect=AssertionError("must reject before hashing")):
+            with self.assertRaisesRegex(ValueError, "query count mismatch"):
+                self.check(expected_queries=2)
+            with self.assertRaisesRegex(ValueError, "GT framing mismatch"):
+                self.check()
+            with self.gt.open("r+b") as file:
+                file.truncate(8 + width * 8)
+            with self.assertRaisesRegex(ValueError, "cached row exceeds 64MiB scratch estimate"):
+                self.check()
+
+    def test_importlib_loading_without_scripts_on_sys_path(self):
+        code = '''import importlib.util, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+assert str(path.parent) not in sys.path
+spec = importlib.util.spec_from_file_location("standalone_coverage", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert module.GTLayout(2, 3).byte_size(True) == 80
+assert module.fits_row_scratch(524288)
+'''
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(SCRIPT)],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_underflow_and_deeper_cache(self):
         shallow = [[80, 81, 82, 83, 84, 85, 86, 87, 88, 1],
                    [0, 10, 20, 30, 40, 50, 60, 70, 75, 79]]
@@ -148,16 +245,17 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(self.cli(["--mixed-rounds", "0"]).returncode, 2)
 
     def test_malformed_cache(self):
-        for name, rows, distances in (
-            ("duplicate", [[1, 1, 2]], None),
-            ("out_of_range", [[1, 2, 100]], None),
-            ("nan", [[1, 2, 3]], [0.0, float("nan"), 2.0]),
-            ("negative", [[1, 2, 3]], [-1.0, 1.0, 2.0]),
-            ("unsorted", [[1, 2, 3]], [1.0, 0.0, 2.0]),
+        for name, rows, distances, error in (
+            ("duplicate", [[1, 1, 2]], None, "duplicate GT ID at query 0"),
+            ("out_of_range", [[1, 2, 100]], None, "GT ID outside full source at query 0"),
+            ("nan", [[1, 2, 3]], [0.0, float("nan"), 2.0], "invalid/unsorted GT distance at query 0"),
+            ("infinite", [[1, 2, 3]], [0.0, 1.0, float("inf")], "invalid/unsorted GT distance at query 0"),
+            ("negative", [[1, 2, 3]], [-1.0, 1.0, 2.0], "invalid/unsorted GT distance at query 0"),
+            ("unsorted", [[1, 2, 3]], [1.0, 0.0, 2.0], "invalid/unsorted GT distance at query 0"),
         ):
             with self.subTest(name=name):
                 write_gt(self.gt, rows, distances=distances)
-                with self.assertRaises(ValueError):
+                with self.assertRaisesRegex(ValueError, error):
                     self.check()
         write_gt(self.gt, [[1, 2, 3]])
         bad = bytearray(self.gt.read_bytes())

@@ -3,10 +3,11 @@
 import argparse
 import json
 from pathlib import Path
-import struct
 import subprocess
 import sys
 import tempfile
+
+from ivf_test_support import write_matrix
 
 
 def main():
@@ -30,10 +31,8 @@ def main():
         for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
             query = root / (dtype + ".bin")
             offset = 200 if dtype == "uint8" else -20
-            query.write_bytes(
-                struct.pack("<II", 4, 13)
-                + struct.pack("<" + fmt * 52, *(offset + (i % 11) for i in range(52)))
-            )
+            values = [offset + (i % 11) for i in range(52)]
+            write_matrix(query, [values[r * 13 : (r + 1) * 13] for r in range(4)], fmt)
             command = [
                 args.diagnostic,
                 "--index_prefix",

@@ -22,6 +22,12 @@ def require(ok, message):
         raise ValueError(message)
 
 
+def require_absent(path, message):
+    """Reject occupied destinations, including dangling symlinks, without resolving."""
+    path = Path(path)
+    require(not path.exists() and not path.is_symlink(), message)
+
+
 def digest(path):
     h = hashlib.sha256()
     size = 0
@@ -30,6 +36,44 @@ def digest(path):
             h.update(chunk)
             size += len(chunk)
     return {"bytes": size, "sha256": h.hexdigest()}
+
+
+def digests(named_paths):
+    """Hash every named path in mapping order, retaining the caller's names."""
+    return {name: digest(path) for name, path in named_paths.items()}
+
+
+def counted_range_identity(
+    path, first, count, *,
+    framing_message="invalid prepared counted-ID framing",
+    count_message="counted-ID count mismatch",
+    range_message="prepared update IDs differ from IVF source-row range",
+):
+    """Validate a counted little-endian contiguous source-row range, then hash it.
+
+    Workload-specific range arithmetic/admission belongs to the caller.
+    """
+    path = Path(path)
+    require(path.stat().st_size == 4 + 4 * count, framing_message)
+    with path.open("rb") as source:
+        require(source.read(4) == struct.pack("<I", count), count_message)
+        for offset in range(0, count, 4096):
+            length = min(4096, count - offset)
+            require(
+                source.read(4 * length)
+                == struct.pack("<" + "I" * length, *range(first + offset, first + offset + length)),
+                range_message,
+            )
+    return digest(path)
+
+
+def is_query_record(record, workload):
+    """Recognize native query records; scoring/count/policy checks stay local."""
+    return (
+        record["baseline"] == "IVF"
+        and record["phase"] == "query"
+        and record["workload"] == workload
+    )
 
 
 def header(path, dtype, expected_rows, expected_dim):
@@ -62,8 +106,8 @@ def query_truth_shapes(query, truth, dtype, dim, recall_at):
     )
 
 
-def read_json(path):
-    require(Path(path).stat().st_size <= 65536, f"oversized harness metadata: {path}")
+def read_json(path, max_bytes=65536):
+    require(Path(path).stat().st_size <= max_bytes, f"oversized harness metadata: {path}")
     return json.loads(Path(path).read_text())
 
 

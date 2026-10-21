@@ -399,6 +399,23 @@ namespace ivf_cli {
           << " heap_eviction_write_ns=" << io.eviction_write_ns;
     }
     template<typename T>
+    void checkpoint_update(const Arguments& args, MutableIndex<T>& index,
+                           UpdateStats& s) {
+      const auto     checkpoint_before = index.heap_io_counters();
+      DriverProgress checkpoint(
+          "checkpoint_flush_copy_verify", std::nullopt, "operations",
+          [&](std::ostream& out) {
+            heap_progress(out,
+                          index.heap_io_counters().since(checkpoint_before));
+          });
+      const auto start = Clock::now();
+      index.checkpoint(args.require("--checkpoint_prefix"),
+                       index.estimated_checkpoint_bytes());
+      s.checkpoint_s = seconds(start);
+      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
+      checkpoint.finish();
+    }
+    template<typename T>
     UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index,
                             uint64_t budget, uint64_t resident_bytes,
                             std::span<const T>  queries,
@@ -543,19 +560,7 @@ namespace ivf_cli {
       add(s.bytes, index.estimated_retained_bytes() - retained_before);
       check(s.bytes <= budget,
             "CLI post-growth mixed workload exceeds allowance");
-      const auto     checkpoint_before = index.heap_io_counters();
-      DriverProgress checkpoint(
-          "checkpoint_flush_copy_verify", std::nullopt, "operations",
-          [&](std::ostream& out) {
-            heap_progress(out,
-                          index.heap_io_counters().since(checkpoint_before));
-          });
-      const auto start = Clock::now();
-      index.checkpoint(args.require("--checkpoint_prefix"),
-                       index.estimated_checkpoint_bytes());
-      s.checkpoint_s = seconds(start);
-      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
-      checkpoint.finish();
+      checkpoint_update(args, index, s);
       return s;
     }
     void validate_driver_paths(const Arguments& args, bool updating) {
@@ -836,19 +841,7 @@ namespace ivf_cli {
             "CLI insertion exceeded admitted retained growth allowance");
       check(s.bytes <= budget,
             "CLI post-growth update exceeds workspace allowance");
-      const auto     checkpoint_before = index.heap_io_counters();
-      DriverProgress checkpoint(
-          "checkpoint_flush_copy_verify", std::nullopt, "operations",
-          [&](std::ostream& out) {
-            heap_progress(out,
-                          index.heap_io_counters().since(checkpoint_before));
-          });
-      start = Clock::now();
-      index.checkpoint(args.require("--checkpoint_prefix"),
-                       index.estimated_checkpoint_bytes());
-      s.checkpoint_s = seconds(start);
-      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
-      checkpoint.finish();
+      checkpoint_update(args, index, s);
       return s;
     }
     template<typename T>

@@ -9,7 +9,7 @@ import math
 import os
 from pathlib import Path
 
-from common import digest, require
+from common import digest, flags, require
 
 
 BUILD_DEFAULTS = {
@@ -82,6 +82,19 @@ def query_router_flags():
         if (value := os.environ.get("IVF_" + key.upper())) is not None
         for part in ("--" + key, value)
     ]
+
+
+def query_search_flags():
+    return flags({
+        "nprobe": os.environ.get("IVF_NPROBE", "1"),
+        "rerank_factor": os.environ.get("IVF_RERANK_FACTOR", "2"),
+        "query_threads": os.environ.get("QUERY_THREADS", "1"),
+    })
+
+
+def query_policy_flags(validated_warmups):
+    """Format policy flags only; warmup_queries() must run during preflight."""
+    return query_router_flags() + ["--warmup_queries", validated_warmups]
 
 
 def insertion_threads():
