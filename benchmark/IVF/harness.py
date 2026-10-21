@@ -320,7 +320,6 @@ def run(args):
     output.mkdir(parents=True, exist_ok=True)
     for name in (
         "run.log",
-        "native_result.json",
         "result.json",
         "neighbors.bin",
         "nlist_selection.json",
@@ -331,14 +330,12 @@ def run(args):
             not path.exists() and not path.is_symlink(),
             f"run output exists: {path}; use a fresh IVF_RUN_TAG",
         )
-    # Keep native result.json byte-identical to native_result.json; provenance is
-    # an adjacent experiment record, never a fabricated native query metric.
+    # The driver writes canonical metrics directly; provenance stays separate.
     write_json(output / "nlist_selection.json", selection)
     if mutation is not None:
         for name in (
             "mutation.log",
             "mutation_result.json",
-            "mutation_metrics.json",
             "private.heap",
             "private.heap.pq.bin",
             "query.heap",
@@ -439,7 +436,7 @@ def run(args):
         "--memory_budget_gb",
         query_resources["memory_budget_gb"],
         "--result_file",
-        str(output / "native_result.json"),
+        str(output / "result.json"),
         "--search_result_file",
         str(output / "neighbors.bin"),
     ]
@@ -450,7 +447,7 @@ def run(args):
     query_start = time.monotonic()
     command_log(command, output / "run.log")
     query_process_wall_s = time.monotonic() - query_start
-    record = read_json(output / "native_result.json")
+    record = read_json(output / "result.json")
     require(
         record["baseline"] == "IVF"
         and record["phase"] == "query"

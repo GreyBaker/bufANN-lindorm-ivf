@@ -207,7 +207,7 @@ def main():
         assert "run destination exists" in sweep(collision, False).stderr
         assert not (work / "sweeps/collision").exists()
         record = json.loads((work / "result.json").read_text())
-        assert record == json.loads((work / "native_result.json").read_text())
+        assert not (work / "native_result.json").exists()
         protocol = json.loads((work / "execution_protocol.json").read_text())
         assert protocol["native_driver_process_count"] == 1 and protocol["mutation_process_wall_s"] is None
         assert protocol["insert_input_policy"] is None
@@ -335,10 +335,10 @@ def main():
             update = json.loads((mutation_work / "mutation_result.json").read_text())
             final = json.loads((mutation_work / "result.json").read_text())
             assert update["phase"] == workload and update[workload + "_count"] == 1
-            assert update == json.loads((mutation_work / "mutation_metrics.json").read_text())
+            assert not (mutation_work / "mutation_metrics.json").exists()
             assert update["live_count"] == (4 if workload == "insert" else 2)
             assert final["recall"] == 100 and final["live_count"] == update["live_count"]
-            assert final == json.loads((mutation_work / "native_result.json").read_text())
+            assert not (mutation_work / "native_result.json").exists()
             protocol = json.loads((mutation_work / "execution_protocol.json").read_text())
             assert protocol["version"] == 1 and protocol["completed"] is True
             assert protocol["native_driver_process_count"] == 2

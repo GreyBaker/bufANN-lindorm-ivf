@@ -1,6 +1,4 @@
-# IVF-only: Implementation and Study Guide
-
-**Technical reference · Implementation-first · 20 October 2026**
+# IVF-only: Implementation Guide
 
 A single-node, mutable, disk-backed approximate nearest-neighbor (ANN) index inspired by LindormVector. This guide explains the current source, the reasons behind its design, and the limits of its guarantees. Paths are relative to `ivf-only/`.
 
@@ -335,7 +333,7 @@ Prepare/run scripts cover independent query, insert, delete, and mixed workloads
 - **Insertion timing:** streaming includes worker source reads; staged input is admitted/loaded before mutation timing. Keep these policies separate when comparing worker counts. Heap work/publication and launch/join remain foreground costs.
 - **Warmup:** optional serial queries derived from frozen base centroids run on the same index object before the final timed pass, after updates/checkpoint when applicable. They use no final-query/GT selection and are not scored. A separate-process warmup cannot transfer its application buffer pool.
 - **Recall:** score against the actual live population after updates. Filtered deep ground truth (GT) must contain enough survivors; underflow fails. Native scoring is percentage recall with kth-distance tie expansion where available; truncated derived GT limits tie coverage. Missing hits count against recall.
-- **Comparison:** post-round queries/second (QPS) is not concurrent QPS. Mixed root `result.json` is the last round; `summary.json` retains rounds and summed foreground wall/counts, not pooled quantiles. Record threads/cache, identities, storage/runtime, overlap, memory/RSS, repeats, and failures. Unequal-recall points do not prove matched-recall speedups.
+- **Comparison:** post-round queries/second (QPS) is not concurrent QPS. Mixed `summary.json` references round `result.json` files and retains summed foreground wall/counts, not pooled quantiles or a duplicate root result. Record threads/cache, identities, storage/runtime, overlap, memory/RSS, repeats, and failures. Unequal-recall points do not prove matched-recall speedups.
 
 ### Tests worth reading as executable specifications
 
@@ -423,7 +421,7 @@ The files named `tests/ivf_build.cpp` and `tests/ivf_driver.cpp` are operational
 | `tests/ivf_mixed_workload.h`; `tests/weighted_update_pool.h` | Dispatch dedicated-role or weighted streams; account for callback failures, joins, completion/overlap, and latency storage. Inspect the different startup admission behaviors directly. |
 | `tests/ivf_cost_model.cpp`; `tests/ivf_router_diagnostics.cpp` | Compose calibration sampling/training/router timing/scanner profiling and fixed-router measurements, respectively. Separate centroid recall from end-to-end ANN recall. |
 | `benchmark/IVF/harness.py` | Prepare/restore SHA-256-keyed immutable caches using real copies; verify prepared identities; run query or mutation-then-checkpoint-query processes while preserving native query metrics and execution provenance. |
-| `benchmark/IVF/mixed.py` | Validate equal-cap round plans and per-round ID/GT families; chain native processes through checkpoints; verify extraction/live counts; publish last-round results and separate summaries. |
+| `benchmark/IVF/mixed.py` | Validate equal-cap round plans and per-round ID/GT families; chain native processes through checkpoints; validate driver-written results/live counts; publish aggregates with relative round-result paths. |
 | `benchmark/IVF/settings.py`; `benchmark/IVF/common.py` | Own defaults and build/query policy separation, input/resource guards, calibration-report compatibility, identities, exclusive output/log creation, command streaming, affinity/timeouts, and runtime provenance. |
 | `benchmark/IVF/cost_model.py`; `benchmark/IVF/router_sweep.py`; `benchmark/IVF/qualify.py` | Freeze calibration provenance without official-query inputs; sweep routers on existing centroids; orchestrate trainer/query comparisons and declared gates. Successful orchestration is not production qualification. |
 | `benchmark/IVF/download_sift.py` | Download validated SIFT base prefixes/public queries; rewrite prefix row headers; reject overwrite/resume and retain partial output. Matching download shape does not replace downstream PQ/GT identity checks. |

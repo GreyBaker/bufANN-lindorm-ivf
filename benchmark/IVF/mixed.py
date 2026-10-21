@@ -81,32 +81,6 @@ def prepare(args):
     write_json(args.work_dir / "mixed_prepared.json", expected)
 
 
-def extract_round(dest):
-    # Reuse the unchanged shared canonical extractor before admitting the next
-    # round or publishing a successful workload summary. Preserve failed output.
-    target = dest / "result.json"
-    require(not target.exists() and not target.is_symlink(), f"mixed round result exists: {target}")
-    repo = Path(__file__).resolve().parents[2]
-    command_log(
-        [
-            "bash",
-            "-c",
-            'set -euo pipefail\nREPO_DIR="$1"\n'
-            'source "$REPO_DIR/benchmark/scripts/utils.sh"\n'
-            'write_ann_bench_metrics_json "$2" "$3"',
-            "ivf-mixed-extract",
-            str(repo),
-            str(dest / "run.log"),
-            str(target),
-        ],
-        dest / "extract.log",
-    )
-    require(
-        target.read_bytes() == (dest / "native_result.json").read_bytes(),
-        "mixed canonical extraction mismatch",
-    )
-
-
 def run(args):
     w = args.work_dir.resolve()
     base = read_json(w / "prepared.json")
@@ -151,7 +125,8 @@ def run(args):
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "nlist_selection.json", selection)
     (output / "rounds").mkdir()
-    records = []
+    round_results = []
+    totals = {"mixed_wall_s": 0.0, "concurrent_query_count": 0, "overlapping_query_count": 0}
     for r in range(args.rounds):
         dest = output / f"rounds/round_{r}"
         dest.mkdir()
@@ -206,7 +181,7 @@ def run(args):
             "--memory_budget_gb",
             resources["memory_budget_gb"],
             "--result_file",
-            str(dest / "native_result.json"),
+            str(dest / "result.json"),
             "--search_result_file",
             str(dest / "neighbors.bin"),
         ]
@@ -222,11 +197,13 @@ def run(args):
         command += query_router_flags()
         command += ["--warmup_queries", query_warmups]
         command_log(command, dest / "run.log")
-        record = read_json(dest / "native_result.json")
+        record = read_json(dest / "result.json")
         require(record["explicit_warmup_query_count"] == int(query_warmups),
                 "native mixed final-pass warmup completion count mismatch")
         require(
-            record["workload"] == "mixed"
+            record["baseline"] == "IVF"
+            and record["phase"] == "query"
+            and record["workload"] == "mixed"
             and record["insert_count"] == args.insert_cap
             and record["delete_count"] == args.delete_cap
             and "recall" in record
@@ -235,26 +212,23 @@ def run(args):
             == args.base_count + (r + 1) * (args.insert_cap - args.delete_cap),
             "mixed round execution count/live-set/scoring mismatch",
         )
-        extract_round(dest)
-        records.append(record)
+        round_results.append((dest / "result.json").relative_to(output).as_posix())
+        for key in totals:
+            totals[key] += record[key]
         prefix = saved
     require(
         component_digests(w / "index", args.dataset) == base_components
         and prepared == identity(args),
         "mixed source/base/input identity changed during run",
     )
-    with (output / "result.json").open("xb") as final:
-        final.write((output / f"rounds/round_{args.rounds - 1}/native_result.json").read_bytes())
     write_json(
         output / "summary.json",
         {
-            "version": 1,
+            "version": 2,
             "production_qualified": False,
-            "round_records": records,
-            "final_recall": records[-1]["recall"],
-            "mixed_wall_s": sum(r["mixed_wall_s"] for r in records),
-            "concurrent_query_count": sum(r["concurrent_query_count"] for r in records),
-            "overlapping_query_count": sum(r["overlapping_query_count"] for r in records),
+            "round_results": round_results,
+            "final_recall": record["recall"],
+            **totals,
             "scope": "separate_process_rounds_checkpoint_reopen_and_post_barrier_scoring_excluded_from_foreground_time",
         },
     )

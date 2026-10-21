@@ -15,7 +15,3 @@ fi
 ivf_profile_args
 python3 "$REPO_DIR/benchmark/IVF/harness.py" run "${PROFILE_ARGS[@]}" \
     --output-dir "$OUTPUT_DIR" --recall-at "$RECALL_AT"
-# Retain the shared canonical-record extractor. Only after successful execution;
-# a failed native run must not produce an empty result.json as a success artifact.
-write_ann_bench_metrics_json "$OUTPUT_DIR/run.log" "$OUTPUT_DIR/result.json"
-cmp -s "$OUTPUT_DIR/native_result.json" "$OUTPUT_DIR/result.json" || error "canonical metric extraction mismatch"

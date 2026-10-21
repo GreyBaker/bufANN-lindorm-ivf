@@ -375,10 +375,6 @@ def sweep(args):
         path = work / "runs" / trial["run_tag"]
         record = read_json(path / "result.json")
         require(
-            digest(path / "result.json") == digest(path / "native_result.json"),
-            "canonical metric extraction mismatch",
-        )
-        require(
             record["baseline"] == "IVF"
             and record["phase"] == "query"
             and record["workload"] == "query",

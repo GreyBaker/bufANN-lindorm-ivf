@@ -461,7 +461,7 @@ def main():
                         env=env,
                     )
                     assert harness.read_json(destination / "nlist_selection.json") == selection
-                    native = harness.read_json(destination / "native_result.json")
+                    native = harness.read_json(destination / "result.json")
                     assert (
                         native["phase"] == "query" and native["nlist"] == report["selected_nlist"]
                     )

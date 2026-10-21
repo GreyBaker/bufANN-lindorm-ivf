@@ -140,6 +140,9 @@ def main():
                 run(execute, env)
                 output = work / "runs" / scheduler
                 summary = json.loads((output / "summary.json").read_text())
+                assert summary["version"] == 2 and "round_records" not in summary
+                assert summary["round_results"] == [f"rounds/round_{r}/result.json" for r in range(2)]
+                assert not (output / "result.json").exists()
                 assert (
                     not summary["production_qualified"]
                     and summary["concurrent_query_count"] == 128
@@ -148,7 +151,8 @@ def main():
                 for r in range(2):
                     dest = output / f"rounds/round_{r}"
                     record = json.loads((dest / "result.json").read_text())
-                    assert record == json.loads((dest / "native_result.json").read_text())
+                    assert not (dest / "native_result.json").exists()
+                    assert not (dest / "extract.log").exists()
                     assert record["explicit_warmup_query_count"] == warmups
                     assert record["query_count"] == len(queries)
                     assert "no_reopen" in record["query_cache_process_policy"]
@@ -236,7 +240,8 @@ def main():
                 assert "--query_ratio" not in log and "--query_count" not in log
                 assert "--scheduler_seed" not in log
             assert summary["concurrent_query_count"] == sum(
-                record["concurrent_query_count"] for record in summary["round_records"]
+                json.loads((output / path).read_text())["concurrent_query_count"]
+                for path in summary["round_results"]
             )
             assert all(digest(p) == value for p, value in initial.items())
             for key, value in (
@@ -274,33 +279,6 @@ def main():
             run(execute, env, False)
             assert not (work / "runs/bad_budget/result.json").exists()
             del env["IVF_MEMORY_BUDGET_GB"]
-            # A real shared-extractor mismatch after a valid native round must
-            # retain its checkpoint/evidence, but admit no next round or final
-            # summary/result. BASH_ENV affects only this fixture's child shells;
-            # no production hooks or shared script/source changes are required.
-            if dtype == "float":
-                bash_env = root / "extract_failure.sh"
-                bash_env.write_text(
-                    "grep() {\n"
-                    '  if [[ "${1:-}" == \'-h\' && "${2:-}" == \'^{"baseline":\' ]]; then\n'
-                    "    printf '%s\\n' '{\"baseline\":\"wrong_fixture_record\"}'\n"
-                    '  else command grep "$@"; fi\n}\n'
-                )
-                failure_env = env.copy()
-                failure_env.update(BASH_ENV=str(bash_env), IVF_RUN_TAG="extract_failure")
-                refused = run(execute, failure_env, False)
-                assert "mixed canonical extraction mismatch" in refused.stderr, (
-                    refused.stdout,
-                    refused.stderr,
-                )
-                failed = work / "runs/extract_failure"
-                assert (
-                    not (failed / "summary.json").exists() and not (failed / "result.json").exists()
-                )
-                assert not (failed / "rounds/round_1").exists()
-                assert (failed / "rounds/round_0/native_result.json").is_file()
-                assert (failed / "rounds/round_0/checkpoint" / (dataset + ".manifest")).is_file()
-                assert all(digest(p) == value for p, value in initial.items())
             assert all(digest(p) == value for p, value in original.items())
             # Native mixed-specific invalid counts/allocations/flags, with no
             # checkpoint/success record. Keep the already prepared family intact.

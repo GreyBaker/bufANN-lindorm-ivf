@@ -739,8 +739,12 @@ Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
 For sequential/query runs, inspect `execution_protocol.json` for the declared
 input/worker/warmup policy and separate process wall costs; `result.json` retains
 the native scored-query metrics unchanged. Mutation completion costs live in
-`mutation_result.json`. Mixed runs retain per-round native results and a summary:
-their final-pass `query_qps` is not concurrent foreground QPS. Keep failed logs and
+`mutation_result.json`. The driver writes these metrics directly; no duplicate
+native/extracted JSON files are produced. Mixed runs retain
+`rounds/round_<r>/result.json` and a version-2 `summary.json` with relative
+`round_results` paths and aggregate counts/times, not embedded round records or a
+duplicate root `result.json`. Their final-pass `query_qps` is not concurrent
+foreground QPS. Keep failed logs and
 owned heaps; a failed mutation session must not be checkpointed or reused.
 
 For three query repetitions at the same frozen settings:
