@@ -658,7 +658,7 @@ export IVF_BUFFER_FRAMES=262144
 # Freeze execution policy before running final queries; preserve default behavior.
 # export IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming IVF_WARMUP_QUERIES=0
 # Optional alternative, declared in advance:
-export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=64
+export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
 # Inspect the actual destinations; a large data volume does not ensure space
 # on a work/cache filesystem mounted elsewhere. No existing evidence is deleted.
 mkdir -p "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
