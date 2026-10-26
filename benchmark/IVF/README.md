@@ -810,3 +810,235 @@ Choose a new root for each repetition so preparation starts from the same IVF
 base. Do not delete failed evidence or change settings in response to final-set
 results. Tagged reruns from an existing IVF prepared base are also supported;
 the fresh-root recipe makes each repetition explicit.
+
+# Quickstart: SIFT1M posting-count comparison
+
+Run IVF-only on the standard **1M-vector, 128-dimensional float32 SIFT1M**
+dataset at **101716, 199635 and 252298 posting lists**. Here posting count means
+`IVF_NLIST` (the number of centroids/lists), not `IVF_NPROBE` (lists searched per
+query). No DiskANN graph or SPFresh run is needed.
+
+This follows the four-workload quickstart structure, but uses SIFT1M's float
+profile rather than the uint8 BIGANN downloader. Each posting count runs:
+
+| Workload | Population |
+|---|---|
+| Query | First 900,000 base vectors; all 10,000 queries |
+| Insert | Insert the remaining 100,000 vectors → 1M live |
+| Delete | Delete 100,000 from an independent base → 800,000 live |
+| Mixed update | Ten rounds, each inserting/deleting 10,000; 900,000 live |
+
+Use Ubuntu 24.04 x86-64 or an equivalent Linux/WSL environment with AVX2.
+The commands below declare a 16 GiB workspace allowance and 16 foreground workers;
+use a machine with RAM headroom beyond that allowance and ample SSD space for
+three indexes, independent workload copies and checkpoints. Budgets are not hard
+RSS caps. Run in order in the **same Bash terminal**, from the repository root,
+and stop on any failure. Use fresh paths; preserve failed evidence.
+
+## 1. Install dependencies and compile
+
+Complete [SIFT quickstart step 1](#1-install-dependencies-and-get-the-project)
+and [step 2](#2-compile-the-tools), **including** `bufann_gt_computer` and both
+standalone PQ helpers. Keep their exported `IVF_BUILD_DIR` and
+`IVF_PQ_HELPER_DIR`. Do not run the larger-dataset download or workload steps.
+
+## 1.5. lsblk activities
+
+You'll need to mkdir into ~/project. I usually format and place the SSD there. You can adjust that or the code below at yor convenience. 
+
+## 2. Download and prepare SIFT1M once
+
+Choose a new data directory. This block refuses an existing directory so it
+cannot overwrite inputs. To reuse verified inputs instead, skip generation and
+export the same variables pointing to their matching float32 files and full-source
+PQ64 prefix. Do not reuse PQ or GT from the uint8 SIFT10M/SIFT100M recipe.
+
+```bash
+export DATASET=sift1m
+export DATA_ROOT="$HOME/project/ann-data/sift1m-postings-01"
+export SIFT1M_ROOT="$DATA_ROOT"
+export DATA_FVECS="$DATA_ROOT/sift_base.fvecs" QUERY_FVECS="$DATA_ROOT/sift_query.fvecs"
+export DATA_BIN="$DATA_ROOT/sift_base.bin" QUERY_BIN="$DATA_ROOT/sift_query.bin"
+export IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
+export GT_BIN_KCACHED="$DATA_ROOT/sift1m_1000000_gt1000.bin"
+export OMP_NUM_THREADS=16 MKL_NUM_THREADS=1
+
+(
+  set -euo pipefail
+  : "${IVF_PQ_HELPER_DIR:?Compile the standalone PQ helpers in step 1}"
+  [[ ! -e "$DATA_ROOT" && ! -L "$DATA_ROOT" ]] || {
+    echo "ERROR: data root exists; reuse verified inputs or choose a fresh path" >&2; exit 1;
+  }
+  mkdir -p "$(dirname "$DATA_ROOT")"
+  mkdir "$DATA_ROOT"
+  curl --fail --location --output "$DATA_FVECS" \
+    'https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main/sift_base.fvecs?download=true'
+  curl --fail --location --output "$QUERY_FVECS" \
+    'https://huggingface.co/datasets/qbo-odp/sift1m/resolve/main/sift_query.fvecs?download=true'
+  python3 benchmark/convert_fvec_to_bin.py "$DATA_FVECS" "$DATA_BIN"
+  python3 benchmark/convert_fvec_to_bin.py "$QUERY_FVECS" "$QUERY_BIN"
+
+  # Check float32 framing before expensive PQ/GT generation.
+  python3 - <<'PY'
+import os
+from pathlib import Path
+import struct
+
+for variable, rows in (("DATA_BIN", 1000000), ("QUERY_BIN", 10000)):
+    path = Path(os.environ[variable])
+    with path.open("rb") as source:
+        header = source.read(8)
+    if header != struct.pack("<II", rows, 128) or path.stat().st_size != 8 + rows * 128 * 4:
+        raise ValueError(f"expected {rows} x 128 float32 vectors: {path}")
+PY
+
+  # One frozen global PQ8 codebook, with codes for all 1M source rows.
+  mkdir "$DATA_ROOT/pq"
+  "$IVF_PQ_HELPER_DIR/build_pq_pivot_standalone" \
+    float "$DATA_BIN" "$IVF_PQ_PREFIX" 64
+  "$IVF_PQ_HELPER_DIR/build_pq_codes_standalone" \
+    float "$DATA_BIN" "$IVF_PQ_PREFIX" 64 0
+)
+```
+
+Keep source-row order unchanged. The profile in `benchmark/datasets/sift1m.sh`
+already declares `DATA_TYPE=float`, `NPTS_FULL=1000000`, `NPTS_BASE=900000` and
+`UPDATE_POINTS=100000`; the exported paths replace its placeholders without edits.
+PQ uses 64 eight-bit chunks, or 64 bytes/vector, shared across all three builds.
+
+## 3. Generate and check shared ground truth
+
+The automatic `ensure_gt.py` recommendation workflow above requires uint8 inputs;
+do **not** use it on these float32 files. Generate full-source K=1000 GT with the
+float-compatible native helper, then check Recall@10 coverage for every workload
+and mixed round. K=1000 is a starting depth, not a guarantee of coverage.
+
+```bash
+(
+  set -euo pipefail
+  : "${IVF_BUILD_DIR:?Compile the IVF tools and GT helper in step 1}"
+  [[ ! -e "$GT_BIN_KCACHED" && ! -L "$GT_BIN_KCACHED" ]] || {
+    echo "ERROR: GT path exists; check a verified cache or choose a fresh path" >&2; exit 1;
+  }
+  "$IVF_BUILD_DIR/tests/bufann_gt_computer" \
+    --data_type float --base_file "$DATA_BIN" --query_file "$QUERY_BIN" \
+    --gt_file "$GT_BIN_KCACHED" --K 1000 --num_threads 16 \
+    > "$GT_BIN_KCACHED.log" 2>&1
+  python3 benchmark/scripts/check_gt_coverage.py \
+    --cached-gt "$GT_BIN_KCACHED" --full-count 1000000 --base-count 900000 \
+    --insert-count 100000 --delete-count 100000 \
+    --mixed-rounds 10 --mixed-insert-cap 10000 --mixed-delete-cap 10000 \
+    --k-out 10 --expected-queries 10000 \
+    --json-output "$GT_BIN_KCACHED.coverage.json"
+)
+```
+
+When reusing GT, run just the coverage check with a fresh report path. If it
+returns 3 (underflow), generate deeper GT at a **new** path, update
+`GT_BIN_KCACHED`, and repeat the check before preparing any index. Other nonzero
+exits indicate errors, not permission to proceed. Preserve partial generation
+outputs and logs; do not treat them as reusable GT.
+
+## 4. Run all three posting counts
+
+Only `IVF_NLIST` changes between builds. This recipe fixes LV+ training on all
+900,000 initial-base rows, 15 passes, optimized PCA-refined routing, 64 probes,
+rerank factors of 3, eight query workers and Recall@10. Declare these settings
+before final-query evaluation; report all three configurations, not a winner
+selected using the final queries. The average initial occupancy is only about
+8.85, 4.51 and 3.57 vectors/list respectively, so these are deliberately sparse
+manual comparisons, not calibrated optimal counts or a guarantee of recall.
+
+At 252298 centroids, PCA covariance alone counts
+`252298 * 128 * 129 / 2 = 2082972288` operations. The finite 3B routing-work
+allowance below covers that calculation plus headroom; it does not disable any
+guard or guarantee that all subsequent work fits. Retain any admission failure.
+
+```bash
+export SIFT1M_RUN_ROOT="$HOME/project/ann-eval/sift1m-postings-run01"
+export EVAL_CACHED="$HOME/project/ann-eval/sift1m-postings-cache"
+
+(
+  set -euo pipefail
+  source benchmark/datasets/sift1m.sh
+  [[ "$DATA_TYPE" = float && "$DIM" = 128 && "$METRIC" = l2 &&
+     "$NPTS_FULL" = 1000000 && "$NPTS_BASE" = 900000 && "$UPDATE_POINTS" = 100000 ]] || {
+    echo "ERROR: profile differs from the SIFT1M plan" >&2; exit 1;
+  }
+  [[ ! -e "$SIFT1M_RUN_ROOT" && ! -L "$SIFT1M_RUN_ROOT" ]] || {
+    echo "ERROR: run root exists; preserve it and choose a fresh path" >&2; exit 1;
+  }
+  unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO
+  unset INSERT_CAP DELETE_CAP IVF_RUN_TAG IVF_COST_MODEL_REPORT IVF_SCHEDULER_SEED IVF_GT_FILE
+
+  export IVF_SAMPLE_RATE=1 IVF_MAX_REPS=15 IVF_TRAINER_MODE=lv-plus
+  export IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0
+  export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
+  export IVF_BUILD_THREADS=16 IVF_MEMORY_BUDGET_GB=16 IVF_QUERY_MEMORY_BUDGET_GB=16
+  export OMP_NUM_THREADS=16 OMP_THREAD_LIMIT=16 MKL_NUM_THREADS=1
+  export IVF_BUFFER_FRAMES=262144 IVF_PAGE_SIZE=4096 IVF_ROUTING_WORK_LIMIT=3000000000
+  export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined
+  export IVF_BUILD_ROUTER_RERANK_FACTOR=3 IVF_PCA_VARIANCE=0.95 IVF_REFINE_EF=128
+  export IVF_QUERY_BREADTH=128 IVF_INSERT_BREADTH=64
+  export IVF_ROUTER_MODE=pca-refined IVF_ROUTER_RERANK_FACTOR=3 IVF_ROUTER_BREADTH=128
+  export IVF_NPROBE=64 IVF_RERANK_FACTOR=3 QUERY_THREADS=8 RECALL_AT=10
+  export UPDATE_PERCENT=10 UPDATE_BATCH=10000 IVF_SCHEDULER=update_driven NTHREADS=16
+  export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
+
+  # Recheck coverage even when inputs/GT were reused rather than generated above.
+  python3 benchmark/scripts/check_gt_coverage.py \
+    --cached-gt "$GT_BIN_KCACHED" --full-count "$NPTS_FULL" --base-count "$NPTS_BASE" \
+    --insert-count "$UPDATE_POINTS" --delete-count "$UPDATE_POINTS" \
+    --mixed-rounds 10 --mixed-insert-cap "$UPDATE_BATCH" --mixed-delete-cap "$UPDATE_BATCH" \
+    --k-out "$RECALL_AT" --expected-queries 10000
+
+  mkdir -p "$(dirname "$SIFT1M_RUN_ROOT")" "$EVAL_CACHED"
+  mkdir "$SIFT1M_RUN_ROOT"
+  # Keep GT filtering helpers separate from any baseline build in use.
+  export INCREMENTAL_GT_BIN="$SIFT1M_RUN_ROOT/incremental_groundtruth"
+  df -h "$DATA_ROOT" "$SIFT1M_RUN_ROOT" "$EVAL_CACHED"
+  for nlist in 101716 143653 180501 214414; do
+    export IVF_NLIST="$nlist"
+    export EVAL_TEMPFILES="$SIFT1M_RUN_ROOT/nlist-$nlist"
+    for workload in query insert delete update; do
+      bash "benchmark/IVF/sift/${workload}_prepare.sh"
+      bash "benchmark/IVF/sift/${workload}.sh"
+    done
+  done
+)
+```
+
+To run **query-only**, change the inner loop to `for workload in query; do`;
+the shared GT check remains valid. Each workload starts from an independent copy
+of the same 900K base, not the previous workload's mutated index. Cache keys
+include `nlist`: preparation can reuse a base across workloads at one count,
+but cannot reuse another count's centroids. Keep PQ and binaries unchanged.
+
+The fixed 64-centroid warmup uses no final queries and runs inside the scored
+query process. Staged sequential insertion excludes source loading from its
+foreground timer. Mixed `update_driven` runs have no query quota; report their
+actual concurrent query counts. These policies match the optional execution
+policy in the larger quickstart and remain fixed across posting counts.
+
+## 5. Read results and repeat
+
+For each `nlist`, outputs live under:
+
+```text
+$SIFT1M_RUN_ROOT/nlist-<nlist>/sift1m/IVF/
+  query/result.json
+  insert/result.json          insert/mutation_result.json
+  delete/result.json          delete/mutation_result.json
+  update/summary.json         update/rounds/round_<r>/result.json
+```
+
+Compare `nlist`, `recall`, `query_qps` and `query_time_s` in scored-query results;
+retain `execution_protocol.json`, build/run logs and mutation results alongside
+them. Mixed final-pass `query_qps` is not concurrent foreground QPS. Inspect the
+mixed summary and per-round records separately.
+
+For another repetition, change `SIFT1M_RUN_ROOT` to a fresh `...-run02` path and
+repeat step 4 with the same inputs, cache and frozen settings. Cache hits measure
+restoration, not fresh index construction; use a new cache root when measuring
+builds. OS/device cache state is uncontrolled, and zero warmup would not establish
+a cold-cache run. Do not delete failed evidence or retune on final-query scores.
