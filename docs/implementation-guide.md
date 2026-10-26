@@ -1,430 +1,511 @@
-# IVF-only: Implementation Guide
+# Lindorm-style IVF: architectural summary of the committed implementation
 
-A single-node, mutable, disk-backed approximate nearest-neighbor (ANN) index inspired by LindormVector. This guide explains the current source, the reasons behind its design, and the limits of its guarantees. Paths are relative to `ivf-only/`.
+## Scope and overall assessment
 
-## 1. Architecture and mental model
+**The implementation is a single-node, mutable, disk-backed IVF-PQ engine inspired by Lindorm's ANN core—not a reproduction of its distributed database.** It preserves the central separation between memory-resident compressed search and a bounded final fetch of full coordinates. It implements ANN-accelerated centroid training, graph reuse and assignment seeding, PCA-assisted centroid traversal, bottom-layer graph refinement, real-time posting-list changes, and a centroid-count cost model. It supplies its own local storage, concurrency, persistence, and experimental infrastructure where Lindorm relies on its database platform.
 
-Think of centroids as library sections, posting lists as their catalogs, PQ codes as short book summaries, and heap records as complete books. The query chooses sections, compares summaries, and retrieves only promising complete books.
+The most consequential departures are:
 
-```text
-BUILD: base vectors → centroid training → final centroid router
-       → grouped IDs/PQ codes + graph-free coordinate heap
+1. **Local execution and storage:** no LDMaster/LDServer cluster, LindormTable, LindormDFS, region migration, replicated storage, or network candidate aggregation.
+2. **Global, non-residual PQ8 with a scalar scanner:** not the paper's evaluated four-bit SIMD scanning configuration; RaBitQ is absent.
+3. **Explicit interpretations of underspecified training details:** fixed iteration counts, deterministic sampling/reduction, initial-only refinement, and PCA refitting between assignments.
+4. **A controlled HNSW implementation and ablation suite:** checksum-pinned stock hnswlib plus a separately maintained modified variant, rather than the paper's Faiss comparison.
+5. **In-process publication safety and clean checkpoints, not WAL-backed commits:** update visibility is carefully ordered, but there is no crash recovery or durable transaction protocol.
+6. **Engineering beyond description:** bounded buffer-pin admission, page-local allocation, failure poisoning, artifact identity checks, resource guards, and explicit measurement contracts.
 
-QUERY: query → centroid router → nprobe lists → scalar PQ scan
-       → bounded finalists → coordinate batches → exact top-k
+## 1. System boundary and component architecture
 
-UPDATE: frozen router/PQ → prepare coordinates → publish posting
-        delete posting by swap-with-last → retain physical record
-```
-
-`NativeIndex<T>` owns a `CentroidRouter`, `PostingLists`, `PQCodebook<T>`, and `HeapStorage<T>`. `MutableIndex<T>` adds mutable lists, lifecycle admission, and failure tracking. Supported coordinate types are float32, int8, and uint8. Centroids use float coordinates. Final distances use double-precision squared L2: `Σ(q[d] − x[d])²`.
-
-**“IVF-only” does not mean graph-free search.** No DiskANN/Vamana graph over database vectors is required, but hierarchical navigable small world (HNSW) graphs over centroids accelerate routing and training. The heap reuses legacy storage machinery without database-vector edges.
-
-### Scope and reading plan
-
-| Sections | Subject | Learning outcome |
-|---|---|---|
-| 2 | Data and build | Trace source rows into artifacts. |
-| 3–4 | Training and routing | Separate learning, traversal, and rerank budgets. |
-| 5–6 | PQ, queries, storage | Explain approximation and bounded fetching. |
-| 7–8 | Updates and concurrency | Reason about visibility, failures, and checkpoints. |
-| 9–10 | Cost model and evaluation | Interpret predictions and measurements correctly. |
-
-**Not implemented here:** distributed execution, multi-tenancy, hybrid/filtered search, residual IVF-PQ, 4-bit single-instruction/multiple-data (SIMD) fast scan, write-ahead-log (WAL) recovery, or physical slot reclamation. Functional fixtures are not production or paper-speedup qualification.
-
-## 2. Data layout, artifacts, and native build
-
-### Input and identity contracts
-
-Vector `.bin` inputs have an 8-byte row-count/dimension header followed by packed coordinates. Dtype is supplied externally. The first `base_count` rows form the initial index; the remaining source rows may supply insertions. The benchmark preserves source-row IDs. The library permits an offset: `ID = first_id + source_row`, bounded by `id_capacity`.
-
-IVF consumes existing global PQ pivots and codes; it does not train PQ during native build. Codes must cover the full source row population with the matching chunk count, including reserved insertion rows. Shapes and digests are checked, but external code-to-vector parity and training provenance are not independently proved. Inputs must remain trusted and immutable.
-
-### Immutable lists: compact grouped arrays
-
-One vector belongs to one centroid list. Immutable postings use compressed-sparse-row (CSR)-like storage: `offsets[nlist+1]`, grouped `ids[N]`, and aligned-by-entry `codes[N × chunks]`. List `c` spans `[offsets[c], offsets[c+1])`. Full coordinates are separate and accessed by ID; physical heap placement need not follow list order.
-
-### Native build sequence
-
-1. **Validate/admit:** reject output collisions; validate shapes, identities, memory estimates, and relevant work limits. Reserve a fresh manifest path.
-2. **Train:** select training rows from the base prefix and produce float centroids. Sampling affects training only, not indexed population.
-3. **Build final router:** construct and save a new router independently of the temporary training graph; retain fitted PCA dimension when applicable.
-4. **Build postings:** reroute every base row through that final router. A sequential reader feeds bounded blocks to routing workers. After joining, serial histogram/prefix sums and source-order PQ grouping produce deterministic arrays.
-5. **Populate heap:** release posting-build buffers and final router, stream base coordinates into the graph-free heap, checkpoint it, then release locator arrays before final hashing.
-6. **Finish:** copy the PQ pivots into the bundle, recheck full source identities, hash component artifacts, and write the completed manifest last.
-
-| Artifacts | Contents |
-|---|---|
-| `.centroids.bin`, `.hnsw`, `.router` | Centroids, stock graph, settings/identities |
-| `.lists`, `.pq.bin` | Grouped IDs/codes and copied codebook |
-| `.heap`, `.heap.meta`, `.heap.meta.ivf` | Coordinates, backend metadata, IVF descriptor |
-| `.patched.hnsw`, `.refined.hnsw`, `.pca` | Additional optimized-router artifacts, if enabled |
-| `.manifest` | Configuration and component digests |
-
-Open checks digests and cross-component shape/settings/population agreement, validates graph framing, and checks posting IDs exist in the heap. Manifest completion is **not atomic publication or an fsync commit**. Failures retain partial artifacts; existing outputs are not overwritten. Checksums are integrity checks, not authentication.
-
-**Read:** `src/bufann/ivf_index.cpp:404–595`; `src/bufann/ivf_lists.cpp:107–306`; `include/bufann/ivf_index.h:31–66`.
-
-**Check:** Why can two shape-valid vector/code files still be incompatible? Their row order or encoding provenance may differ.
-
-## 3. Centroid training and ANN k-means
-
-**Intuition:** repeatedly assign rows to centroids, then move each centroid to the mean of its assigned rows. Approximate assignment avoids comparing every training row with every centroid.
-
-### Shared loop and numerical behavior
-
-The training count is `S = ceil(base_count × sample_rate)`. Seeded reservoir sampling reads and validates the base prefix and retains S float rows and their source IDs. Even a small sample still requires reading the base prefix. `nlist ≤ S` is mandatory.
-
-`sample` initialization chooses distinct sample rows. `random_partition` shuffles rows, distributes them round-robin into balanced nonempty partitions, and initializes each centroid to its partition mean. LV/LV+ require the latter.
-
-Each pass builds/refreshes its assignment index, assigns rows in parallel bounded blocks, joins workers, and serially accumulates double sums/occupancies to produce float means. Empty centroids recover from distinct high-assignment-error rows, breaking ties by source-row ID. This does not guarantee final nonempty clusters.
-
-There are exactly `max_reps` mean-update passes plus a final assignment, so final occupancy and sum of squared errors (SSE) describe returned centroids. No convergence-based early stopping is used. ANN SSE uses chosen centroids; it need not equal the exhaustive nearest-centroid objective or decrease monotonically.
-
-| Mode | Assignment behavior |
-|---|---|
-| `exact` | Exhaustive double-L2 comparisons |
-| `ann-rebuild` | Rebuild stock HNSW every assignment pass |
-| `ann-reuse` | Refresh reused full-coordinate patched graph |
-| `ann-reuse-seeded` | Reuse plus prior-assignment entry point |
-| `ann-reuse-count`, `ann-reuse-seeded-count` | Nearest-one float traversal controls, without/with seeding |
-| `lv`, `lv-plus` | LindormVector-inspired optimized trainers: reuse, initial refinement, moving PCA, candidate rerank; LV+ adds seeding |
-
-### What reuse and seeding really do
-
-Refresh snapshots neighbors across all graph levels, replaces **all** centroid coordinates first, then serially reinserts stable IDs using old neighborhoods. Labels/levels persist; full-coordinate distances maintain links. Assignment workers are stopped during refresh, so they never see mixed old/new coordinates. Reuse is connection maintenance, not an unchanged graph.
-
-Seeded modes use the row’s previous centroid ID as a bottom-layer entry, skipping ordinary upper-layer descent. The ID is evaluated against current coordinates/projection. The first pass has no prior assignments and uses ordinary global entry behavior; random partitions do not prepopulate search seeds.
-
-### LV/LV+ schedule and limits
-
-LV/LV+ refine only the initial graph and fit centroid principal component analysis (PCA) at fixed 95% variance. Each later refresh refits PCA, including before final assignment; it does not repeat initial refinement. They return up to `min(nlist, ceil(training_rerank_factor))` candidates and rerank using double-precision distances. Breadth controls exploration separately. Legacy ANN controls rescore breadth-sized sets; count controls return one float winner. The loop also computes the chosen centroid’s double objective distance.
-
-`S × (max_reps + 1)` must fit the default one-billion-search guard; exact mode additionally checks that count × nlist against its distance-work limit. Thus 90M rows × 11 assignments = 990M; 16 assignments exceed the guard. PCA counted operations and refinement traversal have separate guards, not total construction/refresh work limits. Memory budgets estimate allocations, not hard resident-set-size (RSS) ceilings.
-
-**Read:** `src/bufann/ivf_centroids.cpp:48–378`; `src/bufann/ivf_router.cpp:23–40,673–865`; `src/bufann/ivf_patched_graph.cpp:137–172`; `src/bufann/ivf_config.cpp:103–143`.
-
-## 4. Final centroid routing and optimization
-
-**Intuition:** the router is an ANN index whose database is the centroids. It returns promising list IDs, not final vector neighbors. Base assignment and insertion request one centroid; queries request nprobe.
-
-| Router mode | Traversal and selection |
-|---|---|
-| `exact` | Enumerate all centroids and select by double squared L2 |
-| `hnswlib` | Stock HNSW, full-coordinate float traversal, double rescoring |
-| `patched-full` | Patched graph, full-coordinate traversal and rescoring |
-| `refined` | Refined graph, full-coordinate traversal and rescoring |
-| `pca` | Projected traversal, full-coordinate double centroid rerank |
-| `pca-refined` | Refined graph plus projected traversal and centroid rerank |
-
-Optimized artifacts must be enabled at build time. Enabling them retains stock HNSW, a patched graph, a separately built/refined graph, and PCA—even if only one mode is selected. Final router construction is independent of the training graph. Selecting LV+ alone does not select optimized final routing.
-
-### Per-operation breadth without shared mutation
-
-The shared graph’s `ef` stays at 1. Stock search requests `min(nlist, max(requested_count, breadth))` candidates; upstream `searchKnn` uses max(ef,k). This supplies query/insertion breadth without racing on `setEf`. Full-coordinate patched modes similarly oversample/rescore. Results sort by full-coordinate distance, then list ID. Requesting every centroid takes the exact enumeration branch.
-
-### PCA: cheaper comparisons, not different full-vector storage
-
-PCA fits the centroid population, not all database rows. It computes a centered double covariance, uses a cyclic double Jacobi eigensolver (at most 64 sweeps), orders eigenvalues, and retains the smallest prefix meeting the variance target. Query projection is `q′ = Uᵀ(q−μ)`; accumulation is double, output float, without whitening. Eigenvector signs/repeated-eigenvalue bases are canonicalized. Zero variance retains all dimensions with identity basis.
-
-The HNSW topology remains full-coordinate-built. Projected coordinates replace the traversal distance space. PCA modes request `C = min(nlist, ceil(requested_count × router_rerank_factor))` centroid candidates, use breadth at least C, and rerank in original coordinates. Requested count is nprobe for queries, one for base assignment/insertion. Keeping 95% variance is not a 95% recall guarantee. Projection cost or limited dimensional reduction may erase its benefit.
-
-### Bottom-layer refinement and connectivity
-
-For each centroid, search/prune neighbors against the frozen pre-refinement graph. Replace bottom outgoing edges only; this replacement adds no reciprocal edges. Make one reinsertion pass over zero-indegree nodes in the proposed graph. Reachability and zero-indegree counts are measured, not guaranteed or repaired until convergence.
-
-> **Three distinct budgets:** training rerank factor controls centroid candidates for one training assignment; router rerank factor controls centroid candidates for final PCA routing; vector rerank factor controls PQ finalists whose full coordinates are fetched. For nprobe=32 and router factor=3, rerank up to 96 centroids. For k=10 and vector factor=3, fetch up to 30 vectors.
-
-**Read:** `src/bufann/ivf_router.cpp:300–452`; `src/bufann/ivf_pca.cpp:32–237`; `src/bufann/ivf_patched_graph.cpp:174–217`; patched headers in `dependencies/hnswlib/include/ivf_patched/`.
-
-## 5. PQ scoring and complete query execution
-
-### Global PQ8 and asymmetric distance computation
-
-**Intuition:** split a vector into chunks and replace each chunk with the byte label of a representative subvector. A query builds a distance lookup table; each code is scored by adding one lookup per chunk.
-
-`PQCodebook<T>` wraps the existing `FixedChunkPQTable<T>`. The codebook is global, with 256 representatives per chunk, and is not an IVF-centroid residual quantizer. Its stored global centering/rearrangement still applies. IVF does not retrain it. Inserts encode against this same frozen codebook.
+The principal composition is:
 
 ```text
-L[c,b] = query-to-representative squared distance for chunk c
-ADC(code) = Σ L[c, code[c]]
-immutable budget B = min(N, ceil(k × rerank_factor))
-mutable budget B = min(id_capacity−first_id, ceil(k × rerank_factor))
+NativeIndex<T>
+  ├─ CentroidRouter       full centroids + centroid HNSW/PCA artifacts
+  ├─ PostingLists         memory-resident grouped vector IDs and PQ codes
+  ├─ PQCodebook<T>        frozen global quantizer
+  └─ HeapStorage<T>       disk coordinates + buffer pool + ID-to-slot mapping
+
+MutableIndex<T>
+  ├─ frozen router and PQ
+  ├─ MutablePostingLists  per-list locks, capacity and ID states
+  ├─ private writable coordinate heap and logical-state ledger
+  └─ lifecycle admission, checkpoint composition and failure state
 ```
 
-Mutable budgeting uses usable ID capacity, not a racing live count; actual finalists cannot exceed observed live postings. Here N is immutable population, k is requested result count, and nprobe is the number of lists selected from nlist total lists.
+The implementation uses C++ templates for float32, int8, and uint8 coordinates. Centroids are float32 even when database coordinates are integers. The supported index metric is squared Euclidean distance; the presence of other metrics elsewhere in the inherited repository does not make them IVF features.
 
-The ADC table contains `256 × chunks` float entries. With 64 chunks, each code is 64 bytes and each query LUT is 64 KiB. For 90M vectors, code payload alone is 5.76 GB, excluding IDs, locators, router, buffers, and allocator overhead. Equal bytes/vector do not make this PQ8 scanner equivalent to Lindorm’s four-bit SIMD scanner.
+There is **no graph over database vectors** on the IVF path. HNSW exists only over the much smaller centroid population. The coordinate heap reuses a graph-capable backend but sets database-record graph degree to zero. Thus “IVF-only” means independence from DiskANN/Vamana data-graph construction, not absence of all graph algorithms.
 
-### Scalar scan and global top-B
+**Relation to paper §§3.2–3.4:** the logical search pipeline is preserved, but the distributed coordinator/worker stages collapse into one process. One centroid/codebook family is shared across this index's lists; this is not distributed metadata sharing, cross-table deduplication, or an elasticity mechanism. There is no simulated network or distributed latency component.
 
-The scanner visits every code in every selected list. It sums float lookup distances and maintains a bounded max-heap across all selected lists, breaking ties by ID. Filling the heap does not stop scanning. Increasing B increases retained candidates, selection work, coordinate fetching, and exact reranking; it does not reduce the number of scanned codes.
+**Sources:** [`ivf_index.h`](../include/bufann/ivf_index.h), [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_search.cpp`](../src/bufann/ivf_search.cpp), [`ivf_heap.h`](../include/bufann/ivf_heap.h).
 
-### Query stages
+## 2. Identity, input contracts, and physical/logical layout
 
-1. **Validate/admit:** check dimension, finite coordinates, component compatibility, and conservative workspace allowance.
-2. **Route:** find nprobe centroid/list IDs; record routing statistics and time.
-3. **Prepare ADC:** build a caller-owned query LUT from frozen PQ pivots.
-4. **Scan/select:** inspect selected-list codes and retain up to B candidates.
-5. **Fetch:** copy candidate coordinates into bounded, aligned scratch batches.
-6. **Exact rerank:** compute double squared L2 against full coordinates, sort by distance then ID, and truncate to k.
+### Stable source-row identity
 
-Native immutable query requires a clean, checkpointed/read-only heap. Mutable queries use a separate path with live-state checks (section 8). Query scratch is caller-owned; shared PQ/router objects are frozen. The outer driver schedules query concurrency; the single-query core does not become parallel merely because `query_threads` is set.
+Vector inputs use an eight-byte header containing uint32 row count and dimension, followed by packed coordinates. Dtype is supplied separately. The first `base_count` rows are the initial database; later rows can supply insertions. The benchmark preserves source-row IDs across vectors, PQ codes, ground truth, and mutations. The library additionally permits `external_id = first_id + source_row`.
 
-### Where approximation enters
+IDs belong to a bounded, predeclared capacity. They are also the storage backend's node IDs, but **not physical slot numbers**: an ID-to-RID locator identifies the page and slot. Several arrays are capacity-sized, so sparse, very large external ID spaces are not free. An inserted vector is assigned to one list, not replicated across adjacent clusters.
 
-ANN routing can miss useful centroids; selecting only nprobe lists excludes other vectors; PQ top-B can discard true neighbors. Exact reranking fixes finalist distances, not earlier omissions. Even exact centroid routing remains approximate end-to-end. On a quiescent immutable index, nprobe=nlist **and** B=N yield exhaustive exact scoring; either condition alone is insufficient.
+This substitutes a simple identity contract for Lindorm's arbitrary database row/routing keys and region ownership. Physical coordinates need not be laid out in centroid order.
 
-**Read:** `include/bufann/ivf_pq.h`; `include/pq_table.h`; `src/bufann/ivf_lists.cpp:320–368`; `src/bufann/ivf_search.cpp:28–157`; `src/bufann/ivf_config.cpp:146–172`.
+### Two posting representations
 
-**Check:** A true nearest neighbor discarded by PQ cannot be recovered by exact reranking.
+* **Immutable:** CSR-like `offsets[nlist+1]`, grouped `ids[N]`, and `codes[N × chunks]`. Each list is a contiguous range; IDs inside a list preserve source order.
+* **Mutable:** each list owns separate contiguous ID/code arrays, a length, capacity, and reader-writer mutex. A locator directory maps each external ID to list, slot, and atomic lifecycle state.
 
-## 6. Coordinate heap, batching, and I/O safety
+Separating these representations gives compact immutable bundles and localized mutable changes without pretending the same storage format serves both purposes optimally.
 
-**Intuition:** fetch finalist vectors in groups, but never let concurrent operations pin more cached pages than the pool can safely support.
+### PQ is an external, frozen input
 
-### Graph-free storage on a reused backend
+Native IVF build loads existing pivots and codes; it does **not** train PQ itself. Codes must cover the entire supplied source population, including reserved insertion rows, and match the pivot chunk count. Standalone helpers can produce those inputs, and the documented full-source recipe may train PQ on rows reserved for later insertion. That is distinct from centroid training, which uses only the initial base prefix.
 
-`HeapStorage<T>` wraps `InPlaceGraphStore` and its buffer pool/libaio path. External IDs are backend node IDs; an ID-to-record-identifier (RID) locator identifies the physical slot. IVF records have degree zero. Reads validate node identity and degree rather than assuming a locator is correct. Logical liveness is separate from retained backend allocation.
+Framing, sizes, finite values, and identities are checked, but the builder does not independently prove that every supplied code encodes its corresponding vector or that the codebook's training provenance is appropriate. Shape-valid but differently ordered inputs can still be semantically incompatible. The manifest explicitly identifies the policy as `global_nonresidual_pq8_external_unverified`.
 
-Streaming immutable construction and mutable preparation fill pages locally. Generic appends retain round-robin allocation behavior. Filling one page before advancing avoids repeatedly cycling over a 256-page allocation batch with a small default pool. This changes physical placement, not source IDs or query semantics.
+**Sources:** [`ivf_io.cpp`](../src/bufann/ivf_io.cpp), [`ivf_lists.cpp`](../src/bufann/ivf_lists.cpp), [`ivf_posting_lists.cpp`](../src/bufann/ivf_posting_lists.cpp), [`ivf_pq.h`](../include/bufann/ivf_pq.h).
 
-### What a batch does
+## 3. Build architecture: train once, reroute all rows, stream coordinates
 
-1. Check logical availability under a short ledger mutex.
-2. Acquire FIFO aggregate pin-admission credits outside that mutex.
-3. Pin requested pages through the backend batch API, which can share/deduplicate page reads.
-4. Use one page read guard at a time; validate slot/node identity and recheck logical state.
-5. Copy coordinates to caller-owned scratch; release frame pins before admission credits.
+The committed build has deliberately separate phases:
 
-Rows start on 64-byte boundaries; scratch stride covers the backend’s padded dimension. No pointer into an evictable page escapes. Duplicate IDs/pages do not recursively acquire a shared page mutex. Backend I/O is not performed under one global adapter ledger lock; coordinate writers are nevertheless serialized.
+1. Validate configuration, input shapes, output collisions, and relevant resource limits; hash source vectors, pivots, and codes.
+2. Exclusively claim a fresh manifest path, reserving the output family.
+3. Train centroids from the configured sample of the base prefix.
+4. Construct and persist a **new final router**, independent of the temporary training graph/PCA.
+5. Route **every base vector** through that final base/insertion router and group its ID and supplied PQ code.
+6. Release completed posting-build buffers and the final router; stream original coordinates into the heap.
+7. Checkpoint and release heap metadata, copy the PQ pivots, recheck source identities, hash all components, and write the completed manifest last.
 
-### Bounded aggregate admission
+Sampling reduces training population, not indexed population. Likewise, temporary training assignments are not reused as final list labels: different training/final search policies can choose different centroids, so final routing is an explicit correctness boundary.
 
-Let Fmin be the smallest buffer shard’s frame count. Admission capacity is `A = max(1, Fmin−1)`. Query batch size is capped by `min(256, max(1, floor(A/2)))`; writers request one credit. The conservative bound assumes every request could target one shard. FIFO admission, per-page guards, and consistent release order avoid unbounded aggregate pinning even for tiny/skewed pools, at the cost of contention and potentially reduced throughput.
+### Parallelism is selective and bounded
 
-> **One logical fetch stage ≠ one backend call ≠ one page read ≠ one device operation.** Large finalist sets split into bounded calls. Multiple vectors may share a page; cached pages need no pool read. Pool-read counters do not establish device IOPS or cold-storage behavior.
+Training assignments run in parallel blocks. Final list routing uses a single sequential source reader feeding bounded waves to persistent routing workers. Workers write independent label slots. Histogram construction, prefix sums, and source-order PQ grouping occur serially after routing joins. This avoids concurrent offset writes and preserves deterministic grouped output independent of worker completion order.
 
-### Failures and instrumentation
+Heap construction remains serial. Releasing the grouped lists before coordinate population is material at scale: 90M PQ64 vectors require about 6.12 GB just for codes plus uint32 IDs. Worker buffers, routing scratch, and stack allowances are included in preflight estimates; `build_threads` does not parallelize every phase.
 
-The private IVF path validates complete reads/AIO completions and aligned full-page writes. Terminal heap/pool failures poison the session/admission, wake waiters, and refuse future successful checkpointing. Short writes are failures; interrupted operations are retried where implemented. These protections do not imply crash durability or a blanket change to unrelated legacy readers.
+These are implementation-specific build/memory choices beyond the paper's algorithmic outline, not a distributed training implementation.
 
-Fetch reports backend calls, thread-attributed pool reads, ledger-mutex wait, pin-admission wait, and backend-pin wall time. The three wait/pin intervals are nested within fetch wall time: do not add them again to stage totals or treat them as CPU/device utilization. Pool-wide counter snapshots are individually atomic; use quiescent phase deltas for exact phase accounting.
+**Sources:** `NativeIndex<T>::build` in [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_lists_internal.h`](../src/bufann/ivf_lists_internal.h), [`ivf_lists.cpp`](../src/bufann/ivf_lists.cpp).
 
-**Read:** `include/bufann/ivf_heap.h`; `include/bufann/ivf_pin_admission.h`; `src/bufann/ivf_heap.cpp:381–623`; `include/bufann/exact_aio.h`.
+## 4. Centroid learning: deterministic Lloyd loop with interchangeable assignment engines
 
-**Check:** Four candidates on one resident page can require zero new page reads.
+### Sampling, initialization, and numerical policy
 
-## 7. Mutable lists and publication-safe updates
+For base population `N`, training uses `S = ceil(N × sample_rate)` rows, selected by seeded reservoir sampling. The sampler still reads and validates the entire base prefix. It retains sampled source IDs for diagnostics and deterministic tie handling. `nlist ≤ S` is required.
 
-**Intuition:** insert into an existing section without relearning its boundaries; delete by removing its catalog entry. Full coordinates remain stable once committed.
+Two initialization policies exist:
 
-### Mutable representation and state
+* `sample`: distinct sampled rows become initial centroids.
+* `random_partition`: shuffle sample rows, distribute them round-robin into balanced nonempty initial partitions, and use partition means. LV/LV+ require this policy.
 
-Each list owns contiguous ID/PQ arrays, length/capacity, and a reader-writer lock. A bounded locator directory maps ID to owning list, slot, and atomic state. Initial capacity is list population +16; a full list grows by exactly 16 entries. Allocation admission includes old and replacement buffers while both coexist. Deletion does not shrink capacity.
+The second policy concretizes the paper's random-partition initialization; it is specifically balanced rather than unconstrained independent random assignment. Initial partition membership does not seed the first ANN assignment.
+
+Assignments run in parallel, but means and objective totals use ordered serial reductions. Coordinate sums and exact squared distances accumulate in double; new means are stored as float. Empty clusters are reset to distinct rows with the greatest assignment error, breaking ties by original source-row ID. This deterministic recovery rule is additional implementation detail; it does not ensure every returned cluster is nonempty.
+
+### Fixed passes, not convergence stopping
+
+The code executes exactly `max_reps` assignment/mean-update passes followed by one final assignment. The last assignment ensures returned occupancy and SSE refer to the returned centroids. There is no convergence threshold or early termination.
+
+This differs from the paper's “until convergence” description (§4.2). Approximate assignments also mean reported SSE is the error to the **chosen** centroid, not necessarily the exhaustive nearest-centroid objective, and it need not decrease monotonically.
+
+### Assignment modes and what each isolates
+
+| Trainer | Committed assignment behavior |
+|---|---|
+| `exact` | Exhaustive double-L2 nearest centroid. |
+| `ann-rebuild` | Rebuild stock full-coordinate HNSW for every assignment pass. |
+| `ann-reuse` | Refresh a maintained full-coordinate modified graph; double-rescore a breadth-sized candidate set. |
+| `ann-reuse-seeded` | Same reuse, with the previous assignment as a bottom-layer entry. |
+| `ann-reuse-count` | Full-coordinate traversal returning one float-distance winner; exploration breadth remains separate. |
+| `ann-reuse-seeded-count` | Same nearest-one control with previous-assignment seeding. |
+| `lv` | Reuse, initial graph refinement, PCA traversal, and original-coordinate candidate reranking. |
+| `lv-plus` | Identical to LV except for previous-assignment seeding. |
+
+The count controls matter: the older reuse controls return and double-rescore up to the traversal breadth, whereas LV requests `min(nlist, ceil(training_rerank_factor))` centroid candidates for nearest-one assignment. Without separating exploration from returned candidates, a comparison would confound graph optimization with a different reranking workload.
+
+### Reuse means active graph maintenance
+
+At a joined assignment boundary, refresh:
+
+1. snapshots old neighbors across all levels;
+2. replaces **all** centroid coordinates;
+3. serially reinserts every stable centroid ID using old neighborhoods as entry information;
+4. measures resulting directed reachability and zero indegree.
+
+Graph levels and labels persist, but links are maintained through update search, pruning, and reciprocal connection logic. This is neither rebuilding from scratch nor retaining an unchanged adjacency graph. Old neighbors are selected at eligible levels with global-entry fallback where necessary. No assignment worker sees mixed old/new coordinates.
+
+For seeded training searches, the previous centroid is evaluated at its **current** coordinates and used as a bottom-layer entry, skipping normal upper-layer descent. The first pass has no prior assignment and falls back to ordinary entry behavior. The implementation remembers one previous nearest centroid per row, a concrete choice within the paper's broader “nearest centroids” entry-point description.
+
+### LV/LV+ resolve a schedule the paper does not fully prescribe
+
+LV modes refine the initial graph once, fit PCA to retain 95% centroid variance, and refit PCA after each subsequent graph refresh, including before final assignment. They do not repeat the initial frozen-graph refinement every iteration. Graph maintenance always uses full coordinates; only assignment traversal uses projected coordinates. Candidate selection is followed by original-coordinate double reranking and a separately counted objective-distance evaluation.
+
+This moving-PCA/initial-refinement schedule is an explicit implementation interpretation, not a claim that Alibaba used precisely that schedule. Training PCA's 95% target is fixed independently of the configurable final-router variance target. Temporary training graphs and projections are discarded, not persisted as the final search router.
+
+**Sources:** [`ivf_centroids.cpp`](../src/bufann/ivf_centroids.cpp), `training_search_policy`, `make_reusable_assignment`, and `train_centroids_ann` in [`ivf_router.cpp`](../src/bufann/ivf_router.cpp), [`ivf_patched_graph.cpp`](../src/bufann/ivf_patched_graph.cpp), [`ivf_config.cpp`](../src/bufann/ivf_config.cpp).
+
+## 5. Centroid routing: separately selectable graph, refinement, and compression
+
+The final router returns list IDs. Base assignment and insertion request one centroid; a query requests `nprobe`. It is independently configured from the trainer.
+
+| Router | Traversal | Final centroid ranking |
+|---|---|---|
+| `exact` | Enumerate all centroids | Original-coordinate double L2. |
+| `hnswlib` | Stock HNSW, full-coordinate float kernels | Double-rescore returned candidates. |
+| `patched-full` | Modified HNSW, full coordinates | Double-rescore candidates. |
+| `refined` | Modified graph after bottom-layer refinement | Double-rescore candidates. |
+| `pca` | Modified graph, projected centroid coordinates | Original-coordinate double rerank. |
+| `pca-refined` | Refined graph, projected coordinates | Original-coordinate double rerank. |
+
+Selecting LV+ training **does not enable or select** PCA/refined final routing. Optimized final artifacts must be enabled during build; query mode can then be overridden independently of the persisted base/insertion mode. This separation supports useful ablations but also permits a configuration substantially less optimized than the paper's full pipeline.
+
+### Per-call breadth instead of mutating shared HNSW settings
+
+Shared graphs retain `ef = 1`. For stock HNSW, the requested candidate count is `min(nlist, max(requested_count, breadth))`; upstream's `max(ef, k)` behavior supplies effective breadth without concurrent `setEf` calls. Full-coordinate modified modes use similar oversampling and double rescoring. Projected modes request:
 
 ```text
-Posting state: Absent → Reserved → Live → Deleted
-                        └ cancel → Absent
-Heap state:    Absent → Prepared → Live → Deleted
-                         └ cancel → Aborted → retry Prepared
+C = min(nlist, ceil(requested_count × router_rerank_factor))
+effective breadth ≥ C
 ```
 
-Successful deletion permanently prevents ID reuse. Canceled unpublished insertion may retry; its retained aborted physical slot is rewritten rather than allocated again. Out-of-range IDs throw. Missing/nonlive deletion returns false and increments the missing-delete counter, including deletion racing with a reserved, unpublished insertion.
+They traverse in projected space, rerank those C centroids in original space, and retain the requested number. Ordering is distance then list ID. Requesting all centroids takes exact enumeration rather than depending on graph connectivity.
 
-### Insertion protocol
+This per-call design is important for overlapping queries and insertions with different breadths. It also means the `hnswlib` mode is an unmodified **dependency**, but the surrounding router adds candidate oversampling and double rescoring; it is not simply raw upstream `searchKnn(query, nprobe)` timing.
 
-1. Acquire shared lifecycle admission; reject failed sessions and invalid coordinates/workspace.
-2. Atomically reserve an Absent ID, rejecting live/reserved/deleted IDs.
-3. Route to one frozen centroid and encode with the frozen PQ codebook.
-4. Prepare physical coordinates under serialized heap-writer admission.
-5. Exclusively lock the destination list; grow if full and copy the new ID/code into an unpublished slot.
-6. Publish heap logical readiness through a callback, then publish locator/list length/live state. No throwing operations remain after readiness succeeds.
+### PCA implementation choices
 
-The ordering prevents visible postings referencing unready coordinates. A reserved insertion is not visible merely because bytes exist in a heap page. This is an in-process visibility protocol, not a disk transaction. Centroids, graph topology, PCA, and codebook remain frozen across updates.
+PCA fits the centroid population, not database vectors. The implementation computes a centered double covariance matrix, solves it with a cyclic double Jacobi eigensolver capped at 64 sweeps, and retains the smallest leading-eigenvalue prefix meeting the variance target. Projection uses double accumulation and float output, with no whitening. Eigenvector signs and repeated-eigenvalue bases are canonicalized; zero variance uses the full-dimensional identity basis. Load validation checks the projection against the source centroids.
 
-### Deletion protocol
+The graph topology is built in full-coordinate space and then searched using a separate projected coordinate array. **The implementation does not eliminate full-coordinate centroid storage.** With optimized modes enabled it retains a stock graph, a modified unrefined graph, a separately constructed/refined graph, full centroids, and PCA data. That is valuable for comparisons but costs more memory than a production representation retaining only the chosen graph. PCA here reduces traversal-coordinate traffic, not necessarily the total router memory footprint.
 
-Acquire the owning list’s exclusive lock and recheck live state. Move its last ID and PQ code into the removed slot, repair the moved ID’s locator, decrement length, and mark the removed ID Deleted. Then retire its heap record logically. For example, `[41,12,88,9]` deleting 12 becomes `[41,9,88]`. This is constant-entry list work (including a chunk-sized code copy), not coordinate-heap compaction.
+Keeping 95% variance is not a 95% recall guarantee, and projection overhead can outweigh reduced-distance cost when dimensional reduction is small.
 
-### Failure boundaries and tradeoffs
+### Refinement and connectivity are bounded heuristics
 
-Routing/encoding/list-growth failure can unwind a reservation and cancel prepared coordinates without poisoning the session. Terminal heap-coordinate failures poison it; cancellation failure marks the index failed. If heap retirement fails after posting deletion, the session is poisoned rather than rolled back. Failed sessions reject queries, mutations, and checkpoints. Harness-level partial workloads publish no successful completion, even when some individual updates committed.
+For every centroid, refinement searches the frozen pre-refinement graph, applies the standard neighbor-pruning heuristic, and records proposed bottom-layer neighbors. All proposals are then installed. This replacement changes outgoing bottom edges only and adds no reciprocal links by itself. Upper layers remain intact.
 
-Exact +16 growth limits spare capacity but repeatedly copies growing lists; severe insertion skew can make cumulative growth expensive. Frozen centroids avoid retraining cost but may fit shifted data poorly. Balanced insert/delete counts do not bound disk usage: deleted/aborted records remain retained, while newly committed IDs consume storage.
+The implementation makes one reinsertion pass over nodes with zero indegree in the proposed graph. It measures directed bottom-layer reachability from the entry point and zero-indegree counts afterward. It does **not** enforce strong connectivity, compute an SCC repair closure, or repeat repair until connected. This realizes the paper's isolated-node reinsertion idea (§4.3), but does not turn the paper's empirical connectivity observation into a guarantee.
 
-**Read:** `src/bufann/ivf_index.cpp:702–775`; `src/bufann/ivf_posting_lists.cpp:118–338`; `src/bufann/ivf_heap.cpp:381–431`.
+**Sources:** [`ivf_router.h`](../include/bufann/ivf_router.h), [`ivf_router.cpp`](../src/bufann/ivf_router.cpp), [`ivf_pca.cpp`](../src/bufann/ivf_pca.cpp), [`ivf_patched_graph.cpp`](../src/bufann/ivf_patched_graph.cpp).
 
-**Check:** Explain why retrying an aborted ID is allowed but reinserting a deleted ID is not.
+## 6. HNSW dependency and comparison architecture
 
-## 8. Consistency, checkpoints, and mixed rounds
+The paper evaluates against Faiss HNSW. This repository instead uses:
 
-### Weakly consistent mutable queries
+* a checksum-pinned, fetched, **unmodified hnswlib v0.8.0** comparison;
+* a checked-in modified variant under `dependencies/hnswlib/include/ivf_patched/`, isolated in namespace `ivf_hnswlib`.
 
-A scan takes each selected list’s shared lock separately, not a collection-wide lock. It may observe different lists at different times. Reranking checks candidate liveness before fetching, after fetching, and while filtering sorted hits. Deleted candidates are dropped without refilling from the lists, so fewer than k hits may remain. A deletion can still overlap a hit’s final check/return. Late insertions may be missed. These safeguards prevent known stale candidates from being used; they do not provide snapshot isolation.
+Modified headers are authoritative source, not generated patches. They add per-call projected traversal coordinates and counters, caller-provided entries, seeded bottom-layer search, quiescent coordinate replacement/reinsertion, and validated bottom-edge replacement. They retain upstream queues, stopping rules, visited pools, pruning, and SIMD distance kernels rather than introducing a new graph-search algorithm. Local lookahead/empty-neighbor safety fixes are also retained.
 
-Mutable workspace admission uses possible ID capacity rather than a racing live count. Ledger/page protection safeguards coordinates. A scan holds one list’s shared lock across its entire scan; growth/deletion require an exclusive lock. Large/skewed lists can delay mutations; no bounded-wait guarantee follows. Ordinary calls share lifecycle admission and can overlap; checkpointing takes it exclusively.
+Artifacts accept the producer identity `hnswlib-0.8.0-stock1`; older producer labels are deliberately rejected rather than relabeled. This records dependency identity separately from binary framing versions. The label identifies the stock comparison, not a claim that optimized graphs are unmodified.
 
-### Fork, checkpoint, reopen
+There is a qualification caveat: pristine upstream retains known SIMD-prefetch safety issues. Sanitizer configurations default to disabling manual HNSW vectorization for both variants. Scalar sanitizer results therefore do not qualify the SIMD path, and old safety-corrected comparison measurements cannot be relabeled as new stock measurements.
 
-`fork` verifies the immutable source, converts lists, and makes real private copies of heap and PQ sidecar. It does not make a shared cache heap writable. A checkpoint waits for calls to quiesce, verifies no pending reservations and heap/list live/tombstone agreement, flushes, and writes a fresh immutable checkpoint family. The current session remains writable afterward.
+**Sources:** [`dependencies/hnswlib/README.md`](../dependencies/hnswlib/README.md), [`cmake/Hnswlib.cmake`](../cmake/Hnswlib.cmake), modified [`hnswalg.h`](../dependencies/hnswlib/include/ivf_patched/hnswalg.h).
 
-Mutable artifacts include `.mlists`, `.heap.state`, and `.origin`, in addition to frozen router/PQ and heap metadata. Reopen copies checkpoint heap/PQ into new private paths, validates states/coordinates/membership and frozen identities, and rechecks source digests. Deleted and aborted physical records survive reopening.
+## 7. Quantization, candidate selection, and complete query execution
 
-Publication is manifest-last, not atomic/fsynced/crash-safe. No write-ahead log (WAL), rollback, interrupted-run recovery/resume, or slot reclamation is supplied. Flush failure poisons the heap; later output-copy/write failure can leave partial artifacts without necessarily poisoning a healthy session. Preserve failure evidence and use new paths.
+### Deliberate PQ8/scalar specialization
 
-### Three actual mixed schedulers
+`PQCodebook<T>` wraps the inherited `FixedChunkPQTable<T>`: 256 representatives per chunk, one byte per chunk, with its stored global centering/rearrangement. Codes describe global vectors, **not residuals relative to IVF centroids**. Insertions encode with that same frozen codebook.
 
-| Mode | Allocation and termination |
+For each query, a caller-owned float LUT contains `256 × chunks` distances. A code's asymmetric distance is the ordered float sum of one lookup per chunk. The scanner visits every code in every selected list and retains a global top-B max-heap, with vector-ID tie breaking.
+
+The paper supports PQ/RaBitQ and evaluates PQ with four-bit codes and SIMD fast scanning (§§3.3, 4.1, 5.3). Neither RaBitQ nor a four-bit batch-transposed FastScan kernel is implemented here. For example, 64 PQ8 chunks and 128 PQ4 chunks both occupy 64 bytes/vector, but have different subspaces, lookup tables, approximation error, and execution cost. Equal byte budgets do not establish algorithmic or performance equivalence.
+
+### Three distinct candidate budgets
+
+| Budget | What it controls |
 |---|---|
-| `weighted` | Shared pool; finite streams chosen in proportion to remaining counts. Query percentage r gives floor(r×updates/(100−r)) queries unless explicit count supplied. |
-| `fixed_8_8` | Exactly 8 mutation +8 query workers; finite query stream. |
-| `update_driven` | floor(T/2) mutation workers, remaining query workers; stop query admission once all updates finish. No query quota. |
+| Training rerank factor | Number of centroid candidates reranked for one LV/LV+ training assignment. |
+| Router rerank factor | Number of centroid candidates reranked during projected final routing; proportional to nprobe for queries. |
+| Vector rerank factor | Number of PQ finalists whose full database coordinates are fetched; proportional to requested k. |
 
-Dedicated mutation claims alternate insert/delete while both remain. Dedicated-role modes gate callbacks until all workers launch; weighted workers may execute during launch. Failures stop admission, join existing work, and rethrow without rolling back updates. OpenMP/MKL are constrained before mixed setup. Final `query_threads` controls scoring, not foreground allocation.
+For immutable population N, `B = min(N, ceil(k × vector_rerank_factor))`. Mutable query admission uses usable **ID capacity** instead of a changing live count, avoiding underestimating scratch during concurrent insertion. Actual returned candidates remain bounded by observed postings.
 
-Foreground wall time spans launch through join, excluding staging/hash/setup/checkpoint/scoring. Callback latencies exclude dispatch/monitor bookkeeping but include native waits. Overlap measures admitted intervals, not CPU simultaneity. Concurrent queries are unscored; a separate post-join/checkpoint pass scores recall. Update-driven percentiles use at most 65,536 reservoir samples; means use all queries. Tiny update-driven rounds may have no queries; any mode may lack overlap.
+Larger B increases selection/fetch/exact-rerank work. It does not reduce scanned codes, and reaching B does not terminate scanning.
 
-**Read:** `src/bufann/ivf_search.cpp:230–380`; `src/bufann/ivf_index.cpp:615–699,803–967`; `tests/ivf_mixed_workload.h`; `tests/ivf_cli_execution.cpp`.
+### Query sequence
 
-## 9. Cost-model selection and configuration
+```text
+validate/admit workspace
+  → route to nprobe lists
+  → build PQ LUT
+  → scalar scan + global top-B selection
+  → bounded batches of copied full coordinates
+  → double squared-L2 exact distances
+  → distance/ID sort and top-k
+```
 
-### Choosing nlist without final-query leakage
+This preserves the paper's “compressed computation first, fetch once at the end” architecture, but “once” means **one logical fetch stage**, not one physical read or one backend call. All exact distances use original stored coordinates. The core processes an individual query serially; outer drivers supply query-level concurrency. Setting `query_threads` alone does not parallelize a single scan.
 
-**Intuition:** more centroids create finer lists and potentially less PQ scanning, but increase routing and per-list work. The model chooses a candidate nlist minimizing mean `T1 + T2`, where T1 is routing time and T2 is estimated scan/selection time—not complete query latency.
+Approximation enters through centroid ANN, the nprobe list restriction, and PQ finalist truncation. Exact reranking cannot recover excluded vectors. On an immutable quiescent index, searching all lists **and** retaining all N vectors yields exhaustive exact scoring; either condition alone is insufficient.
 
-1. Select seeded, disjoint base-derived sample and synthetic-query rows; compute exact double-L2 ground truth against that sample.
-2. For each eligible nlist, train the declared trainer and build the final router. Reassign sample rows with the final base/insertion router, not temporary training labels.
-3. For each synthetic query’s top-k true neighbors, collect distances to their assigned centroids. Keep multiplicity when neighbors share a centroid.
-4. Choose the distance threshold at rank `ceil(target_recall × k)`. Count every centroid at or below the threshold and sum its sample occupancy.
-5. Measure production-router time for that probe count. Estimate full-base code count as `sample_codes × N/S`; multiply by a measured per-code coefficient from the actual scalar scanner.
-6. Average T1/T2 across queries and choose minimum total, breaking exact ties toward smaller nlist. Retain exclusions, settings, identities, and report provenance.
+**Sources:** [`ivf_pq.h`](../include/bufann/ivf_pq.h), [`pq_table.h`](../include/pq_table.h), [`ivf_numeric_internal.h`](../include/bufann/ivf_numeric_internal.h), [`ivf_lists.cpp`](../src/bufann/ivf_lists.cpp), [`ivf_search.cpp`](../src/bufann/ivf_search.cpp).
 
-Threshold code counts use ideal centroid distances; approximate routing may select a different set. The tool records routed sample counts separately. ADC-table setup, coordinate fetch, and exact vector rerank are excluded from the objective. Thus the selected nlist need not maximize end-to-end QPS, nor does a probe estimate guarantee achieved ANN recall.
+## 8. Local coordinate storage and I/O safety
 
-Default eligibility requires `S ≥ nlist × 32`: configurable project policy, not a paper mandate or adequacy proof. The coefficient profiles single-list scan/selection on an existing-code prefix and extrapolates linearly, not a complete multi-list query. Freeze source/PQ/settings/report before validation and reserve final queries. Prediction error is not permission to refit on the final set. The harness checks report/explicit-nlist agreement and records provenance.
+### Reuse the backend, remove vector-graph semantics
 
-### Defaults depend on entry point
+`HeapStorage<T>` adapts `InPlaceGraphStore`, its slotted pages, locator arrays, buffer pool, and Linux/libaio machinery. IVF uses zero-degree records and keeps PQ codes in posting arrays rather than the heap. Read paths validate node identity and zero degree instead of blindly trusting a locator. The default page size is 4096 bytes; padded coordinates must fit within one slot/page, so dimension support is bounded by dtype and page size.
 
-| Setting | Current default or distinction |
+This is a local substitute for LindormTable's full-vector batch gets, not a reconstruction of its storage engine, replication, or row semantics.
+
+### Page-local allocation addresses a concrete backend mismatch
+
+The inherited generic allocator can round-robin across a 256-page allocation batch. With the small 64-frame default pool, repeatedly touching all partially filled pages causes bulk-load thrashing. Immutable streaming construction and mutable coordinate preparation therefore fill one page before advancing. Generic append behavior remains unchanged.
+
+This optimization changes physical placement only: source IDs, list membership, and serialized framing do not change. Mutable allocation and coordinate writes remain caller-serialized even when multiple workers route and encode insertions concurrently.
+
+### Bounded copying instead of exposing pinned pointers
+
+Coordinate fetches copy into caller-owned, 64-byte-aligned scratch with padded row strides. No pointer into an evictable frame escapes. The backend batch path can share/deduplicate page reads for multiple vectors on the same page. One page read guard is held at a time when copying, avoiding recursive locking for duplicate IDs/pages.
+
+The adapter uses short ledger locks to check logical availability, releases that lock before pin admission and backend I/O, and rechecks liveness while copying. A global mutex is not held across the entire I/O stage.
+
+### Aggregate pin admission is a safety/throughput tradeoff
+
+Let `Fmin` be the smallest buffer shard's frame count. FIFO admission grants aggregate credits with:
+
+```text
+A = max(1, Fmin − 1)
+query batch limit = min(256, max(1, floor(A / 2)))
+writer request = 1 credit
+```
+
+The conservative bound assumes all requests might hit one shard. It bounds aggregate pinning across concurrent readers/writers rather than trusting each operation's batch bound independently. Frame pins release before credit leases; admission waits occur outside the logical-state mutex. Tiny/skewed pools remain bounded, but admission contention can limit throughput. This is not a universal concurrency speedup.
+
+### Fail closed on terminal storage errors
+
+The scoped IVF backend path checks complete reads/AIO completions and aligned full-page writes, including eviction and flush paths. Short writes fail; interruptions are retried where implemented. Aligned page snapshots avoid depending on an ordinary byte vector satisfying direct-I/O alignment.
+
+Terminal heap/pool failures poison the session and admission mechanism, wake waiters, and prevent a later successful checkpoint. This does not provide crash durability or silently repair an inconsistent artifact. These protections are scoped to the IVF path, not a blanket claim about every inherited reader.
+
+**Sources:** [`ivf_heap.cpp`](../src/bufann/ivf_heap.cpp), [`ivf_pin_admission.h`](../include/bufann/ivf_pin_admission.h), [`exact_aio.h`](../include/bufann/exact_aio.h), [`inplace_backend.h`](../include/bufann/inplace_backend.h), [`inplace_backend.cpp`](../src/bufann/inplace_backend.cpp).
+
+## 9. Mutable posting lists and publication-safe updates
+
+### Paper-faithful compact list operations
+
+Each mutable list starts with `initial_population + 16` capacity. When full, it grows by **exactly 16**, not geometric vector growth. Growth admission accounts for old and new arrays coexisting, including concurrent growth on different lists. Deletion does not shrink capacity.
+
+Deletion swaps the final ID/code into the removed slot, repairs the moved ID's locator, decrements length, and marks the removed ID deleted. This matches the paper's compact swap-with-last mechanism (§4.4). Its work is constant in list length, but includes copying one PQ code. It does not compact coordinates on disk.
+
+The +16 policy is memory-frugal for short lists but causes repeated full-list copying under severe insertion skew. With very large nlist, per-list locks, array headers, and reserved slots are themselves material overhead.
+
+### Reservation and coordinate preparation are separate from visibility
+
+The implementation adds explicit state machines:
+
+```text
+posting: Absent → Reserved → Live → Deleted
+                   └ cancel → Absent
+
+heap:    Absent → Prepared → Live → Deleted
+                   └ cancel → Aborted → retry Prepared
+```
+
+Insertion proceeds as follows:
+
+1. Take shared lifecycle admission; validate session health, vector, and scratch allowance.
+2. Atomically reserve an Absent ID, excluding duplicate concurrent insertions.
+3. Route to one frozen centroid and encode with frozen PQ.
+4. Prepare coordinates through the serialized heap writer, without publishing a posting.
+5. Exclusively lock the destination list, perform any allocation, and copy the unpublished ID/code.
+6. Publish heap logical readiness through a callback, then publish list length/locator/live state with no remaining throwing operations.
+
+The key invariant is **a visible posting must never reference unready coordinates**. Bytes present in a page do not by themselves make an insertion visible. The callback ordering and exception cleanup supply in-process cross-component safety where the paper describes a database-level WAL commit.
+
+### Identity and failure choices
+
+Successful deletion permanently forbids reuse of that ID. Canceled, unpublished insertion may retry; an aborted heap record keeps its slot and is rewritten rather than allocating another slot. Missing/nonlive deletion returns false, including when racing with a reserved unpublished insertion; out-of-range IDs throw.
+
+Routing, encoding, and growth failures can cancel reservations/prepared state without automatically poisoning a healthy session. Terminal coordinate errors poison it; cancellation failure marks it failed. If coordinate retirement fails after a posting deletion, the session fails rather than pretending the posting change was rolled back.
+
+Deleted and aborted physical records remain retained. Consequently, equal insert/delete counts keep the **live** population stable but do not bound disk usage or reusable ID supply. No physical garbage collection, slot reclamation, or arbitrary replacement of a live vector under the same ID is implemented.
+
+Centroids, final graphs, PCA, and PQ stay frozen across updates. There is no adaptive centroid movement, list splitting/merging, reassignment maintenance, or drift-triggered rebuilding in this committed architecture. That keeps mutations cheap and stable but can degrade routing fit as data shifts.
+
+**Sources:** `MutableIndex<T>::insert`/`erase` in [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_posting_lists.cpp`](../src/bufann/ivf_posting_lists.cpp), [`ivf_heap.cpp`](../src/bufann/ivf_heap.cpp).
+
+## 10. Concurrency and consistency: safe overlap without snapshot isolation
+
+Ordinary mutable queries and mutations take shared lifecycle admission; checkpointing takes it exclusively. Each list scan holds that list's shared lock for its full scan; growth and deletion need its exclusive lock. Lists are scanned independently, not under one collection-wide read lock.
+
+Therefore a query can observe different lists at different times. Insertions after a list's scan may be missed. Deletion can invalidate a retained PQ candidate before reranking. The code checks candidate membership before fetching, after fetching, and when filtering sorted exact hits. Stale candidates are dropped **without rescanning or refilling**, so fewer than k hits may remain. A deletion can still overlap the final liveness check and return.
+
+These semantics are explicitly weakly consistent: neither collection snapshot isolation nor a linearizable top-k read is promised. Stable coordinate slots and no committed-ID reuse simplify safe fetching, but do not change that visibility contract. Long/skewed list scans can delay writers; there is no bounded mutation-wait guarantee.
+
+Memory admission for mutable queries uses possible ID capacity rather than a racing live count. Shared router/PQ data are frozen and query scratch is caller-owned. Coordinate writers serialize; routing/encoding and list operations can otherwise overlap. Thus “parallel insertion” does not mean parallel heap allocation or unconstrained disk writes.
+
+**Sources:** [`ivf_search.cpp`](../src/bufann/ivf_search.cpp), [`ivf_posting_lists.cpp`](../src/bufann/ivf_posting_lists.cpp), lifecycle locks in [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_heap.h`](../include/bufann/ivf_heap.h).
+
+## 11. Persistence, private ownership, and failure boundaries
+
+### Immutable artifact bundles
+
+The local file family separates:
+
+| Artifact | Purpose |
 |---|---|
-| Programmatic trainer/init | `AnnRebuild / Sample` |
-| Native CLI/harness trainer/init | `ann-reuse-seeded / random_partition`; examples explicitly choose LV+ |
-| Training | sample rate 1, 15 passes, breadth 64; LV training rerank factor 3, refinement breadth 128 |
-| Library/native query | nprobe 1, k=10, vector factor 2, one query thread; calibration vector factor defaults to 4 |
-| Final router | hnswlib; degree 16, construction breadth 200, query breadth 128, insert breadth 64 |
-| Mixed | Native: weighted, 16 workers, ratio 80; shell/Python: update_driven, 16 workers |
-| Runtime / optional policy | 64 frames, 1 GiB allowance; standalone insertion: one worker/streaming; warmup zero. Mixed input is staged. |
+| `.centroids.bin`, `.hnsw`, `.router` | Full centroids, stock graph, settings and integrity metadata. |
+| `.patched.hnsw`, `.refined.hnsw`, `.pca` | Optional optimized-router/ablation artifacts. |
+| `.lists`, `.pq.bin` | Immutable grouped postings and copied codebook. |
+| `.heap`, `.heap.meta`, `.heap.meta.ivf` | Coordinate pages, backend snapshot, IVF descriptor. |
+| `.manifest` | Versioned configuration, source identities, and component digests. |
 
-Large-data recipes override these values; example settings are not defaults or qualified optima. Optimized final modes must be enabled separately. Library page-size admission is broader than Python harness admission; use entry-point-specific validation. Memory allowances guard estimated retained objects/scratch, not a hard process-RSS ceiling.
+Open verifies component digests and cross-component shape/population/settings agreement. Graph framing is validated before the legacy HNSW loader follows offsets: labels, centroid bytes, edge IDs/levels, lengths, and layout must agree. Posting IDs must exist in the heap. Formats assume native little-endian data and the router's 64-bit host layout, not portable cross-platform interchange.
 
-**Read:** `src/bufann/ivf_cost_model.cpp:31–172`; `tests/ivf_cost_model.cpp:280–403`; `include/bufann/ivf_config.h`; `include/bufann/ivf_router.h`; `benchmark/IVF/settings.py`; `benchmark/IVF/mixed.py`.
+The paper persists index metadata/codes through wide tables (§3.4); this implementation instead uses explicit local bundles and defensive framing checks. Native digests use byte counts/FNV-1a; Python reusable-cache identities use SHA-256. These detect integrity changes, not trusted provenance or authenticated content.
 
-## 10. Verification, measurement, and study checklist
+### Mutation never writes into a reusable immutable source
 
-### Operational and measurement boundaries
+`fork` validates the base and makes real private copies of its heap and PQ sidecar. Frozen router/PQ objects are reused in memory where appropriate, while immutable CSR lists become mutable lists. Reopening a mutable checkpoint similarly creates a new private writable heap. This isolates runs and prevents shared-cache corruption; it is not zero-copy cloning or a distributed shared-storage implementation.
 
-Full heap-backed execution requires the Linux/native dependency-enabled build (MKL, OpenMP, libaio). Dependency-isolated drivers validate input contracts but do not execute native workloads. Use `benchmark/IVF/build.sh` and the current benchmark README for installed-library paths; no DiskANN graph conversion is needed.
+Mutable checkpoints add `.mlists`, `.heap.state`, and `.origin`. Under exclusive lifecycle admission they require no pending reservations and matching heap/list live and tombstone state. They flush and write a **fresh immutable checkpoint family**; the current session remains writable afterward. Reopen validates retained physical records, metadata/bitmaps/locators, coordinates and padding, logical state, and unchanged frozen router/PQ identities. Deleted/aborted records persist across reopening.
 
-Prepare/run scripts cover independent query, insert, delete, and mixed workloads. Source/settings/tool identities bind reusable cached bundles. Cache restoration is not a new build measurement. Fresh work paths/tags preserve prior and failed evidence. Checkpoint/reopen copies can substantially increase disk requirements.
+### Manifest-last is not a transaction
 
-- **Query timing:** excludes preparation/open/checks/scoring/export; lifetime RSS does not. Stage totals sum per-query wall times, not run wall time, and can exceed elapsed time with concurrency. Run time includes launch/join/result collection. Hashing/open/copies warm caches; zero warmup does not mean cold devices.
-- **Insertion timing:** streaming includes worker source reads; staged input is admitted/loaded before mutation timing. Keep these policies separate when comparing worker counts. Heap work/publication and launch/join remain foreground costs.
-- **Warmup:** optional serial queries derived from frozen base centroids run on the same index object before the final timed pass, after updates/checkpoint when applicable. They use no final-query/GT selection and are not scored. A separate-process warmup cannot transfer its application buffer pool.
-- **Recall:** score against the actual live population after updates. Filtered deep ground truth (GT) must contain enough survivors; underflow fails. Native scoring is percentage recall with kth-distance tie expansion where available; truncated derived GT limits tie coverage. Missing hits count against recall.
-- **Comparison:** post-round queries/second (QPS) is not concurrent QPS. Mixed `summary.json` references round `result.json` files and retains summed foreground wall/counts, not pooled quantiles or a duplicate root result. Record threads/cache, identities, storage/runtime, overlap, memory/RSS, repeats, and failures. Unequal-recall points do not prove matched-recall speedups.
+Output paths are freshly/exclusively claimed and existing files are refused. A completed manifest is written last, but publication is not an atomic rename/fsync transaction. Partial files and failed evidence are retained. There is no WAL, rollback, automatic recovery, interrupted-run resume, or crash-safe generation switch.
 
-### Tests worth reading as executable specifications
+This is the largest correctness-contract difference from paper §4.4: Lindorm commits only after data/index WAL persistence; this engine publishes in-process visibility and later creates clean checkpoints. Successful insertion must not be described as crash-durable insertion. Flush/storage failure poisons a session; a later output-copy failure can leave a partial checkpoint without necessarily invalidating an otherwise healthy session.
 
-| Under `tests/ivf/` | Evidence to inspect |
+**Sources:** [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_artifacts.cpp`](../src/bufann/ivf_artifacts.cpp), serialization/load paths in [`ivf_router.cpp`](../src/bufann/ivf_router.cpp), [`ivf_heap.cpp`](../src/bufann/ivf_heap.cpp), [`ivf_posting_lists.cpp`](../src/bufann/ivf_posting_lists.cpp).
+
+## 12. Centroid-count selection: paper-inspired T1 + T2, not total-query optimization
+
+The cost model preserves paper §4.1's central tradeoff: finer partitioning reduces scanned codes but increases centroid-routing cost. It evaluates a declared nlist grid rather than hard-coding sqrt(N) or treating 200K as universally optimal.
+
+The procedure is:
+
+1. Select seeded, **disjoint** training/sample rows and synthetic-query rows from the initial base. Official/final queries and GT are not inputs.
+2. Compute exact double-L2 top-k GT against the sample.
+3. For each eligible nlist, train centroids, construct the final router, and reassign sample rows through the final base/insertion router.
+4. For each synthetic query, collect distances to the assigned centroids of its true top-k neighbors. Preserve multiplicity when several neighbors share a centroid.
+5. Take the threshold at rank `ceil(target_recall × k)` and count every centroid within that inclusive radius. Sum sample occupancy inside the radius.
+6. Measure actual production-router time for that probe count, with separate warmup/repeats, giving T1.
+7. Estimate full-base scanned codes as `sample_codes × N/S`; multiply by a profiled per-code scalar scan/selection coefficient, giving T2.
+8. Choose minimum mean `T1 + T2`, breaking exact ties toward smaller nlist; retain exclusions, identities, settings, and per-query details.
+
+Preserving GT-neighbor multiplicity and inclusive distance ties makes the paper's rank/radius procedure unambiguous. Scaling expands by N/S, rather than shrinking sample counts by S/N.
+
+### Departures and added policies
+
+* The paper profiles fixed-size SIMD batches; this implementation profiles its real **scalar scan plus bounded candidate selection**, using an existing-code prefix (default 100K codes), and extrapolates linearly per code.
+* Candidate eligibility defaults to `S ≥ 32 × nlist`. This configurable sample-per-centroid minimum is project policy, not a paper requirement or statistical adequacy proof.
+* The estimated radius uses ideal full-coordinate centroid distances. Approximate routing can select a different list set; actual routed sample-code counts are reported separately rather than silently replacing the model.
+* LUT construction, coordinate fetch, and exact vector reranking are excluded. A one-list coefficient does not fully model many-list overhead, cache locality, or concurrent contention.
+* Calibration can use a different vector finalist factor from query defaults; the profile's selection cost must be interpreted with its recorded settings.
+* Reports are identity-bound and intended to be frozen before validation/final evaluation; the harness rejects an explicit nlist inconsistent with the selected report.
+
+Thus the model chooses a **routing-plus-scan estimate**, not a proven end-to-end QPS optimum, and its predicted nprobe does not guarantee achieved ANN recall. It does not model Lindorm's distributed network/storage behavior or automatically retune the index during updates.
+
+**Sources:** [`ivf_cost_model.cpp`](../src/bufann/ivf_cost_model.cpp), operational [`tests/ivf_cost_model.cpp`](../tests/ivf_cost_model.cpp), `PostingLists::profile_scan` in [`ivf_lists.cpp`](../src/bufann/ivf_lists.cpp), [`benchmark/IVF/cost_model.py`](../benchmark/IVF/cost_model.py), [`settings.py`](../benchmark/IVF/settings.py).
+
+## 13. Resource and numerical contracts are architectural, not incidental
+
+Build, training, open, query, growth, checkpoint, and calibration have explicit preflight size/work checks with overflow protection. Estimates include relevant persistent structures, scratch, temporary replacement buffers, and conservative thread-stack allowances. They are **admission estimates, not hard process-RSS caps**.
+
+Training normally permits at most one billion assignment searches: `S × (max_reps + 1)`. Exact training additionally limits that quantity times nlist. PCA covariance/solver/validation and refinement have separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. For example, 90M rows with ten mean-update passes require 990M assignments; fifteen passes require 1.44B and fail the default guard. Raising a PCA/routing limit does not raise that training-search limit.
+
+Numeric domains are deliberately separate:
+
+* HNSW traversal uses float kernels and rejects excessive coordinates that could overflow float squared distances.
+* PQ LUT entries and chunk-order ADC accumulation remain float; changing summation precision/order can change finalist ties.
+* Exact vector/centroid reranking, calibration truth, and training objective distances use ordered double squared-L2 calculations.
+* PCA uses its own double fitting/validation arithmetic and float projected coordinates.
+
+The public IVF CMake policy disables fast-math for consumers, overriding inherited aggressive floating-point assumptions so finite-value checks remain meaningful. Sorting consistently breaks equal final distances by ID. These choices prioritize stable, inspectable contracts; they do not establish bitwise equivalence to Faiss or paper results.
+
+**Sources:** [`ivf_config.h`](../include/bufann/ivf_config.h), [`ivf_config.cpp`](../src/bufann/ivf_config.cpp), [`ivf_numeric_internal.h`](../include/bufann/ivf_numeric_internal.h), [`cmake/IVF.cmake`](../cmake/IVF.cmake), workspace estimators in the component implementations.
+
+## 14. Workload scheduling and measurement infrastructure
+
+This is additional experimental architecture, not Lindorm's production request scheduler.
+
+### Sequential and mixed mutation execution
+
+Standalone insertion defaults to one worker but permits bounded parallel workers. Streaming input validates requested coordinates before mutation, then includes worker source reads in insertion timing. Staged input admits/loads the coordinate array before timing. Its reported foreground rate excludes that loading but still includes native waits, heap work, publication, and worker launch/join. Those policies must not be compared as an isolated worker-count speedup. Standalone deletion remains serial.
+
+Three mixed schedulers exist:
+
+| Scheduler | Allocation and termination |
 |---|---|
-| `ivf_centroid_tests.cpp`, `ivf_ann_training_tests.cpp`, `ivf_patched_router_tests.cpp` | Training schedules, candidate contracts, routing/projection |
-| `ivf_list_tests.cpp`, `ivf_search_tests.cpp` | Grouping, independent ADC/exact oracle, full-budget exactness, page-sharing/batch counts |
-| `ivf_mutable_list_tests.cpp`, `ivf_mutable_index_tests.cpp` | Growth, reservations, stale candidates, retries, checkpoint/reopen |
-| `ivf_concurrent_fetch_tests.cpp`, `ivf_direct_io_tests.cpp`, `ivf_read_io_tests.cpp` | Bounded access, alignment, short/failing I/O |
-| `ivf_cost_model_tests.cpp`, scheduler and Python integration tests | Prediction components, failure joining, orchestration contracts |
+| `weighted` | Shared worker pool; finite operation streams selected in proportion to remaining counts. |
+| `fixed_8_8` | Exactly eight mutation and eight query workers, finite query stream. |
+| `update_driven` | floor(T/2) mutation workers, remaining query workers; replay queries until updates complete, without a query quota. |
 
----
+Dedicated mutation claims alternate insert/delete while both streams remain. Dedicated-role mixed and parallel-insert workers launch behind an admission gate; weighted scheduling has different launch semantics and may execute while workers are still launching. Failures stop new admission, join admitted work, and rethrow; they do not roll back already committed mutations or publish a successful partial workload.
 
-## Addendum A. Evidence and file-by-file activities
+OpenMP/MKL concurrency is constrained before mixed execution to avoid hidden oversubscription. Final `query_threads` controls the later scoring pass, not the mixed foreground role split.
 
-### A.1 What “evidence” means
+### Concurrent query timing is separate from recall scoring
 
-Evidence labels distinguish four different kinds of support; they are not interchangeable:
+Mixed foreground queries run against weakly consistent changing state and are not scored against a fictitious fixed GT. After updates join and checkpointing completes, a separate final query pass measures recall against the actual final live population. **Post-round query QPS is not concurrent foreground QPS.** Mixed rounds are chained through checkpoints and summarized using counts/times and relative round-result paths, not pooled percentiles.
 
-| Evidence type | What it supports | What it does not establish |
-|---|---|---|
-| **Implementation inspection** | Actual branches, arithmetic, lock scopes, publication order, framing checks, and failure paths in the reviewed source | That every path executes correctly on every platform or is race-free |
-| **Test-source inspection** | The properties a fixture asserts, its oracle, inputs, and injected failures | That the test passed on this checkout; a test name alone is not execution evidence |
-| **Historical reports/documentation** | Recorded intent, prior runs, operational procedures, and known caveats | Current successful execution, current performance, or code fidelity when notes have drifted |
-| **Derived reasoning** | Consequences of explicit mechanisms: e.g., no refill can produce fewer than k hits; +16 growth repeatedly copies arrays | Measured latency, memory, recall, scaling, or a formal correctness proof |
+Overlap means admitted operation intervals overlap, including waits; it does not prove simultaneous CPU execution. Update-driven query volume is unbounded in advance, so percentile storage uses a seeded reservoir capped at 65,536 samples, while means use all queries. Very short update rounds may admit no queries or show no overlap.
 
-This guide and addendum are **static-review artifacts**. Neither records a new test/build run or reproduces historical performance numbers. Line ranges are navigation aids for this snapshot, not stable version identifiers; prefer the named classes/functions after edits. For reproducible evidence, record a revision or source digest plus binary/dependency identities, input/configuration hashes, commands, machine/runtime settings, logs, and exit status.
+### Warmup is explicit and final-query-independent
 
-### A.2 Claim-to-evidence map
+Optional warmup queries are derived deterministically from frozen base centroids, rounded/clamped for integer dtypes, and run serially on the **same index object** before the timed final pass. They use no final-query/GT selection, are unscored, and have separate timing. This differs from launching a discarded warmup process, which cannot transfer its application buffer pool to another process.
 
-| Claim | Implementation evidence | Relevant fixture or limitation |
-|---|---|---|
-| Build consumes existing PQ and assigns all base rows independently of the training sample | `NativeIndex<T>::build`; `PostingLists::build<T>` | `ivf_search_tests.cpp`; source identities do not prove external code/vector parity |
-| LV+ differs from LV by previous-assignment seeding | Trainer-mode helpers; reusable assignment policy; patched HNSW search entry | `ivf_ann_training_tests.cpp`; no paper-equivalent speedup follows |
-| Training performs a final assignment after fixed mean-update passes | Shared loop in `ivf_centroids.cpp` | `ivf_centroid_tests.cpp`; not convergence-based training |
-| ADC scans every code in selected lists but retains only B candidates | Immutable and mutable `scan` loops | `ivf_list_tests.cpp`, `ivf_search_tests.cpp`; finalist truncation remains approximate |
-| Full-budget, all-list immutable search agrees with brute force | Query exact-distance loop and deterministic ordering | `ivf_search_tests.cpp:129–161` compares with an independent coordinate oracle |
-| One logical fetch may produce multiple calls; same-page vectors can share reads | `copy_batch_limit`, `copy_coordinates_batch` | `ivf_search_tests.cpp:155–215`; counters are not device IOPS |
-| Postings are not published before prepared heap readiness | `MutableIndex<T>::insert`; reservation `commit_ready`/`publish_reserved` | `ivf_mutable_index_tests.cpp`; in-process publication, not durable commit |
-| Deleted IDs cannot be reused; aborted unpublished IDs may retry | Posting state transitions and heap mutable ledger | `ivf_mutable_list_tests.cpp`, `ivf_mutable_index_tests.cpp`; physical records remain retained |
-| Queries are weakly consistent, with stale filtering and no refill | Per-list scan locks; `rerank_mutable_candidates` membership checks | `ivf_mutable_index_tests.cpp`; no collection snapshot or guaranteed k results |
-| Checkpoint excludes active ordinary calls and preserves retained state | Lifecycle exclusive lock; checkpoint membership validation; mutable-copy persistence | Mutable-index and I/O fixtures; no crash recovery/fsync guarantee |
-| Scheduler startup semantics differ by mode | Dedicated start gate versus weighted pool launch loop | Scheduler fixtures; weighted launch failure can follow already-applied updates |
-| Predictor minimizes routing plus estimated scan, not full latency | `estimate_probes`, `choose_nlist`, calibration timing/coefficient code | `ivf_cost_model_tests.cpp`; prediction quality needs frozen real-data validation |
+Neither zero explicit warmup nor direct I/O proves a cold-device experiment: opening, hashing, copies, OS/device state, and existing process activity affect cache conditions.
 
-Fixture paths in this table are under `tests/ivf/`. A fixture must be built and executed successfully before citing it as a passing result.
+### Provenance and ground truth
 
-### A.3 Core implementation: file-by-file activities
+Python/shell orchestration separates reusable immutable caches from private work trees, binds caches/prepared runs to source/settings/tool identities, refuses overwrites, and retains logs, failures, neighbors, and structured results. Cache restoration is not a new build measurement. Changed untracked runtime environments still require explicit cache-tag/root discipline.
 
-“Activities” below means **what each file does during operation and what to inspect in it**.
+Ground truth is filtered for each workload's actual live IDs. Insufficient survivors fail rather than silently depressing the denominator. Helpers check coverage and recommend/generate deeper GT for declared update plans. Native recall uses percentage scores and kth-distance tie expansion where available; truncated derived GT can limit complete tie coverage. Missing hits count against recall.
 
-| File(s) | Operational activity and review focus |
+Training comparisons, fixed-router sweeps, and repeated query sweeps are separate tools: centroid recall is not database-neighbor recall, and passing a minimum-recall gate is not proof of an identical-recall speedup over another system.
+
+### Instrumentation boundaries
+
+Queries report routing, LUT preparation, scan/selection, fetch, and exact-rerank wall times, plus scanned codes, finalists, backend calls, and pool reads. Fetch lock/admission/backend-pin intervals are **nested within fetch time**, not extra stages. A logical fetch can span several calls; several candidates can share a page; resident pages need no read. Pool-read counters are not device IOPS. Summed per-query stage times can exceed run wall time under concurrency, and lifetime RSS includes work outside the timed query phase.
+
+**Sources:** [`ivf_cli_execution.cpp`](../tests/ivf_cli_execution.cpp), [`ivf_insert_workload.h`](../tests/ivf_insert_workload.h), [`ivf_mixed_workload.h`](../tests/ivf_mixed_workload.h), [`ivf_query_warmup.h`](../tests/ivf_query_warmup.h), [`benchmark/IVF/harness.py`](../benchmark/IVF/harness.py), [`mixed.py`](../benchmark/IVF/mixed.py), [`common.py`](../benchmark/IVF/common.py), [`benchmark/scripts/check_gt_coverage.py`](../benchmark/scripts/check_gt_coverage.py), [`benchmark/IVF/README.md`](../benchmark/IVF/README.md).
+
+## 15. Defaults are not the fully optimized paper configuration
+
+| Setting | Committed default / distinction |
 |---|---|
-| `include/bufann/ivf_index.h`; `src/bufann/ivf_index.cpp` | Compose complete native/mutable indexes; own build/open/fork/reopen/query/update/checkpoint lifecycles; validate manifests and frozen-component agreement. Start here for cross-component ordering and failures. |
-| `include/bufann/ivf_config.h`; `src/bufann/ivf_config.cpp` | Define/parse trainer and dtype policies; validate training/search settings; calculate training sample and finalist budgets. Distinguish programmatic defaults from CLI policy. |
-| `include/bufann/ivf_centroids.h`; `src/bufann/ivf_centroids.cpp` | Sample base rows, initialize means, dispatch assignments, accumulate sums/occupancy/SSE, recover empty clusters, and perform final assignment. Check counters separately from total work. |
-| `src/bufann/ivf_centroids_internal.h` | Define the internal assignment-index/factory interface and measurements connecting the shared training loop to alternative assignment implementations. |
-| `include/bufann/ivf_router.h`; `src/bufann/ivf_router.cpp` | Build/load centroid indexes, select routing modes, enforce query/insert breadth, project/rerank candidates, and implement ANN training adapters and refresh policy. |
-| `include/bufann/ivf_patched_graph.h`; `src/bufann/ivf_patched_graph.cpp` | Adapt modified HNSW; measure directed reachability/indegree; refresh coordinates and neighborhoods; propose/replace bottom edges and reinsert zero-indegree nodes. |
-| `dependencies/hnswlib/include/ivf_patched/hnswalg.h` | Implement the actual traversal hooks, seeded bottom-layer entry, coordinate replacement, and reinsertion/edge-update primitives beneath the wrapper. Read this when wrapper-level descriptions are insufficient. |
-| `include/bufann/ivf_pca.h`; `src/bufann/ivf_pca.cpp` | Fit/project/serialize/validate centroid PCA; count bounded covariance/solver work; handle eigenvalue degeneracy and retained-dimension selection. |
-| `include/bufann/ivf_lists.h`; `src/bufann/ivf_lists.cpp` | Route all base rows; build grouped immutable arrays; save/load and validate framing; scan ADC codes and profile scalar scan/selection. |
-| `src/bufann/ivf_lists_internal.h` | Coordinate bounded block routing and joined worker phases during list construction. Histogram and grouping remain outside the parallel routing phase. |
-| `include/bufann/ivf_posting_lists.h`; `src/bufann/ivf_posting_lists.cpp` | Own mutable arrays, locator states, reservations, exact +16 growth, swap deletion, list locking, mutable scan, and checkpoint reconstruction. |
-| `include/bufann/ivf_pq.h`; `include/pq_table.h` | Wrap/load the frozen PQ codebook; encode insertion vectors and build ADC LUTs; implement underlying centering/rearrangement and chunk quantization. |
-| `include/bufann/ivf_search.h`; `src/bufann/ivf_search.cpp` | Estimate query scratch; sequence routing/LUT/scan/fetch/rerank; sort exact hits; collect stage metrics; filter stale mutable candidates without refilling. |
-| `include/bufann/ivf_heap.h`; `src/bufann/ivf_heap.cpp` | Adapt graph-free typed records; serialize coordinate preparation; manage mutable states, page-local population, bounded coordinate copies, poisoning, and immutable/mutable heap checkpoint formats. |
-| `include/bufann/ivf_pin_admission.h` | Implement FIFO aggregate credit admission, capacity bounds, terminal failure propagation, and waiter wakeup. Check resource acquisition/release order with heap code. |
-| `include/bufann/ivf_fetch_timing.h` | Attribute ledger-lock and fetch subinterval timing without treating nested intervals as separate query stages. |
-| `include/bufann/inplace_backend.h`; `src/bufann/inplace_backend.cpp` | Provide reused physical slot/page layout, locators, buffer frames, page guards, batch pinning, allocation, flushing, and low-level I/O. Only graph-free IVF usage is in this guide’s scope. |
-| `include/bufann/exact_aio.h` | Validate complete asynchronous read submission/completion in the scoped IVF backend path; inspect error/short-completion handling rather than inferring it from ordinary read APIs. |
-| `include/bufann/ivf_cost_model.h`; `src/bufann/ivf_cost_model.cpp` | Implement disjoint calibration splits, exact sample GT, multiplicity-preserving probe thresholds, scaled code counts, and candidate selection by T1+T2. |
+| Programmatic training | `ann-rebuild`, `sample` initialization. |
+| Native CLI/harness training | `ann-reuse-seeded`, `random_partition`; examples explicitly select LV+. |
+| Training | sample rate 1, 15 mean-update passes, breadth 64. |
+| LV training | centroid rerank factor 3, initial refinement breadth 128, 95% PCA variance. |
+| Final router | stock `hnswlib`; optimized modes disabled unless requested. |
+| HNSW | degree 16, construction breadth 200, query breadth 128, insertion breadth 64. |
+| Native/library search | nprobe 1, k=10, vector rerank factor 2, one query thread. |
+| Heap/runtime | 4096-byte pages, 64 buffer frames; common small-run memory allowance 1 GiB. |
+| Standalone insertion / warmup | one worker, streaming input, zero warmup. |
+| Mixed scheduling | native default `weighted`; shell/Python default `update_driven`, generally 16 foreground workers. |
 
-### A.4 Input, CLI, harness, and build-system files
+Large-data recipes explicitly override these. The SIFT recipe uses 64 PQ8 chunks and opts into LV+, optimized artifacts, and `pca-refined` base/insertion and query routing. Its 200K lists, resource allowances, thread counts, and search budgets are example/profile choices—not library defaults, a universal cost-model result, or measured proof of paper equivalence.
 
-The files named `tests/ivf_build.cpp` and `tests/ivf_driver.cpp` are operational command-line tools.
+**Sources:** [`ivf_config.h`](../include/bufann/ivf_config.h), [`ivf_router.h`](../include/bufann/ivf_router.h), [`ivf_heap.h`](../include/bufann/ivf_heap.h), [`ivf_training_settings.h`](../tests/ivf_training_settings.h), [`benchmark/IVF/settings.py`](../benchmark/IVF/settings.py), [`benchmark/IVF/README.md`](../benchmark/IVF/README.md).
 
-| File(s) | Operational activity and review focus |
+
+## 16. Paper-to-implementation coverage matrix
+
+| Paper mechanism | Committed status and qualification |
 |---|---|
-| `src/bufann/ivf_artifacts.cpp` | Exclusively claim fresh artifact paths; compute whole-file/prefix FNV-1a hashes and byte-count/hash digests. Distinguish native integrity digests from Python SHA-256 cache identities and from authentication. |
-| `src/bufann/ivf_io.cpp` | Validate vector/PQ framing, sizes/overflow, pivot offsets/finite values/permutations/chunk boundaries, and bounded unique counted IDs. GT shape inspection alone does not validate tag identity or distance ordering; the native execution layer performs additional content checks. |
-| `tests/ivf_build.cpp`; `tests/ivf_driver.cpp`; `tests/ivf_cli.h` | Parse build/workload options, enforce input/metric contracts, and dispatch validation-only versus compiled native execution. Do not mistake an input-validation success for index construction or workload execution. |
-| `tests/ivf_cli_execution.cpp` | Implement typed native workflows, composed memory admission, private copies, identity checks, mutations/checkpoints, warmup and parallel final queries; validate/score GT, export neighbors, and emit timing/resource JSON. |
-| `tests/ivf_insert_input.h`; `tests/ivf_insert_workload.h`; `tests/ivf_query_warmup.h` | Implement insertion input-policy/worker coordination and centroid-derived warmup. Distinguish staged payload memory and source-read timing from native mutation cost. |
-| `tests/ivf_mixed_workload.h`; `tests/weighted_update_pool.h` | Dispatch dedicated-role or weighted streams; account for callback failures, joins, completion/overlap, and latency storage. Inspect the different startup admission behaviors directly. |
-| `tests/ivf_cost_model.cpp`; `tests/ivf_router_diagnostics.cpp` | Compose calibration sampling/training/router timing/scanner profiling and fixed-router measurements, respectively. Separate centroid recall from end-to-end ANN recall. |
-| `benchmark/IVF/harness.py` | Prepare/restore SHA-256-keyed immutable caches using real copies; verify prepared identities; run query or mutation-then-checkpoint-query processes while preserving native query metrics and execution provenance. |
-| `benchmark/IVF/mixed.py` | Validate equal-cap round plans and per-round ID/GT families; chain native processes through checkpoints; validate driver-written results/live counts; publish aggregates with relative round-result paths. |
-| `benchmark/IVF/settings.py`; `benchmark/IVF/common.py` | Own defaults and build/query policy separation, input/resource guards, calibration-report compatibility, identities, exclusive output/log creation, command streaming, affinity/timeouts, and runtime provenance. |
-| `benchmark/IVF/cost_model.py`; `benchmark/IVF/router_sweep.py`; `benchmark/IVF/qualify.py` | Freeze calibration provenance without official-query inputs; sweep routers on existing centroids; orchestrate trainer/query comparisons and declared gates. Successful orchestration is not production qualification. |
-| `benchmark/IVF/download_sift.py` | Download validated SIFT base prefixes/public queries; rewrite prefix row headers; reject overwrite/resume and retain partial output. Matching download shape does not replace downstream PQ/GT identity checks. |
-| `cmake/IVF.cmake`; `cmake/Hnswlib.cmake` | Define dependency-light C++20 targets and public no-fast-math numeric policy; optionally add routing/list targets, vendored modified headers, and a pinned stock upstream comparison. |
-| `src/CMakeLists.txt`; `tests/ivf/tools.cmake`; `tests/ivf/CMakeLists.txt` | Compose backend/search/index targets, gate native CLI execution and diagnostics by available targets/platform, and register contract/integration fixtures. Inspect target gates before assuming a binary can execute heap workloads. |
-| `benchmark/IVF/README.md`; `docs/s02-heap-adapter.md` through milestone-specific notes | Explain operational procedures, historical rationale, and recorded validation. Cross-check against current code; old scheduler, patch-generation, and serialization descriptions can lag implementation. |
+| One logical IVF index with shared centroids/codebooks | Implemented within one local index; no distributed sharing protocol. |
+| In-memory compressed postings, disk full vectors | Implemented with local lists and coordinate heap. |
+| Large nlist instead of blindly using sqrt(N) | Supported and cost-model guided; example values are not universally optimal. |
+| ANN k-means | Implemented with exact/rebuild/reuse/seeded/LV variants. |
+| Reuse graph and prior assignments | Implemented with joined coordinate refresh/reinsertion and one prior centroid seed. |
+| Convergence-based clustering | Replaced by fixed passes plus final assignment. |
+| Full-coordinate topology, PCA traversal, centroid rerank | Implemented, with explicit solver/schedules and retained full-coordinate/ablation copies. |
+| Bottom-layer refinement and isolated-node reinsertion | Implemented as frozen proposals plus one zero-indegree repair pass; connectivity measured, not guaranteed. |
+| PQ/RaBitQ and SIMD fast scan | Only global non-residual PQ8 and scalar scanning implemented; no RaBitQ/PQ4 FastScan. |
+| One final full-vector batch-get stage | Logical pattern preserved; bounded local batch calls/page reads replace database/network gets. |
+| Immediate compact posting mutations | Implemented, including +16 growth and swap deletion. |
+| Data/index WAL-backed durable commit | Not implemented; publication-safe memory state and clean checkpoint families instead. |
+| Distributed regions, random sharding, broadcast/merge | Not implemented. |
+| LDMaster coordination, failover, elasticity, replication | Not implemented. |
+| Filter planning, pre/post filtering, attribute pushdown | Not implemented as IVF query features. Live-ID GT filtering is evaluation, not filtered ANN. |
+| Hybrid full-text/vector search and RRF | Not implemented. |
+| Metadata deduplication across tables | Not implemented; local frozen-bundle reuse is a different capability. |
+| Multi-tenant lists and promotion to tenant IVF | Not implemented. |
+| Physical slot reclamation / adaptive drift maintenance | Not implemented in this committed revision; do not infer these from live updates. |
