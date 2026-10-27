@@ -373,6 +373,27 @@ def main():
             assert json.loads(metrics_path.read_text()) == record and record["workload"] == "query"
             assert read_results(result_path) == [[row[0]] for row in oracle]
             assert record["recall"] == 100 and record["query_count"] == 3
+            # Immutable base -> private mutable query session, with no updates.
+            original = {p: p.read_bytes() for p in root.glob(prefix.name + ".*")}
+            mutable_path = root / f"{dtype}_mutable_base_results.bin"
+            private_heap = root / f"{dtype}_mutable_base.heap"
+            mutable_record = run(
+                driver + ["--private_heap_path", str(private_heap),
+                          "--search_result_file", str(mutable_path)],
+                "query",
+            )
+            assert mutable_record["index_format"] == "mutable"
+            assert mutable_record["input_index_format"] == "immutable"
+            assert mutable_record["live_count"] == 3
+            assert mutable_record["recall"] == record["recall"]
+            assert mutable_record["scanned_codes"] == record["scanned_codes"]
+            assert mutable_record["reranked_vectors"] == record["reranked_vectors"]
+            assert mutable_path.read_bytes() == result_path.read_bytes()
+            assert "insert_count" not in mutable_record and "delete_count" not in mutable_record
+            assert private_heap.is_file() and Path(str(private_heap) + ".pq.bin").is_file()
+            assert all(p.read_bytes() == content for p, content in original.items())
+            # Reusing a private output must fail rather than overwrite it.
+            run(driver + ["--private_heap_path", str(private_heap)])
             default_path = root / f"{dtype}_default.bin"
             default_record = run(
                 driver + ["--router_mode", "default", "--search_result_file", str(default_path)],

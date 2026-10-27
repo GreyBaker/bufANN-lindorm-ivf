@@ -408,6 +408,17 @@ class SharedOrchestrationTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True), \
              patch.object(harness, "command_log", side_effect=native_driver), \
              patch.object(mixed, "command_log", side_effect=native_driver):
+            # Private-session collisions fail before launching or writing evidence.
+            collision = work / "private-collision"
+            collision.mkdir()
+            (collision / "query.heap").write_bytes(b"owned heap")
+            args.output_dir = collision
+            with self.assertRaisesRegex(ValueError, "run output exists"):
+                harness.run(args)
+            self.assertEqual((collision / "query.heap").read_bytes(), b"owned heap")
+            self.assertFalse((collision / "nlist_selection.json").exists())
+            self.assertEqual(commands, [])
+            args.output_dir = work / "query-run"
             harness.run(args)
             with self.assertRaisesRegex(ValueError, "run output exists"):
                 harness.run(args)
@@ -430,7 +441,7 @@ class SharedOrchestrationTests(unittest.TestCase):
             "--buffer_frames", "64", "--memory_budget_gb", "2",
             "--result_file", str(query_out / "result.json"),
             "--search_result_file", str(query_out / "neighbors.bin"),
-        ] + policy)
+        ] + ["--private_heap_path", str(query_out / "query.heap")] + policy)
         round_out = work / "mixed-run/rounds/round_0"
         self.assertEqual(commands[1], opening + [
             "--index_format", "immutable", "--workload", "mixed", "--scheduler", "weighted",
@@ -451,6 +462,8 @@ class SharedOrchestrationTests(unittest.TestCase):
             self.assertFalse(path.with_name("native_result.json").exists())
         protocol = common.read_json(query_out / "execution_protocol.json")
         self.assertFalse(protocol["canonical_native_query_metrics_rewritten"])
+        self.assertEqual(protocol["query_session_policy"],
+                         "immutable_base_forked_to_mutable_session_without_updates")
         self.assertEqual(protocol["warmup_query_count_requested"], 7)
 
     @unittest.skipUnless(sys.platform == "linux", "quickstart gate executes in Bash")

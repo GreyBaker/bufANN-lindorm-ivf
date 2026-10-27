@@ -67,6 +67,16 @@ def fixture(args, root, dtype, fmt):
         if count is None:
             base_allowance = record["estimated_workspace_bytes"]
     budget = format((base_allowance + 8) / (1 << 30), ".17g")
+    for count in (0, 5):
+        cmd, output, _, saved, private, gold = command(count)
+        record = run(cmd + ["--private_heap_path", str(private)], "query")
+        check(record, count)
+        assert record["index_format"] == "mutable" and record["input_index_format"] == "immutable"
+        assert record["live_count"] == 8
+        assert record["query_cache_process_policy"].startswith("private_mutable_copy")
+        assert "insert_count" not in record and "delete_count" not in record
+        assert output.read_bytes() == first
+        assert not Path(str(saved) + ".manifest").exists()
     cmd, _, _, _, _, _ = command(0)
     run(cmd + ["--memory_budget_gb", budget], "query")
     cmd, output, result, _, _, _ = command(5)

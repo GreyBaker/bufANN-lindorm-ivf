@@ -66,6 +66,8 @@ int main(int argc, char** argv) {
              "  [--memory_budget_gb F] [--buffer_frames N] [--result_file "
              "JSON_PATH]\n"
              "  [--search_result_file SPFresh_BINARY_PATH]\n";
+      std::cout << "Native search_only: --private_heap_path NEW_PATH forks an "
+                   "immutable base into a mutable session without updates.\n";
       std::cout << "Updates: --private_heap_path NEW_PATH --checkpoint_prefix "
                    "NEW_PREFIX\n"
                    "  --full_data_file ORIGINAL_FULL_SOURCE "

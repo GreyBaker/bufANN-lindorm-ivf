@@ -1336,8 +1336,10 @@ namespace ivf_cli {
       if (args.has("--search_result_file"))
         emit("search_result_file", args.require("--search_result_file"));
       if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
-        if (!updating)
+        if (!updating) {
           emit("live_count", index->size());
+          emit("input_index_format", args.get("--index_format", "immutable"));
+        }
         emit("index_format", "mutable");
         if (updating)
           emit_update(record, first, args, *index, updates,
@@ -1439,15 +1441,15 @@ namespace ivf_cli {
       const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
       DriverProgress opening("open_private_copy_verify");
       const auto     start = Clock::now();
-      if (updating || format == "mutable") {
+      // A private heap requests a mutable session even for an immutable input
+      // bundle. Search-only forks the base without applying any mutations.
+      if (updating || format == "mutable" || args.has("--private_heap_path")) {
         auto       index = open_mutable<T>(args, budget);
         const auto open_time = seconds(start);
         opening.finish();
         return search_typed<T>(args, type, std::move(index), open_time,
                                workflow_start);
       }
-      args.reject_present({"--private_heap_path"},
-                          "not used by immutable search");
       auto index =
           NativeIndex<T>::open(args.require("--index_prefix"),
                                {args.u32("--buffer_frames", 64), budget});

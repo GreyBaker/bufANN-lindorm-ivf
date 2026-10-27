@@ -332,6 +332,8 @@ def run(args):
         "neighbors.bin",
         "nlist_selection.json",
         "execution_protocol.json",
+        "query.heap",
+        "query.heap.pq.bin",
     ):
         path = output / name
         require_absent(
@@ -346,8 +348,6 @@ def run(args):
             "mutation_result.json",
             "private.heap",
             "private.heap.pq.bin",
-            "query.heap",
-            "query.heap.pq.bin",
             "checkpoint",
         ):
             path = output / name
@@ -418,7 +418,9 @@ def run(args):
         str(output / "neighbors.bin"),
     ]
     if mutation is not None:
-        command += ["--index_format", "mutable", "--private_heap_path", str(output / "query.heap")]
+        command += ["--index_format", "mutable"]
+    # Always serve queries from a private mutable session.
+    command += ["--private_heap_path", str(output / "query.heap")]
     command += query_policy_flags(query_warmups)
     query_start = time.monotonic()
     command_log(command, output / "run.log")
@@ -442,6 +444,9 @@ def run(args):
             "mutation_driver_verified_checkpoint_then_separate_query_driver_private_copy"
             if mutation is not None else "standalone_query_driver"),
         "application_cache_transfer_between_driver_processes": False,
+        "query_session_policy": (
+            "mutable_checkpoint_reopened_as_private_mutable_session"
+            if mutation is not None else "immutable_base_forked_to_mutable_session_without_updates"),
         "warmup_query_count_requested": int(query_warmups),
         "explicit_warmup_query_count": record["explicit_warmup_query_count"],
         "warmup_policy": record["warmup_policy"],

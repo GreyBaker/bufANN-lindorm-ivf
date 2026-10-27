@@ -212,6 +212,10 @@ def main():
         assert protocol["native_driver_process_count"] == 1 and protocol["mutation_process_wall_s"] is None
         assert protocol["insert_input_policy"] is None
         assert protocol["process_boundary_policy"] == "standalone_query_driver"
+        assert protocol["query_session_policy"] == "immutable_base_forked_to_mutable_session_without_updates"
+        assert record["index_format"] == "mutable" and record["input_index_format"] == "immutable"
+        assert record["live_count"] == 3
+        assert (work / "query.heap").is_file() and (work / "query.heap.pq.bin").is_file()
         assert protocol["harness_workflow_wall_s"] >= protocol["query_process_wall_s"] >= record["driver_workflow_time_s"]
         assert (
             record["baseline"] == "IVF" and record["recall"] == 100 and record["query_count"] == 2

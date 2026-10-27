@@ -1,5 +1,7 @@
 # IVF benchmark guide
 
+Query-only benchmark runs fork the prepared immutable base into a private mutable session before warmup or query timing, without inserting, deleting, or creating a checkpoint. Native `search_only` without `--private_heap_path` still supports immutable search; supplying a fresh private path with immutable input selects the no-update fork.
+
 These scripts prepare and run IVF query-only, insertion, deletion and mixed-update
 workloads on Linux/WSL. Run the commands below from the repository root.
 
