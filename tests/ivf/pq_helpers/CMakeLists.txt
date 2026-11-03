@@ -16,8 +16,16 @@ set(MKL_LIBRARY_DIR
 set(INTEL_OMP_LIBRARY_DIR
     ""
     CACHE PATH "Installed Intel OpenMP library directory")
-if(NOT EXISTS "${MKL_ROOT}/include/mkl.h")
-    message(FATAL_ERROR "Set MKL_ROOT to the administrator-installed MKL prefix")
+find_path(
+    MKL_INCLUDE_DIR
+    NAMES mkl.h
+    HINTS "${MKL_ROOT}/include"
+    PATH_SUFFIXES mkl
+    NO_DEFAULT_PATH)
+if(NOT MKL_INCLUDE_DIR OR NOT EXISTS "${MKL_INCLUDE_DIR}/mkl.h")
+    message(FATAL_ERROR
+        "MKL headers not found: set MKL_ROOT to the installed prefix "
+        "(e.g. /usr for Ubuntu packages), or MKL_INCLUDE_DIR to the directory containing mkl.h")
 endif()
 foreach(name mkl_intel_ilp64 mkl_intel_thread mkl_core)
     find_library(
@@ -51,7 +59,7 @@ add_library(
     "${DISKANN}/src/logger.cpp"
     "${DISKANN}/src/ann_exception.cpp"
     "${DISKANN}/src/linux_aligned_file_reader.cpp")
-target_include_directories(standalone_pq PUBLIC "${DISKANN}/include" "${MKL_ROOT}/include")
+target_include_directories(standalone_pq PUBLIC "${DISKANN}/include" "${MKL_INCLUDE_DIR}")
 target_compile_definitions(standalone_pq PUBLIC MKL_ILP64 USE_AVX2 USE_ACCELERATED_PQ)
 target_compile_options(standalone_pq PUBLIC -march=native -fopenmp)
 target_compile_options(standalone_pq PUBLIC $<$<CONFIG:Release>:-Ofast>
