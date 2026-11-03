@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Dependency-free contracts for shared IVF settings and evidence/process helpers."""
 import argparse
+import ast
 import hashlib
 import io
 import json
@@ -140,6 +141,66 @@ class SharedOrchestrationTests(unittest.TestCase):
             harness.run(args)
         launch.assert_not_called()
         self.assertFalse(args.output_dir.exists())
+
+    def test_documented_multi_nlist_grid_preview(self):
+        guide = Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md"
+        block = guide.read_text().split("# Quickstart: SIFT100M wide query-only grid", 1)[1]
+        program = block.split("exec python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        compile(program, str(guide), "exec")
+        for mode, count, preparations in (("coarse", 24, 6), ("expanded", 100, 6),
+                                          ("sift100m-wide", 73, 6)):
+            env = dict(os.environ, IVF_GRID_DRY_RUN="1", IVF_GRID_MODE=mode,
+                       IVF_GRID_REPO=str(self.root), DATASET="sift100m",
+                       IVF_GRID_TOTAL_TIMEOUT_S="604800", IVF_GRID_NLIST_TIMEOUT_S="86400",
+                       IVF_GRID_QUERY_TIMEOUT_S="21600")
+            result = subprocess.run([sys.executable, "-c", program], env=env,
+                                    cwd=self.root, text=True, capture_output=True, check=True)
+            lines = result.stdout.splitlines()
+            self.assertEqual(len(lines[1:-1]), count)
+            self.assertIn(f"{count} query passes, {preparations} index preparations", lines[-1])
+            if mode == "sift100m-wide":
+                points = [tuple(map(int, line.split("\t"))) for line in lines[1:-1]]
+                nlists = [100, 1000, 10000, 100000, 200000, 300000]
+                self.assertEqual(list(dict.fromkeys(p[0] for p in points)), nlists)
+                for nlist in nlists:
+                    group = [p for p in points if p[0] == nlist]
+                    self.assertEqual([p[1] for p in group],
+                                     [2 ** i for i in range(14) if 2 ** i <= nlist])
+                    self.assertTrue(all(p[2] == 128 and
+                                        p[3] == max(128, min(nlist, 3 * p[1])) for p in group))
+            self.assertEqual(list(self.root.iterdir()), [])
+        env["DATASET"] = "sift10m"
+        invalid = subprocess.run([sys.executable, "-c", program], env=env,
+                                 cwd=self.root, text=True, capture_output=True)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("requires DATASET=sift100m", invalid.stderr)
+
+    def test_wide_grid_cleanup_only_removes_private_query_files(self):
+        guide = Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md"
+        block = guide.read_text().split("# Quickstart: SIFT100M wide query-only grid", 1)[1]
+        program = block.split("exec python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        function = next(node for node in ast.parse(program).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "cleanup_private_query_heaps")
+        namespace = {"root": self.root, "json": json}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(guide), "exec"), namespace)
+        cleanup = namespace["cleanup_private_query_heaps"]
+        folder = self.root / "point"
+        folder.mkdir()
+        for name in ("query.heap", "query.heap.pq.bin", "result.json", "neighbors.bin", "run.log"):
+            (folder / name).write_bytes(b"evidence")
+        base = self.root / "base.heap"
+        base.write_bytes(b"base")
+        cleanup(folder, "nl100-np1_rb128")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["neighbors.bin", "result.json", "run.log"])
+        self.assertEqual(base.read_bytes(), b"base")
+        log = [json.loads(line) for line in (self.root / "heap-cleanup.jsonl").read_text().splitlines()]
+        self.assertEqual([Path(r["path"]).name for r in log], ["query.heap", "query.heap.pq.bin"])
+        self.assertTrue(all(r["deleted"] and r["bytes"] == 8 for r in log))
+        (folder / "query.heap").write_bytes(b"keep on invalid pair")
+        with self.assertRaisesRegex(ValueError, "expected regular private query heaps"):
+            cleanup(folder, "invalid")
+        self.assertTrue((folder / "query.heap").exists())
 
     def test_resource_lower_bound_and_unchanged_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
