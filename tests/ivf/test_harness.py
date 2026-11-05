@@ -88,6 +88,8 @@ def main():
             IVF_BUILD_DIR=str(args.build_dir),
             EVAL_TEMPFILES=str(root / "work first"),
             EVAL_CACHED=str(root / "cache"),
+            ANN_DATA_ROOT=str(root / "ann-data"),
+            GT_ARTIFACT_DIR=str(root / "ann-data/groundtruth"),
             IVF_NLIST="2",
             IVF_PQ_PREFIX=str(pq_prefix),
             IVF_GT_FILE=str(truth),
@@ -320,6 +322,16 @@ def main():
             ]
             == 100
         )
+        link = Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/query/groundtruth/tiny_3_gt1.bin"
+        assert link.is_symlink()
+        shared_truth = link.resolve()
+        assert shared_truth.is_relative_to(Path(env["GT_ARTIFACT_DIR"]))
+        env["EVAL_TEMPFILES"] = str(root / "reused derived gt")
+        run(prepare, env)
+        reused_link = Path(env["EVAL_TEMPFILES"]) / "tiny/IVF/query/groundtruth/tiny_3_gt1.bin"
+        assert reused_link.is_symlink() and reused_link.resolve() == shared_truth
+        link.unlink()  # Removing old eval input links must not delete shared GT.
+        assert shared_truth.is_file() and reused_link.is_file()
         # S05 prepare/run pairs use canonical shared split/ID/GT helpers, then
         # reopen the NEW mutable checkpoint in a separate query process. Cache
         # and original working bundles remain immutable, never writable aliases.
@@ -495,7 +507,7 @@ def main():
             for workload in ("insert", "delete"):
                 run(repo / f"benchmark/IVF/sift/{workload}_prepare.sh", typed_env)
                 run(repo / f"benchmark/IVF/sift/{workload}.sh", typed_env)
-                typed_work = Path(typed_env["EVAL_TEMPFILES"]) / f"{dataset}/IVF/{workload}"
+                typed_work = Path(typed_env["EVAL_TEMPFILES"]) / dataset / f"IVF/{workload}"
                 assert json.loads((typed_work / "result.json").read_text())["recall"] == 100
                 live = range(4) if workload == "insert" else range(2)
                 expected = [

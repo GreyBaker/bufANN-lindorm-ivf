@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Dependency-free contracts for shared IVF settings and evidence/process helpers."""
 import argparse
-import ast
 import hashlib
 import io
 import json
@@ -16,6 +15,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark/IVF"))
 import common
+import experiment
+import recall_diagnostic
 import harness
 import mixed
 import settings
@@ -143,21 +144,32 @@ class SharedOrchestrationTests(unittest.TestCase):
         self.assertFalse(args.output_dir.exists())
 
     def test_documented_multi_nlist_grid_preview(self):
-        guide = Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md"
-        block = guide.read_text().split("# Quickstart: SIFT100M wide query-only grid", 1)[1]
-        program = block.split("exec python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-        compile(program, str(guide), "exec")
+        script = Path(experiment.__file__)
         for mode, count, preparations in (("coarse", 24, 6), ("expanded", 100, 6),
-                                          ("sift100m-wide", 73, 6)):
+                                          ("sift100m-wide", 73, 6),
+                                          ("sift100m-refine", 80, 1)):
             env = dict(os.environ, IVF_GRID_DRY_RUN="1", IVF_GRID_MODE=mode,
                        IVF_GRID_REPO=str(self.root), DATASET="sift100m",
                        IVF_GRID_TOTAL_TIMEOUT_S="604800", IVF_GRID_NLIST_TIMEOUT_S="86400",
                        IVF_GRID_QUERY_TIMEOUT_S="21600")
-            result = subprocess.run([sys.executable, "-c", program], env=env,
+            result = subprocess.run([sys.executable, str(script), "--mode", mode, "--dry-run"], env=env,
                                     cwd=self.root, text=True, capture_output=True, check=True)
             lines = result.stdout.splitlines()
             self.assertEqual(len(lines[1:-1]), count)
-            self.assertIn(f"{count} query passes, {preparations} index preparations", lines[-1])
+            if mode == "sift100m-refine":
+                self.assertIn("80 query passes, 3 prepared-base reuses, 1 index preparation", lines[-1])
+                points = [tuple(map(int, line.split("\t"))) for line in lines[1:-1]]
+                self.assertEqual(list(dict.fromkeys(p[0] for p in points)),
+                                 [100000, 200000, 300000, 400000])
+                for nlist in (100000, 200000, 300000, 400000):
+                    group = [p for p in points if p[0] == nlist]
+                    self.assertEqual(len(group), 20)
+                    effective = [(p[1], p[3]) for p in group]
+                    self.assertEqual(len(effective), len(set(effective)))
+                    self.assertEqual([p[1] for p in group if p[2] == 128],
+                                     [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 384, 512])
+            else:
+                self.assertIn(f"{count} query passes, {preparations} index preparations", lines[-1])
             if mode == "sift100m-wide":
                 points = [tuple(map(int, line.split("\t"))) for line in lines[1:-1]]
                 nlists = [100, 1000, 10000, 100000, 200000, 300000]
@@ -170,20 +182,85 @@ class SharedOrchestrationTests(unittest.TestCase):
                                         p[3] == max(128, min(nlist, 3 * p[1])) for p in group))
             self.assertEqual(list(self.root.iterdir()), [])
         env["DATASET"] = "sift10m"
-        invalid = subprocess.run([sys.executable, "-c", program], env=env,
+        invalid = subprocess.run([sys.executable, str(script), "--mode", "sift100m-refine", "--dry-run"], env=env,
                                  cwd=self.root, text=True, capture_output=True)
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("requires DATASET=sift100m", invalid.stderr)
 
+    def test_recall_audit_boundary_ties_and_genuine_misses(self):
+        from audit_recall import audit
+
+        gt = self.root / "deep.gt"
+        # ID 5 is outside the live prefix. IDs 0/1 tie at the live cutoff.
+        gt.write_bytes(struct.pack("<II4I4f4I", 1, 4, 5, 0, 1, 2,
+                                   0, 1, 1, 2, 5, 0, 1, 2))
+        result = self.root / "neighbors.bin"
+        result.write_bytes(struct.pack("<IIIf", 1, 1, 1, 1))
+        report = audit(gt, result, base_count=3, k=1)
+        self.assertEqual(report["strict_first_k_id_recall_percent"], 0)
+        self.assertEqual(report["tie_expanded_recall_percent"], 100)
+        self.assertEqual(report["additional_hits_from_tie_expansion"], 1)
+        self.assertEqual(report["returned_slots_outside_exact_kth_distance"], 0)
+        result.write_bytes(struct.pack("<IIIf", 1, 1, 2, 2))
+        report = audit(gt, result, base_count=3, k=1)
+        self.assertEqual(report["tie_expanded_recall_percent"], 0)
+        self.assertEqual(report["returned_slots_outside_exact_kth_distance"], 1)
+        gt.write_bytes(struct.pack("<II2I2f", 1, 2, 0, 1, 1, 1))
+        report = audit(gt, result, base_count=3, k=1)
+        self.assertIsNone(report["tie_expanded_recall_percent"])
+        self.assertEqual(report["queries_without_proven_complete_boundary_ties"], 1)
+        with self.assertRaisesRegex(ValueError, "result framing/query range"):
+            audit(gt, result, base_count=3, k=1, query_offset=1)
+
+    def test_refinement_requires_unchanged_previous_preparations_and_gt(self):
+        previous = self.root / "previous"
+        previous.mkdir()
+        gt = previous / "existing.gt"
+        gt.write_bytes(b"existing GT; structural coverage checked by the later GT phase")
+        (previous / "selected_gt.txt").write_text(str(gt) + "\n")
+        env = {"DATASET": "sift100m", "IVF_GRID_PREVIOUS_ROOT": str(previous), "DATA_BIN": str(self.root / "data.bin"),
+               "QUERY_BIN": str(self.root / "queries.bin"), "IVF_PQ_PREFIX": str(self.root / "pq"),
+               "IVF_SAMPLE_RATE": "1", "IVF_MAX_REPS": "10", "IVF_TRAINER_MODE": "lv-plus",
+               "IVF_INIT": "random_partition", "IVF_TRAINING_BREADTH": "64",
+               "IVF_TRAINING_RERANK_FACTOR": "3", "IVF_TRAINING_REFINE_BREADTH": "128",
+               "IVF_SEED": "0", "IVF_OPTIMIZED_MODES": "1", "IVF_PCA_VARIANCE": "0.95",
+               "IVF_REFINE_EF": "128", "IVF_QUERY_BREADTH": "128",
+               "IVF_ASSIGNMENT_ROUTER_MODE": "pca-refined", "IVF_BUILD_ROUTER_RERANK_FACTOR": "3"}
+        common.write_json(previous / "plan.json", {"settings": env})
+        nlists = (100000, 200000, 300000, 400000)
+        paths = []
+        for nlist in nlists[:-1]:
+            path = previous / f"nlist-{nlist}/sift100m/IVF/query/prepared.json"
+            path.parent.mkdir(parents=True)
+            opts = {k.removeprefix("IVF_").lower(): v for k, v in env.items() if k.startswith("IVF_")}
+            opts.update(nlist=str(nlist), router_mode="pca-refined", router_rerank_factor="3")
+            common.write_json(path, {"settings": opts, "profile": {"base_count": 90000000}})
+            paths.append(path)
+
+        def validate():
+            child = dict(env)
+            work_dirs = experiment.validate_previous(previous, child, nlists[:-1], 90000000)
+            return {"env": child, "previous": previous.resolve(), "previous_work": work_dirs}
+
+        checked = validate()
+        self.assertEqual(checked["previous"], previous.resolve())
+        self.assertEqual(checked["env"]["GT_BIN_KCACHED"], str(gt))
+        self.assertFalse((previous / "nlist-400000").exists())
+        self.assertEqual(checked["previous_work"][100000], paths[0].parent)
+        original = paths[0].read_bytes()
+        altered = json.loads(original)
+        altered["settings"]["sample_rate"] = "0.5"
+        paths[0].write_text(json.dumps(altered))
+        with self.assertRaisesRegex(ValueError, "sample_rate differs"):
+            validate()
+        paths[0].write_bytes(original)
+        gt.unlink()
+        with self.assertRaisesRegex(ValueError, "GT selection is missing"):
+            validate()
+
     def test_wide_grid_cleanup_only_removes_private_query_files(self):
-        guide = Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md"
-        block = guide.read_text().split("# Quickstart: SIFT100M wide query-only grid", 1)[1]
-        program = block.split("exec python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-        function = next(node for node in ast.parse(program).body
-                        if isinstance(node, ast.FunctionDef) and node.name == "cleanup_private_query_heaps")
-        namespace = {"root": self.root, "json": json}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(guide), "exec"), namespace)
-        cleanup = namespace["cleanup_private_query_heaps"]
+        def cleanup(folder, name):
+            experiment.cleanup_private_query_heaps(self.root, folder, name)
         folder = self.root / "point"
         folder.mkdir()
         for name in ("query.heap", "query.heap.pq.bin", "result.json", "neighbors.bin", "run.log"):
@@ -527,26 +604,195 @@ class SharedOrchestrationTests(unittest.TestCase):
                          "immutable_base_forked_to_mutable_session_without_updates")
         self.assertEqual(protocol["warmup_query_count_requested"], 7)
 
-    @unittest.skipUnless(sys.platform == "linux", "quickstart gate executes in Bash")
     def test_quickstart_gt_gate_stops_preparation(self):
-        text = (Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md").read_text()
-        marker = "# Each workload gets an independent prepared base; stop on any failure."
-        block = text.split(marker, 1)[1].split("```", 1)[0]
-        self.assertLess(block.index("GT_BIN_KCACHED=$(python3"), block.index("for workload in"))
-        self.assertIn("export GT_BIN_KCACHED", block)
-        self.assertNotIn("export GT_BIN_KCACHED=", block)
-        self.assertIn("--memory-budget-gb 96 --buffer-frames 262144", text)
-        env = dict(os.environ, DATA_BIN="/source.bin", QUERY_BIN="/queries.bin", NPTS_FULL="100000000",
-                   NPTS_BASE="90000000", UPDATE_POINTS="10000000", UPDATE_BATCH="1000000", RECALL_AT="10")
+        truth = self.root / "covered.gt"
+        truth.write_bytes(b"coverage checked by synthetic preflight")
         for status in (0, 3):
-            script = ("python3() { printf '/covered-fixture.gt\\n'; return " + str(status) + "; }\n"
-                      "bash() { printf 'workload %s gt=%s\\n' \"$1\" \"$GT_BIN_KCACHED\"; }\n" + block)
-            result = subprocess.run(["bash", "-c", script], env=env, text=True,
-                                    capture_output=True, timeout=10)
-            self.assertEqual(result.returncode, status, result.stderr)
-            self.assertEqual(result.stdout.count("workload "), 8 if status == 0 else 0)
-            if status == 0:
-                self.assertEqual(result.stdout.count("gt=/covered-fixture.gt"), 8)
+            root = self.root / f"gate-{status}"
+            root.mkdir()
+            env = experiment.full_scale_environment({}, "sift100m", "workloads")
+            phases = experiment.Phases(root, {"total": 60, "nlist": 30, "query": 10})
+            calls = []
+
+            def execute(command, log, timeout, cpus, child, **kwargs):
+                calls.append(command)
+                if "ensure_gt.py" in command[1]:
+                    if status:
+                        raise ValueError("GT preflight failed")
+                    kwargs["stdout_path"].write_text(str(truth) + "\n")
+                elif command[-1].endswith(".sh"):
+                    self.assertEqual(child["GT_BIN_KCACHED"], str(truth))
+
+            with patch.object(experiment, "execute", execute):
+                if status:
+                    with self.assertRaisesRegex(ValueError, "GT preflight failed"):
+                        experiment.preflight(phases, env, "sift100m", True)
+                else:
+                    experiment.preflight(phases, env, "sift100m", True)
+                    experiment.run_workloads(phases, env)
+            scripts = [c[-1] for c in calls if c[-1].endswith(".sh")]
+            expected = [f"benchmark/IVF/sift/{w}{s}.sh" for w in experiment.WORKLOADS
+                        for s in ("_prepare", "")]
+            self.assertEqual(scripts, [] if status else expected)
+            self.assertIn("--generate", calls[1])
+            self.assertNotIn("--generate", experiment.groundtruth_command(env, "sift100m", False))
+
+    def test_full_scale_presets_share_fixed_settings_without_mutating_shell(self):
+        source = dict(DATA_ROOT=str(self.root / "inputs"), IVF_PQ_PREFIX=str(self.root / "pq"),
+                      IVF_MEMORY_BUDGET_GB="48", IVF_NPROBE="999", IVF_PCA_VARIANCE="0.1",
+                      INSERT_POINTS="1", IVF_RUN_TAG="old")
+        before = dict(source)
+        grid = experiment.full_scale_environment(source, "sift100m", "sift100m-wide")
+        workloads = experiment.full_scale_environment(source, "sift100m", "workloads")
+        self.assertEqual(source, before)
+        for env in (grid, workloads):
+            self.assertNotIn("INSERT_POINTS", env)
+            self.assertNotIn("IVF_RUN_TAG", env)
+            self.assertEqual(env["IVF_PCA_VARIANCE"], "0.95")
+            self.assertEqual(env["IVF_RERANK_FACTOR"], "3")
+            self.assertEqual(env["IVF_ROUTER_RERANK_FACTOR"], "3")
+            self.assertEqual(env["IVF_MAX_REPS"], "10")
+            self.assertEqual(env["IVF_SAMPLE_RATE"], "1")
+            self.assertEqual(env["IVF_QUERY_MEMORY_BUDGET_GB"], "48")
+            self.assertEqual(Path(env["GT_ARTIFACT_DIR"]), self.root / "inputs/groundtruth")
+        self.assertEqual(grid["IVF_WARMUP_QUERIES"], "64")
+        self.assertEqual(workloads["IVF_WARMUP_QUERIES"], "0")
+        self.assertEqual(workloads["IVF_NLIST"], "200000")
+        self.assertEqual(workloads["IVF_NPROBE"], "64")
+        self.assertEqual(workloads["UPDATE_BATCH"], "1000000")
+        self.assertEqual(workloads["IVF_INSERT_INPUT_POLICY"], "staged")
+        small = experiment.full_scale_environment({}, "sift10m", "workloads")
+        self.assertEqual(small["IVF_MAX_REPS"], "15")
+        self.assertEqual(small["UPDATE_BATCH"], "100000")
+
+    def test_readme_uses_checked_in_runners_not_executable_markdown(self):
+        text = Path(experiment.__file__).with_name("README.md").read_text()
+        for mode in ("workloads", "sift100m-wide", "sift100m-refine"):
+            self.assertIn(f"python3 benchmark/IVF/experiment.py --mode {mode}", text)
+        self.assertNotIn("exec python3 - <<", text)
+        self.assertNotIn("grid-search-guide.md", text)
+
+    def test_experiment_retains_plan_and_partial_evidence_on_gt_failure(self):
+        root = self.root / "failed-experiment"
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(experiment, "validate_inputs"), \
+                patch.object(experiment, "preflight", side_effect=ValueError("GT gate rejected")), \
+                patch.object(experiment, "run_grid") as run, \
+                patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+            experiment.main(["--output", str(root)])
+        self.assertEqual(error.exception.code, 1)
+        run.assert_not_called()
+        self.assertTrue((root / "plan.json").is_file())
+        failure = common.read_json(root / "failure.json")
+        self.assertFalse(failure["completed"])
+        self.assertTrue(failure["partial_evidence_retained"])
+        self.assertFalse((root / "summary.json").exists())
+        before = {p: p.read_bytes() for p in root.iterdir()}
+        with patch.dict(os.environ, {}, clear=True), patch("sys.stderr", io.StringIO()), \
+                patch.object(experiment, "validate_inputs") as validate, self.assertRaises(SystemExit):
+            experiment.main(["--output", str(root)])
+        validate.assert_not_called()
+        self.assertEqual(before, {p: p.read_bytes() for p in root.iterdir()})
+
+    def test_grid_lifecycle_records_results_before_cleaning_successful_heaps(self):
+        root = self.root / "grid"
+        truth = self.root / "covered.gt"
+        truth.write_bytes(b"existing checked truth")
+        preparations = []
+
+        def execute(command, log, timeout, cpus, env, **kwargs):
+            log.write_text("fixture command log")
+            if "ensure_gt.py" in command[1]:
+                kwargs["stdout_path"].write_text(str(truth) + "\n")
+            elif command[-1].endswith("query_prepare.sh"):
+                preparations.append(int(env["IVF_NLIST"]))
+                index = Path(env["EVAL_TEMPFILES"]) / "sift100m/IVF/query/index"
+                index.mkdir(parents=True)
+                (index / "base.heap").write_bytes(b"retain prepared base")
+            elif command[-1].endswith("query.sh"):
+                folder = Path(env["EVAL_TEMPFILES"]) / "sift100m/IVF/query/runs" / env["IVF_RUN_TAG"]
+                folder.mkdir(parents=True)
+                common.write_json(folder / "result.json", dict(
+                    baseline="IVF", phase="query", workload="query", query_count=10000,
+                    base_count=90000000, nlist=int(env["IVF_NLIST"]), pq_chunks=64, recall_at=10,
+                    nprobe=int(env["IVF_NPROBE"]), router_breadth=int(env["IVF_ROUTER_BREADTH"]),
+                    router_mode="pca-refined", rerank_factor=3, router_rerank_factor=3,
+                    query_threads=8, explicit_warmup_query_count=64, index_format="mutable",
+                    input_index_format="immutable", live_count=90000000, recall=99.5,
+                    query_qps=100, query_time_s=100))
+                common.write_json(folder / "execution_protocol.json", dict(
+                    completed=True, native_driver_process_count=1, query_process_wall_s=101,
+                    harness_workflow_wall_s=102))
+                for name in ("query.heap", "query.heap.pq.bin", "neighbors.bin"):
+                    (folder / name).write_bytes(b"native artifact")
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(experiment, "validate_inputs"), \
+                patch.object(experiment, "execute", execute), patch("sys.stdout", io.StringIO()):
+            self.assertEqual(experiment.main(["--mode", "sift100m-wide", "--output", str(root)]), 0)
+        self.assertEqual(preparations, [100, 1000, 10000, 100000, 200000, 300000])
+        summary = common.read_json(root / "summary.json", max_bytes=200000)
+        self.assertTrue(summary["completed"])
+        self.assertEqual(len(summary["records"]), 73)
+        self.assertEqual(len((root / "results.csv").read_text().splitlines()), 74)
+        self.assertEqual(len((root / "heap-cleanup.jsonl").read_text().splitlines()), 146)
+        self.assertEqual(len(list(root.rglob("base.heap"))), 6)
+        self.assertEqual(len(list(root.rglob("neighbors.bin"))), 73)
+        self.assertEqual(len(list(root.rglob("query.heap*"))), 0)
+
+    def test_diagnostic_query_prefix_is_bounded_and_exclusive(self):
+        source, output = self.root / "query.bin", self.root / "prefix.bin"
+        source.write_bytes(struct.pack("<II", 10000, 128) + bytes(range(128)) * 10000)
+        recall_diagnostic.query_prefix(source, output, 256)
+        self.assertEqual(output.read_bytes(), struct.pack("<II", 256, 128) + bytes(range(128)) * 256)
+        with self.assertRaises(FileExistsError):
+            recall_diagnostic.query_prefix(source, output, 256)
+        for count in (0, 10001):
+            with self.assertRaisesRegex(ValueError, "query count"):
+                recall_diagnostic.query_prefix(source, self.root / "absent", count)
+        self.assertFalse((self.root / "absent").exists())
+
+    def test_all_lists_diagnostic_retains_native_evidence_and_failed_heaps(self):
+        previous = self.root / "previous"
+        work = previous / "nlist-100/sift100m/IVF/query"  # Historical layout is supported.
+        work.mkdir(parents=True)
+        query, truth = self.root / "query.bin", self.root / "deep.gt"
+        query.write_bytes(struct.pack("<II", 10000, 128) + bytes(10000 * 128))
+        truth.write_bytes(b"checked full-source truth fixture")
+        (previous / "selected_gt.txt").write_text(str(truth) + "\n")
+        common.write_json(work / "prepared.json", dict(
+            profile={"base_count": 90000000}, settings={"nlist": "100"}, query_identity=common.digest(query)))
+        for valid in (True, False):
+            output = self.root / ("diagnostic-good" if valid else "diagnostic-failed")
+            args = argparse.Namespace(previous_root=previous, output=output, query=query,
+                                      driver=Path(sys.executable), query_count=1, timeout_s=10)
+
+            def execute(command, log, timeout, cpus):
+                self.assertEqual(command[command.index("--nprobe") + 1], "100")
+                private = Path(command[command.index("--private_heap_path") + 1])
+                private.write_bytes(b"private heap")
+                Path(str(private) + ".pq.bin").write_bytes(b"private PQ")
+                result = Path(command[command.index("--result_file") + 1])
+                common.write_json(result, dict(query_count=1, nprobe=100, live_count=90000000,
+                    rerank_factor=int(command[command.index("--rerank_factor") + 1]),
+                    scanned_codes=90000000 if valid else 0))
+                Path(command[command.index("--search_result_file") + 1]).write_bytes(b"native neighbors")
+                log.write_text("native log")
+
+            with patch.object(recall_diagnostic, "execute", execute), \
+                    patch.object(recall_diagnostic, "audit", return_value={"tie_expanded_recall_percent": 100}), \
+                    patch("sys.stdout", io.StringIO()):
+                if valid:
+                    recall_diagnostic.run(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, "complete live base"):
+                        recall_diagnostic.run(args)
+            self.assertTrue((output / "plan.json").is_file())
+            self.assertTrue((output / "rf3/result.json").is_file())
+            self.assertTrue((output / "rf3/neighbors.bin").is_file())
+            self.assertEqual((output / "rf3/query.heap").is_file(), not valid)
+            self.assertEqual((output / "rf3/audit.json").is_file(), valid)
+            if valid:
+                self.assertTrue((output / "rf30/audit.json").is_file())
 
     def test_identity_framing_and_exclusive_evidence(self):
         vectors = self.root / "vectors.bin"
@@ -587,6 +833,12 @@ class SharedOrchestrationTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             common.execute([sys.executable, "-c", "print('overwrite')"], log, 10, None)
         self.assertEqual(log.read_bytes(), original)
+        selected, gt_log = self.root / "selected_gt.txt", self.root / "groundtruth.log"
+        command = [sys.executable, "-c", "import os, sys; print(os.getcwd()); print('GT progress', file=sys.stderr)"]
+        common.execute(command, gt_log, 10, None, cwd=self.root, stdout_path=selected)
+        self.assertEqual(selected.read_text().strip(), str(self.root))
+        self.assertIn("GT progress", gt_log.read_text())
+        self.assertNotIn("GT progress", selected.read_text())
         failed = self.root / "failure.log"
         with self.assertRaisesRegex(ValueError, "command failed"):
             common.execute(

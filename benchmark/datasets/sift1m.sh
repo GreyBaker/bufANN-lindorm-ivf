@@ -11,8 +11,9 @@ NPTS_BASE=900000
 UPDATE_POINTS=100000
 DISKANN_R="${DISKANN_R:-64}"
 
-# TODO: Configure the dataset and DiskANN-index directories.
-__dataset_root="${SIFT1M_ROOT:-/path/to/datasets/sift1m}"
+# Shared inputs default to ann-data; canonical DiskANN indexes remain explicit.
+ANN_DATA_ROOT="${ANN_DATA_ROOT:-$HOME/project/ann-data}"
+__dataset_root="${SIFT1M_ROOT:-${DATA_ROOT:-$ANN_DATA_ROOT/sift1m}}"
 __index_root="${SIFT1M_INDEX_DIR:-/path/to/indexes/sift1m}"
 
 # TODO: Configure the source vector files.
@@ -22,5 +23,7 @@ QUERY_FVECS="${QUERY_FVECS:-$__dataset_root/sift_query.fvecs}"
 # Generated artifact paths; no configuration needed.
 DATA_BIN="${DATA_BIN:-$__dataset_root/sift_base.bin}"
 QUERY_BIN="${QUERY_BIN:-$__dataset_root/sift_query.bin}"
-GT_BIN_KCACHED="${GT_BIN_KCACHED:-$__dataset_root/sift1m_1000000_gt100.bin}"
+GT_ARTIFACT_DIR="${GT_ARTIFACT_DIR:-$__dataset_root/groundtruth}"
+GT_BIN_KCACHED="${GT_BIN_KCACHED:-$GT_ARTIFACT_DIR/sift1m_1000000_gt100.bin}"
+PQ_PREFIX="${PQ_PREFIX:-$__dataset_root/pq/pq${PQ_CHUNKS:-32}-base${NPTS_BASE}}"
 DISKANN_INDEX_0P9B="${DISKANN_INDEX_0P9B:-$__index_root/sift1m_0.9M_R64_L100_B32_M8_noPQ}"

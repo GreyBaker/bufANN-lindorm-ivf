@@ -5,6 +5,14 @@ Query-only benchmark runs fork the prepared immutable base into a private mutabl
 These scripts prepare and run IVF query-only, insertion, deletion and mixed-update
 workloads on Linux/WSL. Run the commands below from the repository root.
 
+**Choose a workflow:** [full-scale SIFT setup](#quickstart-sift),
+[all four workloads](#4-configure-and-run-all-four-workloads),
+[wide query grid](#quickstart-sift100m-wide-query-only-grid),
+[reuse/refinement](#follow-up-reuse-the-first-run-and-refine-100k-400k), or
+[recall diagnostics](#investigating-the-approximately-99559-recall-ceiling).
+The numbered sections immediately below describe the lower-level scripts for
+custom datasets and ablations; the quickstart supplies its own fixed preset.
+
 ## 1. Compile the IVF tools
 
 For the Ubuntu-packaged dependencies installed by the [quickstart](#quickstart-sift),
@@ -335,8 +343,9 @@ DATASET=sift1m bash benchmark/IVF/sift/query_sweep.sh \
   --repeats 3 --warmups 1 --memory-budget-gb 4 --buffer-frames 64 --timeout 1800
 ```
 
-Trials reuse the index/PQ/GT; records go to `query/runs/`, plans/summaries to
-`query/sweeps/<tag>/`. Separate-process warmups do not warm later buffer pools.
+Trials reuse the index/PQ/GT; records go to `<dataset>/IVF/query/runs/`,
+plans/summaries to `<dataset>/IVF/query/sweeps/<tag>/`.
+Separate-process warmups do not warm later buffer pools.
 `--cpus` pins without CPU isolation. Recall gates use percent Recall@K;
 run-percentile aggregates are not pooled query percentiles. Gates do not establish
 matched-recall baseline comparisons.
@@ -431,6 +440,8 @@ the call site rather than creating another orchestration layer:
 | `benchmark/IVF/settings.py` | Declared settings, admission and query flag formatting; callers validate warmup before any mutation |
 | `benchmark/IVF/harness.py` | Bundle ownership and common native-open arguments; sequential workload sequencing stays explicit |
 | `benchmark/IVF/common.sh` | Fresh work-directory claims, run-tag output selection and query/sequential prefix GT staging |
+| `benchmark/IVF/experiment.py` | Full-scale recipe settings, grid schedules, reuse/GT gates, deadlines and retained experiment evidence |
+| `benchmark/IVF/sift/_profile.sh` | Dataset/tool shell bootstrap; sequential and mixed arithmetic remain in separate profiles |
 | `benchmark/scripts/check_gt_coverage.py` | Ordered live-state plans, GT plane layout and cached-row scratch estimates |
 | `include/bufann/ivf_numeric_internal.h` | Unchecked ordered float ADC, double exact-L2 and distance/ID ordering; caller validation remains local |
 | `src/bufann/ivf_random_internal.h` | Deterministic bounded draws; training/calibration sampling strategies stay separate |
@@ -447,7 +458,7 @@ paths. Ordered manifest component helpers preserve each format's separate versio
 and suffix schema. Hashes before/after operations are integrity boundaries, not
 redundant reads to cache away. Test fixture sharing must not share mutable files or
 replace independent distance/recall oracles with production calculations. Keep the
-grid guide's terminal blocks copyable; they are not executable Markdown templates.
+README commands copyable; experiment logic belongs in tested scripts, not Markdown.
 
 
 # Quickstart: SIFT
@@ -551,7 +562,11 @@ You'll want at least the eval and data drives to have significant disk space.
 
 Once generated, these artifacts could be uploaded and downloaded instead of regenerated. `DATASET=sift10m` is also valid.
 ```bash
-export DATASET=sift100m; export DATA_ROOT="$HOME/project/ann-data/$DATASET"; export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin"
+export ANN_DATA_ROOT="$HOME/project/ann-data"
+export DATASET=sift100m
+export DATA_ROOT="$ANN_DATA_ROOT/$DATASET"
+export DATA_BIN="$DATA_ROOT/base.bin" QUERY_BIN="$DATA_ROOT/query.10K.bin"
+export GT_ARTIFACT_DIR="$DATA_ROOT/groundtruth"
 source "benchmark/datasets/$DATASET.sh"
 printf 'Dataset=%s total=%s base=%s updates=%s\n' \
   "$DATASET" "$NPTS_FULL" "$NPTS_BASE" "$UPDATE_POINTS"
@@ -584,6 +599,50 @@ headers/ranges, refuses existing outputs and retains partial files; it does not
 resume. Reuse completed inputs unchanged across runs; skip their generation when
 using an existing verified dataset. The PQ helper's final `0` encodes all rows.
 
+### Storage layout and reuse
+
+```text
+ann-data/sift100m/
+  base.bin, query.10K.bin
+  pq/pq64_*                         # shared pivots and full-source codes
+  groundtruth/
+    .gt/run-*/                      # deep GT, coverage evidence and generator logs
+    derived/<identity>/truth.bin    # shared live-prefix / mutation / round GT
+ann-eval/<experiment>/
+  sift100m/IVF/                     # dataset/runner/workload
+    query/
+      data/, groundtruth/           # read-only links to shared inputs/truth
+      index/                        # complete prepared base (retain)
+      runs/<tag>/                   # results, neighbors, logs; private heaps disposable
+    insert/
+    delete/
+    update/
+```
+
+The grid adds `nlist-<N>/` above the dataset directory. `EVAL_CACHED`
+continues to hold verified trained-index caches, not shared GT or generated PQ.
+`ANN_DATA_ROOT` defaults to `$HOME/project/ann-data`; dataset-specific roots and
+explicit input paths still override it. The generic `benchmark/scripts/build_pq.sh`
+now defaults to `ann-data/<dataset>/pq/pq32-base<NPTS_BASE>` (override `PQ_PREFIX`
+and `PQ_CHUNKS`). Its base-only codes are **not** the full-source codes needed by
+the IVF insertion recipe above; retain the explicit `IVF_PQ_PREFIX` selection.
+Derived GT is reused across nlist values, experiments and runners only when its
+deep-GT/query/tool hashes, source identity, output width and live-set filters
+match. Source vectors must remain immutable: their resolved path, size and stat
+identity are recorded rather than rehashing 100M rows for every GT derivation.
+The exact full-source GT's provenance remains the caller's responsibility.
+Eval cleanup does not delete shared GT; `ann-data` is not a permitted destructive
+eval root. PQ components inside an index/private session are still bundle-owned,
+not substitutes for the shared full-source PQ inputs.
+
+Outputs use the `dataset/runner/workload` layout. No existing experiment
+directories are moved or rewritten. Keep existing paths and link targets intact, including
+the actual GT binary named in `selected_gt.txt`. The GT preflight also discovers
+old `$DATA_ROOT/.gt/` runs without regenerating them. New GT goes under
+`$GT_ARTIFACT_DIR` (default `ann-data/<dataset>/groundtruth`), even when reusing
+an old base. Do not rename old prepared trees: saved metadata contains absolute
+paths. No migration is required to continue the previous experiment.
+
 The recipe uses 64 eight-bit chunks: 64 bytes (512 bits) per vector. Lindorm's SIFT setting uses 128 four-bit chunks, also 64 bytes/vector;
 equal storage does not make the quantizer/scanner implementations equivalent.
 
@@ -601,8 +660,8 @@ a separate tuning set before scoring them.
 
 For a **query-only grid over nlist, nprobe and router breadth**, use the
 [copyable SIFT100M wide-grid instructions](#quickstart-sift100m-wide-query-only-grid)
-**instead of this step** after completing steps 1–3. No separate orchestrator
-script is needed; use a fresh work root and declare the grid/time budgets first.
+**instead of this step** after completing steps 1–3. Both recipes use the checked-in
+`experiment.py` runner; this README is the only experiment document required.
 
 **Training limit:** SIFT100M uses **10 passes on all 90M base rows**, plus final
 assignment: 990M searches, below the native 1B guard. The default 15 passes would
@@ -620,89 +679,63 @@ raise the separate 1B training-assignment cap or guarantee that every graph
 operation fits. Keep guards enabled and retain any subsequent work-limit failure.
 
 ```bash
-# Reload the same profile the workload scripts will use, before deriving counts.
-source "benchmark/datasets/$DATASET.sh"
-# Refuse a modified/smaller profile rather than silently training/indexing it.
-case "$DATASET" in
-  sift100m) expected_full=100000000; expected_base=90000000; expected_updates=10000000 ;;
-  sift10m) expected_full=10000000; expected_base=9000000; expected_updates=1000000 ;;
-  *) echo "ERROR: quickstart requires sift10m or sift100m" >&2; exit 1 ;;
-esac
-[[ "$DATA_TYPE" = uint8 && "$DIM" = 128 && "$METRIC" = l2 &&
-   "$NPTS_FULL" = "$expected_full" && "$NPTS_BASE" = "$expected_base" &&
-   "$UPDATE_POINTS" = "$expected_updates" ]] || {
-  echo "ERROR: loaded profile does not match the full-scale quickstart" >&2; exit 1;
-}
-# Remove any smaller-workload overrides from earlier experiments.
-unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO INSERT_CAP DELETE_CAP IVF_RUN_TAG IVF_COST_MODEL_REPORT IVF_SCHEDULER_SEED
-
-# Train on every initial-base row; keep the indexed population unchanged.
-if [ "$DATASET" = sift100m ]; then
-  export IVF_MAX_REPS=10
-else
-  export IVF_MAX_REPS=15
-fi
-export IVF_SAMPLE_RATE=1
-export IVF_TRAINER_MODE=lv-plus IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0 IVF_BUILD_THREADS=20 IVF_MEMORY_BUDGET_GB=96
-export IVF_QUERY_MEMORY_BUDGET_GB=96 OMP_NUM_THREADS=20 MKL_NUM_THREADS=1
-export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
-
-# Expected starting configuration
-export IVF_NLIST=200000 IVF_NPROBE=64 IVF_RERANK_FACTOR=3 QUERY_THREADS=8 RECALL_AT=10
-export IVF_ROUTING_WORK_LIMIT=3000000000
-# Enable optimized final routing separately from LV+ training.
-export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined IVF_BUILD_ROUTER_RERANK_FACTOR=3 IVF_PCA_VARIANCE=0.95 IVF_REFINE_EF=128 IVF_QUERY_BREADTH=128 IVF_INSERT_BREADTH=64
-export IVF_ROUTER_MODE=pca-refined IVF_ROUTER_RERANK_FACTOR=3 IVF_ROUTER_BREADTH=128
-
-# Full profile update counts; ten mixed rounds in either dataset.
-export UPDATE_PERCENT=10 UPDATE_BATCH=$((UPDATE_POINTS / 10)) IVF_SCHEDULER=update_driven NTHREADS=16 EVAL_TEMPFILES="$HOME/project/ann-eval/run01" EVAL_CACHED="$HOME/project/ann-eval/cache"
-export IVF_BUFFER_FRAMES=262144
-# Freeze execution policy before running final queries; preserve default behavior.
-# export IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming IVF_WARMUP_QUERIES=0
-# Optional alternative, declared in advance:
+export EVAL_TEMPFILES="$HOME/project/ann-eval/run01"  # must not exist
+export EVAL_CACHED="$HOME/project/ann-eval/cache"
+export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
 export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
-# Inspect the actual destinations; a large data volume does not ensure space
-# on a work/cache filesystem mounted elsewhere. No existing evidence is deleted.
-mkdir -p "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
-df -h "$DATA_ROOT" "$(dirname "$EVAL_TEMPFILES")" "$EVAL_CACHED"
-
-# Each workload gets an independent prepared base; stop on any failure.
-(
-  set -euo pipefail
-  # Reuse covered GT; recommend/generate only if needed. Failure stops the loop.
-  GT_BIN_KCACHED=$(python3 benchmark/scripts/ensure_gt.py \
-    --base-file "$DATA_BIN" --query-file "$QUERY_BIN" \
-    --full-count "$NPTS_FULL" --base-count "$NPTS_BASE" \
-    --insert-count "$UPDATE_POINTS" --delete-count "$UPDATE_POINTS" \
-    --mixed-rounds 10 --mixed-insert-cap "$UPDATE_BATCH" --mixed-delete-cap "$UPDATE_BATCH" \
-    --k-out "$RECALL_AT" --expected-queries 10000 --num-threads 20 --generate)
-  export GT_BIN_KCACHED
-  for workload in query insert delete update; do
-    bash "benchmark/IVF/sift/${workload}_prepare.sh"
-    bash "benchmark/IVF/sift/${workload}.sh"
-  done
-)
+unset IVF_GT_FILE IVF_GRID_DRY_RUN
+python3 benchmark/IVF/experiment.py --mode workloads --dry-run
 ```
+
+Review the preview, then execute:
+
+```bash
+python3 benchmark/IVF/experiment.py --mode workloads
+```
+
+The full-scale preset validates the loaded profile and input shapes, checks GT,
+then prepares/runs **query, insert, delete, update**, stopping at the first failure.
+It clears stale count, scheduler-seed, run-tag and cost-model overrides. Effective
+settings are recorded in `plan.json`; subprocesses do not change your shell exports.
+
+| Recipe setting | Value |
+|---|---|
+| Training | Full-base LV+, 20 workers, seed 0; 10 passes for SIFT100M, 15 for SIFT10M |
+| Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
+| Workload search | nlist 200K, nprobe 64, router breadth 128, Recall@10 |
+| Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
+| Updates | 10% tail inserts/base deletes; 10 mixed rounds; update-driven, 16 foreground workers |
+| Sequential insertion | 8 workers, staged inputs; override with `IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming` |
+| Warmup | 0 for workloads; 64 for grids, unless explicitly overridden |
+
+Resource and execution-policy exports above remain overridable. Training/search
+settings in this preset are fixed; use the individual workload scripts for other
+experiments. All recipes default to seven days total, one day per index/workload,
+and six hours per grid query pass. Set `IVF_GRID_{TOTAL,NLIST,QUERY}_TIMEOUT_S` or
+the corresponding `--*-timeout-s` options before execution to change those budgets.
+Check free space on both input and work/cache filesystems before starting.
 
 `ensure_gt.py` ignores nonexistent shell paths, finds
 existing caches, and checks every query against every declared live population.
 It reuses a passing cache unchanged. Otherwise it recommends a sufficient depth,
 generates exact full-source GT with the existing helper, and checks the new file
 before returning its path. With no cache, it starts at K=1000; that is a starting
-depth, not a coverage guarantee. Remove `--generate` to check/recommend without
-allowing expensive generation. `IVF_BUILD_DIR` locates the generator; override
-with `--gt-generator`. Use `--cached-gt` to prefer a custom existing cache.
+depth, not a coverage guarantee. Pass `--no-generate-gt` to `experiment.py` to
+check/recommend without permitting an exact scan. For custom GT plans, call
+`ensure_gt.py --help`; `--gt-generator` selects a helper and `--cached-gt` prefers
+an existing cache. `IVF_BUILD_DIR` supplies the default generator location.
 
 No timestamps, manual K extraction, or report-path bookkeeping are needed.
-Caches, reports and generator logs are preserved under `$DATA_ROOT/.gt/run-0001/`,
+Caches, reports and generator logs are preserved under `$GT_ARTIFACT_DIR/.gt/run-0001/`,
 `run-0002/`, etc.; rerunning rechecks and reuses completed caches (underflowing ones
 can seed recommendation). Failed/partial generation outputs are never selected.
 Existing GT, PQ and index files are never overwritten. A malformed cache is an
 error, not permission to bypass validation. On failure, inspect that run's
 `error.json` and `generate-k*.log`, fix the cause, and rerun the same command.
-Exit 3 means generation is needed; 1/2 means an error. No failure returns a GT path.
-Keep the shell assignment and `export` separate as shown: combining them can mask
-failure and allow preparation to proceed without validated GT.
+`ensure_gt.py` exits 3 when generation is needed and 1/2 on errors. No failure
+returns a GT path; the experiment runner exits nonzero and retains the phase log.
+The runner checks the GT command's exit status and returned path before preparing
+any index; a failed GT gate cannot fall through to benchmark execution.
 
 Recommendation scans require NumPy and original uint8 squared-L2 inputs in at most
 128 dimensions. Defaults admit 32 scan queries and 256 MiB estimated scan workspace;
@@ -771,7 +804,8 @@ the external SPFresh tester's scheduler or scoring cadence.
 ## 5. Read results and repeat
 
 Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
-`delete/` and `update/`. Retain logs, structured results and input identities.
+`delete/` and `update/`.
+Retain logs, structured results and input identities.
 For sequential/query runs, inspect `execution_protocol.json` for the declared
 input/worker/warmup policy and separate process wall costs; `result.json` retains
 the native scored-query metrics unchanged. Mutation completion costs live in
@@ -799,13 +833,12 @@ would add a discarded **whole driver process** per configuration; it does not
 warm the next process's buffer pool and is not equivalent to centroid warmup.
 Keep both policies consistent across repetitions and record them with results.
 
-For another complete run, choose a fresh work root and repeat the loop in step 4
+For another complete run, choose a fresh work root and repeat the recipe in step 4
 without changing the frozen settings:
 
 ```bash
-unset IVF_RUN_TAG
 export EVAL_TEMPFILES="$HOME/project/ann-eval/run02"
-# Repeat only the workload loop from step 4.
+python3 benchmark/IVF/experiment.py --mode workloads
 ```
 
 Choose a new root for each repetition so preparation starts from the same IVF
@@ -862,310 +895,197 @@ their artifacts; cleanup never recursively removes directories.
 ## Wide-grid setup and preview
 
 Retain the verified `DATA_BIN`, `QUERY_BIN`, `IVF_PQ_PREFIX`, and `IVF_BUILD_DIR`
-from steps 1–3. Choose a fresh absolute work root. The larger deadlines below are
-explicit budgets, **not estimates that the full grid will finish within them**.
+from steps 1–3. Choose a fresh absolute work root. Default deadlines are seven days
+total, one day per index and six hours per query pass: budgets, **not completion estimates**.
 
 ```bash
 export DATASET=sift100m
 export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-wide-grid-01"  # must not exist
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
-export IVF_GRID_MODE=sift100m-wide
-export IVF_GRID_TOTAL_TIMEOUT_S=604800   # seven days for the complete workflow
-export IVF_GRID_NLIST_TIMEOUT_S=86400   # one day per index, including its queries
-export IVF_GRID_QUERY_TIMEOUT_S=21600  # six hours per query process/workflow
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
 export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
-unset IVF_GT_FILE IVF_COST_MODEL_REPORT IVF_RUN_TAG
+unset IVF_GT_FILE IVF_GRID_DRY_RUN
+python3 benchmark/IVF/experiment.py --mode sift100m-wide --dry-run
 ```
 
-### Usage
-
-Next paste the **entire block from `(` through the closing `)`**, including its
-Python here-document. Everything required is in this README; no separate guide
-file is read. Optionally set `IVF_GRID_DRY_RUN=1` first to preview the schedule
-without creating artifacts; unset it and paste the same block again to execute.
-Do not change the plan or warmup policy in response to final-query results.
+Review the preview, then execute (this can take days):
 
 ```bash
-(
-  set -euo pipefail
-  export IVF_GRID_REPO="$PWD"
-  export EVAL_TEMPFILES="${EVAL_TEMPFILES:-$HOME/project/ann-eval/nlist-grid-01}"
-  export EVAL_CACHED="${EVAL_CACHED:-$HOME/project/ann-eval/cache}"
-  export IVF_GRID_DRY_RUN="${IVF_GRID_DRY_RUN:-0}"  # 1 previews without reading inputs
-   export IVF_GRID_MODE="${IVF_GRID_MODE:-sift100m-wide}"  # also coarse or expanded
-  export IVF_GRID_TOTAL_TIMEOUT_S="${IVF_GRID_TOTAL_TIMEOUT_S:-21600}"
-  export IVF_GRID_NLIST_TIMEOUT_S="${IVF_GRID_NLIST_TIMEOUT_S:-7200}"
-  export IVF_GRID_QUERY_TIMEOUT_S="${IVF_GRID_QUERY_TIMEOUT_S:-900}"
-  export IVF_WARMUP_QUERIES="${IVF_WARMUP_QUERIES:-64}"  # 0 disables centroid warmup
-  exec python3 - <<'PY'
-import csv
-import json
-import math
-import os
-from pathlib import Path
-import signal
-import struct
-import subprocess
-import time
-
-env = dict(os.environ)
-repo = Path(env['IVF_GRID_REPO'])
-mode = env['IVF_GRID_MODE']
-if mode not in ('coarse', 'expanded', 'sift100m-wide'):
-    raise ValueError('IVF_GRID_MODE must be coarse, expanded or sift100m-wide')
-wide = mode == 'sift100m-wide'
-if wide and env.get('DATASET', 'sift100m') != 'sift100m':
-    raise ValueError('sift100m-wide requires DATASET=sift100m')
-if env['IVF_GRID_DRY_RUN'] not in ('0', '1'):
-    raise ValueError('IVF_GRID_DRY_RUN must be 0 or 1')
-limits = {key: int(env['IVF_GRID_' + key.upper() + '_TIMEOUT_S'])
-          for key in ('total', 'nlist', 'query')}
-if min(limits.values()) <= 0:
-    raise ValueError('timeouts must be positive seconds')
-nlists = (100, 1000, 10000, 100000, 200000, 300000)
-coarse = {100: (1, 2, 4, 8), 1000: (1, 4, 16, 64), 10000: (4, 16, 64, 256)}
-points, omissions = [], []
-for nlist in nlists:
-    probes = (tuple(2 ** i for i in range(14) if 2 ** i <= nlist) if wide else
-              coarse.get(nlist, (16, 64, 256, 1024)) if mode == 'coarse' else
-              tuple(2 ** i for i in range(0 if nlist <= 10000 else 4, 11) if 2 ** i < nlist))
-    for probe in probes:
-        seen = set()
-        for breadth in ((128, 256, 512) if mode == 'expanded' and probe <= 128 else (128,)):
-            effective = max(breadth, min(nlist, 3 * probe))
-            reason = ('extra breadth exceeds nlist' if breadth != 128 and breadth > nlist
-                      else 'duplicate effective breadth' if effective in seen else None)
-            point = dict(nlist=nlist, nprobe=probe, router_breadth=breadth,
-                         effective_router_breadth=effective, tag=f'np{probe}_rb{breadth}')
-            if reason:
-                omissions.append(dict(**point, reason=reason))
-                continue
-            seen.add(effective)
-            points.append(point)
-if env['IVF_GRID_DRY_RUN'] == '1':
-    print('nlist\tnprobe\trouter_breadth\teffective_router_breadth')
-    for p in points:
-        print(*(p[k] for k in ('nlist', 'nprobe', 'router_breadth', 'effective_router_breadth')), sep='\t')
-    print(f'{mode}: {len(points)} query passes, {len(nlists)} index preparations; no execution')
-    raise SystemExit(0)
-
-if not (repo / 'benchmark/IVF/sift/query_prepare.sh').is_file():
-    raise ValueError('paste this block from the IVF repository root')
-dataset = env.get('DATASET', 'sift100m')
-profiles = {'sift10m': (10000000, 9000000, 1000000, 15),
-            'sift100m': (100000000, 90000000, 10000000, 10)}
-if dataset not in profiles:
-    raise ValueError('this full-scale recipe supports sift10m or sift100m, not float SIFT1M')
-full, base, updates, reps = profiles[dataset]
-if not env.get('IVF_PQ_PREFIX') or not env.get('EVAL_TEMPFILES'):
-    raise ValueError('export IVF_PQ_PREFIX and a fresh absolute EVAL_TEMPFILES root')
-if env.get('IVF_GT_FILE'):
-    raise ValueError('unset IVF_GT_FILE; this recipe requires coverage-checked GT_BIN_KCACHED')
-root = Path(env['EVAL_TEMPFILES'])
-cache = Path(env['EVAL_CACHED'])
-if not root.is_absolute() or not cache.is_absolute():
-    raise ValueError('EVAL_TEMPFILES and EVAL_CACHED must be absolute')
-if root.exists() or root.is_symlink():
-    raise FileExistsError(f'preserve the existing root and choose a new one: {root}')
-for key in ('INSERT_POINTS', 'DELETE_POINTS', 'QUERY_POINTS', 'UPDATE_QUERY_BATCH', 'QUERY_RATIO',
-            'INSERT_CAP', 'DELETE_CAP', 'IVF_RUN_TAG', 'IVF_COST_MODEL_REPORT', 'IVF_SCHEDULER_SEED'):
-    env.pop(key, None)
-data_root = Path(env.get('DATA_ROOT', str(Path.home() / 'project/ann-data' / dataset)))
-native = Path(env.get('IVF_BUILD_DIR', str(repo / 'build/ivf-benchmark'))).resolve()
-env.update(DATASET=dataset, DATA_BIN=str(Path(env.get('DATA_BIN', str(data_root / 'base.bin'))).resolve()),
-           QUERY_BIN=str(Path(env.get('QUERY_BIN', str(data_root / 'query.10K.bin'))).resolve()),
-           EVAL_CACHED=str(cache), IVF_BUILD_DIR=str(native),
-           IVF_BUILD_BIN=str(Path(env.get('IVF_BUILD_BIN', str(native / 'tests/ivf_build'))).resolve()),
-           IVF_DRIVER_BIN=str(Path(env.get('IVF_DRIVER_BIN', str(native / 'tests/ivf_driver'))).resolve()),
-           IVF_SAMPLE_RATE='1', IVF_MAX_REPS=str(reps), IVF_TRAINER_MODE='lv-plus',
-           IVF_INIT='random_partition', IVF_TRAINING_BREADTH='64', IVF_SEED='0', IVF_BUILD_THREADS='20',
-           IVF_TRAINING_RERANK_FACTOR='3', IVF_TRAINING_REFINE_BREADTH='128',
-           IVF_MEMORY_BUDGET_GB=env.get('IVF_MEMORY_BUDGET_GB', '96'),
-           IVF_QUERY_MEMORY_BUDGET_GB=env.get('IVF_QUERY_MEMORY_BUDGET_GB', env.get('IVF_MEMORY_BUDGET_GB', '96')),
-           IVF_BUFFER_FRAMES=env.get('IVF_BUFFER_FRAMES', '262144'), IVF_PAGE_SIZE='4096',
-           OMP_NUM_THREADS='20', OMP_THREAD_LIMIT='20', MKL_NUM_THREADS='1',
-           QUERY_THREADS=env.get('QUERY_THREADS', '8'), RECALL_AT='10',
-           IVF_OPTIMIZED_MODES='1', IVF_ASSIGNMENT_ROUTER_MODE='pca-refined',
-           IVF_BUILD_ROUTER_RERANK_FACTOR='3', IVF_PCA_VARIANCE='0.95', IVF_REFINE_EF='128',
-           IVF_QUERY_BREADTH='128', IVF_INSERT_BREADTH='64', IVF_ROUTING_WORK_LIMIT='3000000000',
-           IVF_ROUTER_MODE='pca-refined', IVF_ROUTER_RERANK_FACTOR='3', IVF_RERANK_FACTOR='3',
-           IVF_ROUTER_BREADTH='128', IVF_NPROBE='1')
-env['IVF_PQ_PREFIX'] = str(Path(env['IVF_PQ_PREFIX']).resolve())
-for key in ('IVF_BUILD_BIN', 'IVF_DRIVER_BIN'):
-    if not os.access(env[key], os.X_OK) or not Path(env[key]).is_file():
-        raise ValueError(f'missing executable {key}; complete quickstart step 2')
-for path, rows, dim in ((Path(env['DATA_BIN']), full, 128), (Path(env['QUERY_BIN']), 10000, 128),
-                         (Path(env['IVF_PQ_PREFIX'] + '_pq_compressed.bin'), full, 64)):
-    with path.open('rb') as source:
-        header = source.read(8)
-    if header != struct.pack('<II', rows, dim) or path.stat().st_size != 8 + rows * dim:
-        raise ValueError(f'wrong full uint8 population/shape: {path}')
-if not Path(env['IVF_PQ_PREFIX'] + '_pq_pivots.bin').is_file():
-    raise ValueError('missing PQ pivots')
-
-root.mkdir(parents=True, exist_ok=False)
-env['INCREMENTAL_GT_BIN'] = str(root / 'incremental_groundtruth')
-started = time.monotonic()
-global_deadline = started + limits['total']
-rows, phases = [], []
-
-def save(name, value):
-    with (root / name).open('x') as out:
-        json.dump(value, out, indent=2)
-        out.write('\n')
-
-save('plan.json', dict(mode=mode, dataset=dataset, source_rows=full, base_rows=base,
-     execution_mode='pasted_bash_subshell', queries_per_point=10000, points=points,
-     omissions=omissions, timeouts_s=limits,
-     settings={k: v for k, v in env.items() if k.startswith('IVF_') or k in (
-         'DATASET', 'DATA_BIN', 'QUERY_BIN', 'EVAL_CACHED', 'BENCH_DATASETS_DIR',
-         'INCREMENTAL_GT_BIN', 'QUERY_THREADS', 'RECALL_AT', 'OMP_NUM_THREADS',
-         'OMP_THREAD_LIMIT', 'MKL_NUM_THREADS')}, selected_configuration=None,
-      cache_policy='separate query drivers; no cache drop; hashing/open/copies may warm caches',
-      private_query_heap_policy=('delete_successful_pass_private_heap_and_pq_after_result_recording'
-                                 if wide else 'retain'),
-     gt_policy='existing conservative quickstart four-workload coverage plan; no mutation execution'))
-
-def terminate(process):
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-
-def interrupted(signum, frame):
-    raise SystemExit(128 + signum)
-
-signal.signal(signal.SIGTERM, interrupted)
-
-def run(name, command, child_env, deadline, stdout_path=None):
-    remaining = min(deadline, global_deadline) - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError(f'budget exhausted before {name}; phase not started')
-    phase_start = time.monotonic()
-    record = dict(name=name, command=command, timeout_s=remaining)
-    process = None
-    try:
-        with (root / (name + '.log')).open('x') as log:
-            if stdout_path is None:
-                process = subprocess.Popen(command, cwd=repo, env=child_env,
-                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-                code = process.wait(timeout=remaining)
-            else:
-                with stdout_path.open('x') as output:
-                    process = subprocess.Popen(command, cwd=repo, env=child_env,
-                        stdout=output, stderr=log, start_new_session=True)
-                    code = process.wait(timeout=remaining)
-        record['returncode'] = code
-        if code:
-            raise RuntimeError(f'{name} failed ({code}); see retained log')
-    except BaseException as error:
-        if process is not None:
-            terminate(process)
-        record.update(error=repr(error), completed=False)
-        raise
-    else:
-        record['completed'] = True
-    finally:
-        record['process_wall_s'] = time.monotonic() - phase_start
-        phases.append(record)
-        with (root / 'phases.jsonl').open('a') as out:
-            out.write(json.dumps(record) + '\n')
-
-def cleanup_private_query_heaps(folder, name):
-    # The query driver has exited; these are only its disposable private
-    # session files, never the prepared input bundle. Validate both first.
-    heaps = [folder / 'query.heap', folder / 'query.heap.pq.bin']
-    if any(p.is_symlink() or not p.is_file() for p in heaps):
-        raise ValueError(f'{name}: expected regular private query heaps for cleanup')
-    for heap in heaps:
-        size = heap.stat().st_size
-        heap.unlink()
-        with (root / 'heap-cleanup.jsonl').open('a') as cleanup:
-            cleanup.write(json.dumps(dict(phase=name, path=str(heap),
-                                          bytes=size, deleted=True)) + '\n')
-
-try:
-    profile_check = ('source benchmark/datasets/_load.sh; '
-                     '[[ "$DATA_TYPE" = uint8 && "$DIM" = 128 && "$METRIC" = l2 && '
-                     f'"$NPTS_FULL" = {full} && "$NPTS_BASE" = {base} && "$UPDATE_POINTS" = {updates} ]]')
-    run('profile', ['bash', '-euc', profile_check], dict(env, REPO_DIR=str(repo)), global_deadline)
-    gt = ['python3', 'benchmark/scripts/ensure_gt.py', '--base-file', env['DATA_BIN'],
-          '--query-file', env['QUERY_BIN'], '--full-count', str(full), '--base-count', str(base),
-          '--insert-count', str(updates), '--delete-count', str(updates), '--mixed-rounds', '10',
-          '--mixed-insert-cap', str(updates // 10), '--mixed-delete-cap', str(updates // 10),
-          '--k-out', '10', '--expected-queries', '10000', '--num-threads', '20', '--generate']
-    if env.get('GT_BIN_KCACHED'):
-        gt += ['--cached-gt', env['GT_BIN_KCACHED']]
-    run('groundtruth', gt, env, global_deadline, root / 'selected_gt.txt')
-    selected = (root / 'selected_gt.txt').read_text().strip()
-    if '\n' in selected or not selected or not Path(selected).is_file():
-        raise ValueError('GT preflight did not return one existing truth path')
-    env['GT_BIN_KCACHED'] = selected
-    with (root / 'results.csv').open('x', newline='') as table:
-        writer = None
-        for nlist in nlists:
-            deadline = min(global_deadline, time.monotonic() + limits['nlist'])
-            child = dict(env, IVF_NLIST=str(nlist), EVAL_TEMPFILES=str(root / f'nlist-{nlist}'))
-            print(f'nlist={nlist}: prepare/restore full base', flush=True)
-            run(f'nl{nlist}-prepare', ['bash', 'benchmark/IVF/sift/query_prepare.sh'], child, deadline)
-            for point in (p for p in points if p['nlist'] == nlist):
-                child.update(IVF_NPROBE=str(point['nprobe']), IVF_ROUTER_BREADTH=str(point['router_breadth']),
-                             IVF_RUN_TAG=point['tag'])
-                name = f'nl{nlist}-{point["tag"]}'
-                print(name, flush=True)
-                run(name, ['bash', 'benchmark/IVF/sift/query.sh'], child,
-                    min(deadline, time.monotonic() + limits['query']))
-                folder = Path(child['EVAL_TEMPFILES']) / dataset / 'IVF/query/runs' / point['tag']
-                native_record = json.loads((folder / 'result.json').read_text())
-                expected = dict(baseline='IVF', phase='query', workload='query', query_count=10000,
-                    base_count=base, nlist=nlist, pq_chunks=64, recall_at=10,
-                    nprobe=point['nprobe'], router_breadth=point['router_breadth'],
-                    router_mode='pca-refined', rerank_factor=3, router_rerank_factor=3,
-                     query_threads=int(env['QUERY_THREADS']), explicit_warmup_query_count=int(env['IVF_WARMUP_QUERIES']))
-                if wide:
-                    expected.update(index_format='mutable', input_index_format='immutable', live_count=base)
-                if any(native_record.get(k) != v for k, v in expected.items()):
-                    raise ValueError(f'{name}: native result does not match frozen plan')
-                if not (math.isfinite(native_record['recall']) and 0 <= native_record['recall'] <= 100
-                        and all(math.isfinite(native_record[k]) and native_record[k] > 0
-                                for k in ('query_qps', 'query_time_s'))):
-                    raise ValueError(f'{name}: invalid native query metrics')
-                protocol = json.loads((folder / 'execution_protocol.json').read_text())
-                if not protocol['completed'] or protocol['native_driver_process_count'] != 1:
-                    raise ValueError(f'{name}: expected one completed standalone query process')
-                row = dict(**point, recall_at_10_percent=native_record['recall'],
-                    query_qps=native_record['query_qps'], query_time_s=native_record['query_time_s'],
-                    query_process_wall_s=protocol['query_process_wall_s'],
-                    harness_workflow_wall_s=protocol['harness_workflow_wall_s'],
-                    query_script_wall_s=phases[-1]['process_wall_s'], output_dir=str(folder))
-                if writer is None:
-                    writer = csv.DictWriter(table, fieldnames=list(row))
-                    writer.writeheader()
-                writer.writerow(row)
-                table.flush()
-                rows.append(row)
-                if wide:
-                    cleanup_private_query_heaps(folder, name)
-    if len(rows) != len(points):
-        raise ValueError('grid incomplete')
-    save('summary.json', dict(completed=True, production_qualified=False, records=rows,
-         phases=phases, selected_configuration=None, wall_s=time.monotonic() - started))
-    print(f'Completed: {root / "results.csv"}', flush=True)
-except BaseException as error:
-    save('failure.json', dict(completed=False, error=repr(error), completed_points=len(rows),
-         wall_s=time.monotonic() - started, partial_evidence_retained=True))
-    raise
-PY
-)
+python3 benchmark/IVF/experiment.py --mode sift100m-wide
 ```
+
+### Follow-up: reuse the first run and refine 100K-400K
+
+For a second, exploratory run after the wide grid, use the commands below instead
+of the wide-grid commands. Keep the previous run intact;
+successful private query heaps need not exist, but its prepared base indexes,
+`prepared.json` files, `plan.json`, and `selected_gt.txt` must still exist.
+
+```bash
+export DATASET=sift100m
+export IVF_GRID_PREVIOUS_ROOT="$HOME/project/ann-eval/sift100m-wide-grid-01"
+export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-refine-grid-01"  # fresh
+export EVAL_CACHED="$HOME/project/ann-eval/cache"
+# Keep the SAME DATA_BIN, QUERY_BIN, IVF_PQ_PREFIX and trained-base settings.
+export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
+export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
+unset IVF_GT_FILE IVF_GRID_DRY_RUN
+python3 benchmark/IVF/experiment.py --mode sift100m-refine --dry-run
+```
+
+Review the preview, then execute:
+
+```bash
+python3 benchmark/IVF/experiment.py --mode sift100m-refine
+```
+
+This mode executes **80 passes**, in nlist order **100K, 200K, 300K, 400K**:
+
+- Probes at every nlist: **16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192,
+  224, 256, 384, 512**. This tightens the region around 90% and 95% recall and
+  retains low/high-effort anchors. A target not reached is reported, not assumed.
+- Requested breadth **128** everywhere; additionally **64 at probes 16/32**,
+  **256 at probes 48/64**, and **512 at probe 128**. These produce distinct
+  effective breadths. In particular, 64 and 128 are identical at probes >=48,
+  and 256 is ineffective once `3*nprobe >=256`; those duplicate trials are omitted.
+- Both rerank factors remain **3**, PCA variance remains **0.95**, and all query
+  passes still score the same 10,000 queries. Do not silently change the vector
+  shortlist or scoring definition while comparing nlist or breadth.
+
+**Reuse:** the first three indexes are queried directly from their existing
+prepared work trees, not retrained or re-copied into new preparations. New tagged
+query outputs live under those prepared trees' `runs/` directories; original
+results and prepared bases are not overwritten. Tags incorporate the new root's
+identity. Only 400K is prepared in the new root, with normal verified-cache reuse
+if a matching build already exists. PQ and source files are reused unchanged.
+Centroids/graphs/PCA cannot be reused between different nlist values.
+
+The previous `selected_gt.txt` supplies the full-source GT cache. Coverage is
+rechecked **without `--generate`**: missing/insufficient GT stops this follow-up
+rather than triggering a new full exact scan. Existing per-base derived GT is
+reused for old indexes; 400K derives equivalent base GT from the shared cache.
+Neither reuse nor deeper full-source GT guarantees that the derived ten-column
+scoring file contains all boundary ties (see saturation discussion below).
+
+The 400K build uses a finite **5B routing-work allowance** because PCA covariance
+alone costs `400000 * 128 * 129 / 2 = 3302400000` operations. Existing bases retain
+their original settings and identities; their 3B allowance is not edited. All
+training guards remain enabled. Rebuild/restore is allowed only for the new 400K
+index; missing previous bases cause a failure, not an accidental retraining job.
+
+The new root holds `plan.json`, `results.csv`, logs, and `heap-cleanup.jsonl`.
+Use each CSV row's `output_dir` to find its native result: reused-index outputs
+are deliberately outside the new root. Successful private heaps are deleted as
+before, and originals/caches are preserved. This is post-observation exploratory
+tuning, not an independent held-out validation of the original sweep.
+
+### Runner options and retained evidence
+
+`python3 benchmark/IVF/experiment.py --help` lists the command-line interface.
+`--dry-run` prints the ordered schedule without reading inputs or creating paths.
+`--output` and `--previous-root` can replace `EVAL_TEMPFILES` and
+`IVF_GRID_PREVIOUS_ROOT`. Explicit CLI options win over environment defaults;
+the historical `IVF_GRID_MODE` and `IVF_GRID_DRY_RUN=0|1` exports still work.
+
+The runner owns profile/GT gates, deadline handling, plan/phase receipts, CSV
+validation and successful private-heap cleanup. Individual workload scripts still
+own preparation and execution; none is parsed from Markdown. `coarse` and
+`expanded` remain available for the older 24/100-pass schedules (with shorter
+6h/2h/15m default budgets). No mode includes nlist 1M.
+
+Keep `plan.json`, `phases.jsonl`, `results.csv`, `summary.json`, `selected_gt.txt`
+and logs. Failures retain partial evidence and write `failure.json`; rerun into a
+new root, not over an incomplete one. Freeze the plan and warmup policy before
+evaluation. No separate grid guide or generated script is needed.
+
+### Investigating the approximately 99.559% recall ceiling
+
+The first wide grid approaches 99.559% at several different list counts. Over
+10,000 queries at k=10, this corresponds to about **441 missing hit slots out of
+100,000**, not necessarily 441 failed queries. A stable aggregate does not prove
+the same individual neighbors were missed at each setting.
+
+Three explanations must be separated:
+
+1. **PQ shortlist loss:** the scanner retains only `ceil(10 * 3) = 30` approximate
+   candidates, even when it scans millions of vectors. Exact reranking cannot
+   recover a true neighbor discarded before fetching. Full list coverage does
+   not imply exact search when this shortlist is bounded.
+2. **List coverage/routing loss:** near-saturation is not proof that every useful
+   list was probed. Use an all-lists diagnostic to remove this approximation.
+3. **Scoring ties:** `common.sh::ivf_stage_prefix_truth` normally derives GT with
+   exactly `RECALL_AT=10` columns. The native scorer expands ties only into extra
+   columns actually present. It cannot accept alternative equally distant IDs
+   missing from a ten-column file, despite the tie-aware policy label. With uint8
+   SIFT and duplicate/equidistant descriptors, this is a credible explanation for
+   at least part of the ceiling. It is not established without auditing results.
+
+Exact uint8 squared distances in 128 dimensions are below 2^24, so the float32
+distance export can represent those integer distances exactly. This makes a
+boundary-distance/tie audit useful before blaming floating-point precision.
+
+#### First: rescore existing neighbors, without running ANN again
+
+Run the existing-GT auditor on a saturated result; no heaps or vectors are read,
+and no new truth is generated:
+
+```bash
+previous="${IVF_GRID_PREVIOUS_ROOT:?Set the original wide-grid root}"
+deep_gt=$(cat "$previous/selected_gt.txt")
+base_work="$previous/nlist-100/sift100m/IVF/query"
+python3 benchmark/IVF/audit_recall.py \
+  --deep-gt "$deep_gt" --base-count 90000000 --k 10 \
+  --results "$base_work/runs/np64_rb128/neighbors.bin"
+```
+
+Repeat for another saturated index, such as 10K/probe2048. The auditor filters
+full-source GT to IDs below 90M and compares strict first-ten-ID recall with
+expanded boundary-tie recall. It requires a stored distance strictly beyond the
+live kth distance to prove all boundary ties were included; otherwise expanded
+recall is reported as unavailable, not as an exact corrected score. Source-row
+ordering, query ordering, and the exact GT's provenance remain your responsibility.
+This audits existing GT; it does not establish its correctness by recomputation.
+
+- If corrected recall reaches 100%, the apparent ceiling was scoring-related
+  for that result, not necessarily a PQ accuracy limit.
+- If returned distances exceed the exact kth distance after tie correction,
+  genuine retrieval misses remain.
+- IDs missing from the expanded truth despite a distance within the cutoff
+  require investigation of GT coverage, IDs, or result-distance consistency.
+- Keep old native scores unchanged. Label rescored values and scoring policy
+  separately; the follow-up nlist grid deliberately retains the original scoring
+  definition so its main results remain comparable.
+
+#### Second: bounded all-lists/vector-rerank diagnostic
+
+This is **optional**, separate from the 80-point grid, and deliberately varies
+vector rerank factor as a diagnostic rather than as the paper-aligned main
+configuration. It reuses the old 100-list base and existing deeper GT. It searches
+the first 256 queries at **nprobe=100**, returning the top ten after fetching 30,
+100, or 300 PQ candidates. Probing all lists bypasses approximate centroid
+selection and removes assignment/list-coverage loss for the live base.
+
+```bash
+python3 benchmark/IVF/recall_diagnostic.py \
+  --previous-root "${IVF_GRID_PREVIOUS_ROOT:?Set the original wide-grid root}" \
+  --query "$QUERY_BIN" \
+  --output "$HOME/project/ann-eval/sift100m-recall-audit-01"  # must not exist
+```
+
+The runner validates the original query identity, creates a prefix subset, and
+retains native results, neighbors, audit reports and logs under `rf3/`, `rf10/`
+and `rf30/`. It enforces the all-lists scan count and removes only successful
+private query heaps. Failed passes keep their files. `--query-count` defaults to
+256; `--timeout-s` defaults to 21600 per pass. Native scoring/results are not rewritten.
+
+This diagnostic still scans all 90M codes per query and can take minutes or more;
+the 256-query subset bounds cost but may contain few saturation misses. The runner
+checks `scanned_codes == query_count * 90000000`. A no-miss subset is not
+proof that the complete 10K query set has no residual error.
+
+If increasing the shortlist improves **tie-corrected, all-lists recall**, PQ
+shortlisting contributes to the error. If strict ID recall stalls but corrected
+recall is already 100%, rerank tuning cannot resolve the scoring artifact. If
+errors remain at larger factors, inspect the missed queries before assuming that
+even larger probing or router breadth can help. No native search/scoring code or
+existing benchmark records are rewritten by either diagnostic.

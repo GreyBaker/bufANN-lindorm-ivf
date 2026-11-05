@@ -259,15 +259,12 @@ def train(args):
 
 def sweep(args):
     work = args.work_dir.resolve()
-    require(
-        work.name == "query" and work.parent.name == "IVF",
-        "expected prepared <root>/<dataset>/IVF/query work tree",
-    )
     prepared_path = work / "prepared.json"
     prepared = read_json(prepared_path)
     dataset = prepared["profile"]["dataset"]
     require(
-        work.parent.parent.name == dataset and re.fullmatch(r"[a-zA-Z0-9_-]+", dataset),
+        work.name == "query" and work.parent.name == "IVF"
+        and work.parent.parent.name == dataset and re.fullmatch(r"[a-zA-Z0-9_-]+", dataset),
         "work/profile dataset mismatch",
     )
     require(re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", args.tag), "unsafe sweep tag")

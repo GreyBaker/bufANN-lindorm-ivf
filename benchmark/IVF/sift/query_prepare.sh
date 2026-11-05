@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DATASET="${DATASET:-sift1m}"
 WORKLOAD=query
-source "$REPO_DIR/benchmark/datasets/_load.sh"
-source "$REPO_DIR/benchmark/IVF/common.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_profile.sh"
 ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing pivots plus full-source PQ codes}"
 [[ -f "$DATA_BIN" && -f "$QUERY_BIN" ]] || error "stage the configured .bin inputs first"

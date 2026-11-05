@@ -1,5 +1,6 @@
 """Synthetic one-command GT lifecycle tests; never run real generator/wrappers."""
 from contextlib import redirect_stderr, redirect_stdout
+from argparse import Namespace
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
@@ -15,6 +16,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "benchmark/scripts"))
 import ensure_gt as manager
+import cache_incremental_gt as derived
 
 try:
     import numpy
@@ -109,6 +111,21 @@ print("generator stdout must not contaminate the returned path")
                 self.assertEqual(calls, [])
         self.assertEqual(self.gt.read_bytes(), before)
         self.assertEqual(len(list((self.root / ".gt").glob("run-*/result.json"))), 2)
+
+    def test_new_default_gt_directory_discovers_legacy_runs(self):
+        first = self.run_manager(["--generate", "--initial-k", "30"])
+        self.assertEqual(first[0], 0, first[2])
+        argv = self.args()
+        index = argv.index("--cache-dir")
+        del argv[index:index + 2]
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, GT_ARTIFACT_DIR=str(self.root / "groundtruth")), \
+                redirect_stdout(out), redirect_stderr(err), \
+                patch.object(manager.subprocess, "run", side_effect=AssertionError("must reuse GT")):
+            code = manager.main(argv)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(out.getvalue(), first[1])
+        self.assertTrue((self.root / "groundtruth/.gt/run-0001/result.json").is_file())
 
     def test_missing_export_discovers_legacy_cache(self):
         cache(self.gt, self.base, 100)
@@ -316,6 +333,96 @@ print("generator stdout must not contaminate the returned path")
         result = subprocess.run(command, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+class DerivedCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="shared derived GT ")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source, self.query, self.gt, self.tool = [self.root / name for name in (
+            "source.bin", "query.bin", "deep.bin", "tool")]
+        for path in (self.source, self.query, self.gt, self.tool):
+            path.write_bytes(b"immutable fixture")
+        self.args = Namespace(cache_root=self.root / "ann-data/tiny/groundtruth/derived",
+                              source=self.source, query=self.query, deep_gt=self.gt,
+                              tool=self.tool, dtype="uint8", metric="l2", k=1,
+                              filters=["--", "--base_trunc", "90"],
+                              output=self.root / "eval/tiny/IVF/query/groundtruth/base.bin")
+        self.calls = 0
+
+    def producer(self, command, **kwargs):
+        self.calls += 1
+        Path(command[3]).write_bytes(struct.pack("<IIIf", 1, 1, 0, 0))
+
+    def install(self):
+        with patch.object(derived.subprocess, "run", self.producer), redirect_stdout(io.StringIO()):
+            derived.install(self.args)
+        return self.args.output.resolve()
+
+    def test_shared_truth_reused_across_evaluations_and_survives_link_deletion(self):
+        truth = self.install()
+        self.assertTrue(self.args.output.is_symlink())
+        self.assertTrue(truth.is_relative_to(self.args.cache_root))
+        self.args.output.unlink()
+        self.args.output = self.root / "eval/nlist-400000/tiny/IVF/query/groundtruth/base.bin"
+        self.assertEqual(self.install(), truth)
+        self.assertEqual(self.calls, 1)
+        self.assertTrue(truth.is_file())
+
+    def test_width_live_set_and_input_identities_separate_entries(self):
+        entries = {self.install()}
+        for change in (lambda: setattr(self.args, "k", 2),
+                       lambda: setattr(self.args, "filters", ["--base_trunc", "80"]),
+                       lambda: self.query.write_bytes(b"different queries"),
+                       lambda: self.gt.write_bytes(b"different deep GT"),
+                       lambda: self.source.write_bytes(b"different source"),
+                       lambda: self.tool.write_bytes(b"different producer")):
+            self.args.output.unlink()
+            change()
+            entries.add(self.install())
+        self.assertEqual(len(entries), 7)
+        self.assertEqual(self.calls, 7)
+
+    def test_id_file_content_not_eval_path_defines_live_set(self):
+        first, second = self.root / "one.ids", self.root / "two.ids"
+        first.write_bytes(b"identical IDs")
+        second.write_bytes(first.read_bytes())
+        self.args.filters = ["--base_trunc", "90", "--deletes", str(first)]
+        truth = self.install()
+        self.args.output.unlink()
+        self.args.filters[-1] = str(second)
+        self.assertEqual(self.install(), truth)
+        self.assertEqual(self.calls, 1)
+        self.args.output.unlink()
+        second.write_bytes(b"different IDs")
+        self.assertNotEqual(self.install(), truth)
+
+    def test_corruption_and_destination_collisions_are_not_overwritten(self):
+        truth = self.install()
+        before = truth.read_bytes()
+        with self.assertRaisesRegex(ValueError, "preserve existing"):
+            self.install()
+        self.assertEqual(truth.read_bytes(), before)
+        self.args.output.unlink()
+        truth.chmod(0o644)
+        truth.write_bytes(b"corrupt")
+        with self.assertRaisesRegex(ValueError, "identity/content mismatch"):
+            self.install()
+        self.assertEqual(truth.read_bytes(), b"corrupt")
+        self.assertFalse(self.args.output.exists())
+
+    def test_failed_production_does_not_publish_cache(self):
+        def failed(command, **kwargs):
+            Path(command[3]).write_bytes(b"partial")
+            raise subprocess.CalledProcessError(1, command)
+        with patch.object(derived.subprocess, "run", failed), \
+                self.assertRaises(subprocess.CalledProcessError):
+            derived.install(self.args)
+        self.assertEqual(list(self.args.cache_root.iterdir()), [])
+        self.assertFalse(self.args.output.exists())
+        self.install()
+        self.assertEqual(self.calls, 1)
 
 
 if __name__ == "__main__":

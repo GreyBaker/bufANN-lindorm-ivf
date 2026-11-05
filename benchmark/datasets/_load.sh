@@ -57,6 +57,7 @@ done
 
 RECALL_AT="${RECALL_AT:-10}"
 R="${R:-$DISKANN_R}"
+export ANN_DATA_ROOT GT_ARTIFACT_DIR
 
 unset __required_dataset_vars __requested_dataset __dataset_file
 unset __bench_datasets_dir __dataset_root __index_root __var

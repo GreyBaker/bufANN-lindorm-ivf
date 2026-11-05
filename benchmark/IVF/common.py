@@ -5,6 +5,7 @@ Evidence destinations are exclusive; partial/failed work is never removed.
 """
 
 import argparse
+from contextlib import ExitStack
 import hashlib
 import json
 import math
@@ -168,7 +169,22 @@ def affinity(cpus):
     return {"available": available, "selected": selected, "explicitly_pinned": bool(cpus)}
 
 
-def execute(command, log, timeout, cpus, env=None):
+def terminate_process(process, grace=5):
+    """Stop the entire experiment group, including children of an exited parent."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        if sig == signal.SIGTERM:
+            try:
+                process.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+    process.wait()
+
+
+def execute(command, log, timeout, cpus, env=None, *, cwd=None, stdout_path=None):
     """Run a measured experiment child, preserving logs and killing its group on timeout."""
     # taskset applies before exec; all descendants inherit the selected affinity.
     if cpus:
@@ -178,22 +194,25 @@ def execute(command, log, timeout, cpus, env=None):
             ",".join(str(v) for v in values(cpus, int, 0)),
         ] + command
     start = time.monotonic()
-    with Path(log).open("x") as out:
+    with ExitStack() as stack:
+        out = stack.enter_context(Path(log).open("x"))
         out.write("Command: " + repr(command) + "\n")
         out.flush()
+        stdout = stack.enter_context(Path(stdout_path).open("x")) if stdout_path else out
         with subprocess.Popen(
-            command, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
+            command, env=env, cwd=cwd, stdout=stdout,
+            stderr=out if stdout_path else subprocess.STDOUT, start_new_session=True
         ) as process:
             try:
                 code = process.wait(timeout=timeout)
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                terminate_process(process)
                 raise ValueError(f"command timed out/interrupted; inspect {log}")
+            except BaseException:
+                terminate_process(process)
+                raise
+            if code:
+                terminate_process(process)
     require(code == 0, f"command failed ({code}); inspect {log}")
     return time.monotonic() - start
 

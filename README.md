@@ -90,7 +90,7 @@ bash benchmark/BufANN/sift/update_prepare.sh
 NTHREADS=16 MERGE_THREADS=8 bash benchmark/BufANN/sift/update.sh
 ```
 
-The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`.
+The mixed-update example assumes a 16-thread server and assigns eight threads to maintenance, leaving eight threads for concurrent queries. The workloads are query-only, insert-only, delete-only, and mixed updates. Each run writes `result.json` and `run.log` under `eval_tempfiles/<dataset>/BufANN/<workload>/`. Shared ground truths and generated PQ inputs live under `ann-data/<dataset>/groundtruth/` and `ann-data/<dataset>/pq/` (override `ANN_DATA_ROOT` or the dataset paths).
 
 # Single-node IVF backend
 

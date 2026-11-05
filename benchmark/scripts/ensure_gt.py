@@ -56,7 +56,11 @@ def candidates(args, inputs):
             yield args.cached_gt
         else:
             log(f"Ignoring missing cache: {args.cached_gt}")
-    for plan in sorted((args.cache_dir / ".gt").glob("run-*/plan.json"), reverse=True):
+    # Discover historical base-directory runs without moving old evidence.
+    directories = list(dict.fromkeys((args.cache_dir, args.base_file.parent.resolve())))
+    plans = [p for directory in directories for p in sorted(
+        (directory / ".gt").glob("run-*/plan.json"), reverse=True)]
+    for plan in plans:
         with plan.open() as file:
             previous = json.load(file)
         if previous["inputs"] != inputs:
@@ -74,7 +78,8 @@ def candidates(args, inputs):
     def width(path):
         match = re.fullmatch(r"full-query\.gt(\d+)\.bin", path.name)
         return int(match[1]) if match else -1
-    yield from sorted(args.cache_dir.glob("full-query.gt*.bin"), key=lambda p: (width(p), p.name), reverse=True)
+    for directory in directories:
+        yield from sorted(directory.glob("full-query.gt*.bin"), key=lambda p: (width(p), p.name), reverse=True)
 
 
 def generate(args, attempt, k):
@@ -187,7 +192,7 @@ def parser():
     p = depth.parser(cached_required=False, report_option=False)
     p.description = __doc__
     p.set_defaults(cached_gt=Path(os.environ["GT_BIN_KCACHED"]) if os.environ.get("GT_BIN_KCACHED") else None)
-    p.add_argument("--cache-dir", type=Path, help="dataset/cache directory; default: base-file directory")
+    p.add_argument("--cache-dir", type=Path, help="shared GT directory; default: GT_ARTIFACT_DIR or <base-dir>/groundtruth")
     p.add_argument("--generate", action="store_true", help="allow expensive exact GT generation only if needed")
     default_generator = (Path(os.environ["IVF_BUILD_DIR"]) / "tests/bufann_gt_computer"
                          if os.environ.get("IVF_BUILD_DIR") else None)
@@ -201,7 +206,9 @@ def main(argv=None):
     args = parser().parse_args(argv)
     attempt = None
     try:
-        args.cache_dir = (args.cache_dir or args.base_file.parent).resolve()
+        default_cache = (Path(os.environ["GT_ARTIFACT_DIR"]) if os.environ.get("GT_ARTIFACT_DIR")
+                         else args.base_file.parent / "groundtruth")
+        args.cache_dir = (args.cache_dir or default_cache).resolve()
         coverage.planned_states(args)
         attempt = new_attempt(args.cache_dir / ".gt")
         log(f"Evidence: {attempt}")

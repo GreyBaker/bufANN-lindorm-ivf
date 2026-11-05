@@ -11,7 +11,7 @@ BENCHMARK_CMAKE_BUILD_TYPE="Release"
 #                    consumable here; *.sh reads it in place. Safe to wipe
 #                    (re-create by re-running prepare).
 #   EVAL_CACHED    - prepare-internal cache for slow-to-produce artifacts only
-#                    (Greator topology, derived GT).
+#                    (Greator topology, trained index bundles).
 #                    Touched solely by *_prepare.sh via eval_cache_* helpers.
 #                    Set EVAL_CACHE_NO_STORE=1 to skip writes into EVAL_CACHED
 #                    (restores still happen); useful for one-off runs where the
@@ -19,6 +19,9 @@ BENCHMARK_CMAKE_BUILD_TYPE="Release"
 #                    persistent cache.
 EVAL_CACHED="${EVAL_CACHED:-$REPO_DIR/eval_cached}"
 EVAL_TEMPFILES="${EVAL_TEMPFILES:-$REPO_DIR/eval_tempfiles}"
+ANN_DATA_ROOT="${ANN_DATA_ROOT:-$HOME/project/ann-data}"
+# Reusable read-only GT/PQ belong with inputs, not in disposable eval roots.
+# Do NOT add this root to safe_mutable_path's destructive-operation allowlist.
 
 error() {
     echo "ERROR: $*" >&2
@@ -93,7 +96,7 @@ copy_dir_contents() {
 # See benchmark/docs/eval-tempfiles-contract.md. *_prepare.sh materializes a
 # real, owner-writable working tree under eval_tempfiles; *.sh consumes it in
 # place. eval_cached is a prepare-internal cache for slow-to-produce artifacts
-# only (Greator topology sidecar, derived-data GT),
+# only (Greator topology sidecar, trained indexes),
 # accessed exclusively via the two helpers below.
 
 # Restore a cached artifact into $dest. Returns 0 (restored) or 1 (cache miss;
@@ -215,9 +218,11 @@ resolve_incremental_gt() {
     [[ -x "$bin" ]] || error "missing incremental_groundtruth binary after build: $bin"
     [[ -e "$GT_BIN_KCACHED" ]] || error "missing deep GT cache: $GT_BIN_KCACHED
        Generate it once with: benchmark/gen_deep_gt.sh $DATASET"
-    mkdir -p "$(dirname "$out_gt")"
-    note "Deriving exact GT (K=$k_out) from $GT_BIN_KCACHED"
-    "$bin" "$GT_BIN_KCACHED" "$k_out" "$out_gt" "$@"
+    python3 "$REPO_DIR/benchmark/scripts/cache_incremental_gt.py" \
+        --cache-root "${GT_ARTIFACT_DIR:-$ANN_DATA_ROOT/$DATASET/groundtruth}/derived" \
+        --source "$DATA_BIN" --query "$QUERY_BIN" --deep-gt "$GT_BIN_KCACHED" \
+        --dtype "$DATA_TYPE" --metric "$METRIC" --tool "$bin" \
+        --output "$out_gt" --k "$k_out" -- "$@"
 }
 
 # Generate one groundtruth file per round into $gt_dir as

@@ -52,6 +52,9 @@ def main():
         for path in (data, queries, truth):
             path.write_bytes(b"unchanged source fixture")
         env.update(DATA_BIN=str(data), QUERY_BIN=str(queries), EVAL_CACHED=str(root / "cache"))
+        # Shared input storage is not an allowed destructive eval destination.
+        invoke('safe_mutable_path "$ANN_DATA_ROOT/truth.bin"',
+               {"ANN_DATA_ROOT": str(root / "ann-data")}, success=False)
         fresh = root / "fresh"
         invoke("ivf_prepare_work_dir", {"EVAL_TEMPFILES": str(fresh)})
         work = fresh / "fixture/IVF/query"
@@ -96,6 +99,24 @@ def main():
                {"IVF_GT_FILE": "", "DESTINATION": str(derived), "MARKER": str(marker)})
         assert marker.read_text().splitlines() == [str(derived), "10", "--base_trunc", "80"]
         assert all(path.read_bytes() == b"unchanged source fixture" for path in (data, queries, truth))
+
+    # Producers and consumers for every runner use dataset/runner/workload.
+    for runner in ("BufANN", "DiskANN", "Greator", "OdinANN", "SPFresh"):
+        for workload in ("query", "insert", "delete", "update"):
+            for suffix in (".sh", "_prepare.sh"):
+                text = (args.repo / f"benchmark/{runner}/sift/{workload}{suffix}").read_text()
+                assert '/$DATASET/$BASELINE/$WORKLOAD' in text
+                assert '/${DATASET}-${WORKLOAD}-${BASELINE}"' not in text
+    # New profile defaults put both kinds of reusable artifact under ann-data.
+    result = subprocess.run(
+        ["bash", "-euc", 'source "$REPO_DIR/benchmark/datasets/sift100m.sh"; '
+         'printf "%s\\n" "$GT_BIN_KCACHED" "$PQ_PREFIX"'],
+        env={"PATH": os.environ["PATH"], "HOME": "/fixture-home", "REPO_DIR": str(args.repo),
+             "ANN_DATA_ROOT": "/shared/ann-data"}, text=True, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "/shared/ann-data/sift100m/groundtruth/sift100m_100000000_gt100.bin",
+        "/shared/ann-data/sift100m/pq/pq32-base90000000"]
     print("IVF shell selection, no-overwrite ownership, run tags and prefix-truth guards passed.")
 
 

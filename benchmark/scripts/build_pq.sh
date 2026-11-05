@@ -17,7 +17,7 @@ DATASET="$1"
 source "$REPO_DIR/benchmark/datasets/_load.sh"
 
 BIN="$REPO_DIR/baselines/DiskANN/build/tests"
-PREFIX="$DISKANN_INDEX_0P9B"
+PREFIX="$PQ_PREFIX"
 PQ_CHUNKS="${PQ_CHUNKS:-32}"
 PIVOTS="${PREFIX}_pq_pivots.bin"
 CODES="${PREFIX}_pq_compressed.bin"
@@ -27,7 +27,7 @@ ensure_dataset
    -x "$BIN/build_pq_codes_standalone" ]] || \
     error "PQ helpers are not built; run bash benchmark/scripts/build.sh first"
 [[ ! -e "$PIVOTS" && ! -e "$CODES" ]] || \
-    error "PQ output already exists under $PREFIX; remove it before rebuilding"
+    error "PQ output already exists under $PREFIX; reuse it or choose a fresh PQ_PREFIX"
 
 mkdir -p "$(dirname "$PREFIX")"
 note "Training $PQ_CHUNKS-chunk PQ pivots on all $NPTS_FULL vectors"

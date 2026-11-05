@@ -107,6 +107,8 @@ def main():
                 IVF_PQ_PREFIX=str(pq),
                 EVAL_TEMPFILES=str(root / "work"),
                 EVAL_CACHED=str(root / "cache"),
+                ANN_DATA_ROOT=str(root / "ann-data"),
+                GT_ARTIFACT_DIR=str(root / "ann-data" / dataset / "groundtruth"),
                 IVF_NLIST="1",
                 IVF_MAX_REPS="1",
                 IVF_BUILD_THREADS="1",
@@ -127,7 +129,7 @@ def main():
             )
             original = {p: digest(p) for p in (data, query, deep)}
             run(prepare, env)
-            work = Path(env["EVAL_TEMPFILES"]) / f"{dataset}/IVF/update"
+            work = Path(env["EVAL_TEMPFILES"]) / dataset / "IVF/update"
             assert json.loads((work / "mixed_prepared.json").read_text())["rounds"] == 2
             initial = {p: digest(p) for p in (work / "index").iterdir()}
             for scheduler in ("weighted", "fixed_8_8"):
@@ -209,7 +211,7 @@ def main():
             default_prepare_env.pop("IVF_RUN_TAG")
             default_prepare_env["EVAL_TEMPFILES"] = str(root / "default_prepare")
             run(prepare, default_prepare_env)
-            default_work = Path(default_prepare_env["EVAL_TEMPFILES"]) / f"{dataset}/IVF/update"
+            default_work = Path(default_prepare_env["EVAL_TEMPFILES"]) / dataset / "IVF/update"
             assert json.loads((default_work / "mixed_prepared.json").read_text())["rounds"] == 2
             assert (default_work / "prepared.json").is_file()
             run(execute, driven_env)

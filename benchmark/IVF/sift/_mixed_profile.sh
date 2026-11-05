@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DATASET="${DATASET:-sift1m}"
 WORKLOAD=update
-source "$REPO_DIR/benchmark/datasets/_load.sh"
-source "$REPO_DIR/benchmark/IVF/common.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_profile.sh"
 if [[ "${IVF_SCHEDULER:-update_driven}" == update_driven ]]; then
     [[ -z "${QUERY_RATIO:-}${QUERY_POINTS:-}${UPDATE_QUERY_BATCH:-}${IVF_SCHEDULER_SEED:-}" ]] || \
         error "update_driven searches until updates finish; unset query ratio/count/seed overrides or select a bounded scheduler"

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # Sequential IVF mutation profile arithmetic over source-row IDs.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DATASET="${DATASET:-sift1m}"
-source "$REPO_DIR/benchmark/datasets/_load.sh"
-source "$REPO_DIR/benchmark/IVF/common.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_profile.sh"
 UPDATE_PERCENT="${UPDATE_PERCENT:-10}"
 compute_split
 OVERRIDE="${INSERT_POINTS:-}"
