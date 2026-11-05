@@ -440,7 +440,7 @@ the call site rather than creating another orchestration layer:
 | `benchmark/IVF/settings.py` | Declared settings, admission and query flag formatting; callers validate warmup before any mutation |
 | `benchmark/IVF/harness.py` | Bundle ownership and common native-open arguments; sequential workload sequencing stays explicit |
 | `benchmark/IVF/common.sh` | Fresh work-directory claims, run-tag output selection and query/sequential prefix GT staging |
-| `benchmark/IVF/experiment.py` | Full-scale recipe settings, grid schedules, reuse/GT gates, deadlines and retained experiment evidence |
+| `benchmark/IVF/experiment.sh` | SIFT100M recipe settings, fixed grid loops, GT preflight and successful private-heap cleanup |
 | `benchmark/IVF/sift/_profile.sh` | Dataset/tool shell bootstrap; sequential and mixed arithmetic remain in separate profiles |
 | `benchmark/scripts/check_gt_coverage.py` | Ordered live-state plans, GT plane layout and cached-row scratch estimates |
 | `include/bufann/ivf_numeric_internal.h` | Unchecked ordered float ADC, double exact-L2 and distance/ID ordering; caller validation remains local |
@@ -471,15 +471,14 @@ You need sudo access, internet access and an AVX2-capable CPU.
 
 Prefer **16 physical CPU cores, 128–256 GB RAM and at least 1 TB free SSD space**.
 Index copies and retained checkpoints take much more space than the vector download
-(1.28 GB for SIFT10M; 12.8 GB for SIFT100M). The resource recommendation is
-for SIFT100M. Expect long-running jobs, especially training and mixed updates.
+(12.8 GB for SIFT100M). Expect long-running jobs, especially training and mixed updates.
 
-| Test | SIFT10M | SIFT100M |
-|---|---|---|
-| Query | 9M base, all 10,000 queries | 90M base, all 10,000 queries |
-| Insert | Insert 1M → 10M live | Insert 10M → 100M live |
-| Delete | Delete 1M → 8M live | Delete 10M → 80M live |
-| Mixed update | Insert 1M and delete 1M | Insert 10M and delete 10M |
+| Test | SIFT100M |
+|---|---|
+| Query | 90M base, all 10,000 queries |
+| Insert | Insert 10M → 100M live |
+| Delete | Delete 10M → 80M live |
+| Mixed update | Insert 10M and delete 10M |
 
 Run commands in order, in the **same Bash terminal**. Stop if any command fails.
 Use fresh paths rather than overwriting existing or failed runs.
@@ -553,14 +552,14 @@ These paths assume Ubuntu's packaged MKL layout.
 
 ## 3. Prepare the inputs once
 
-Choose either profile. This recipe takes the **first 10M or 100M uint8 vectors
+This recipe takes the **first 100M uint8 vectors
 from BIGANN/SIFT1B**, not a random sample. Other valid subsets can be supplied
 through the dataset profile; regenerate matching GT and PQ for their exact row
 order. 
 
 You'll want at least the eval and data drives to have significant disk space.
 
-Once generated, these artifacts could be uploaded and downloaded instead of regenerated. `DATASET=sift10m` is also valid.
+Once generated, these artifacts can be uploaded and downloaded instead of regenerated.
 ```bash
 export ANN_DATA_ROOT="$HOME/project/ann-data"
 export DATASET=sift100m
@@ -661,11 +660,13 @@ a separate tuning set before scoring them.
 For a **query-only grid over nlist, nprobe and router breadth**, use the
 [copyable SIFT100M wide-grid instructions](#quickstart-sift100m-wide-query-only-grid)
 **instead of this step** after completing steps 1–3. Both recipes use the checked-in
-`experiment.py` runner; this README is the only experiment document required.
+`experiment.sh` runner; this README is the only experiment document required.
 
-**Training limit:** SIFT100M uses **10 passes on all 90M base rows**, plus final
-assignment: 990M searches, below the native 1B guard. The default 15 passes would
-need 1.44B and fail; there is no environment override. SIFT10M fits with 15 passes.
+**Training limit:** the commands below explicitly use **10 passes on all 90M
+base rows**, plus final assignment: 990M searches, below the native 1B guard.
+The script defaults to 15 passes, preserving the chosen training default; on
+SIFT100M that needs 1.44B searches and fails the current guard. Set
+`IVF_MAX_REPS=10` as shown; no guard is disabled or bypassed.
 This guard applies to **LV+ as well as the other trainers**. These are fixed pass
 caps, not convergence-based stopping or paper-mandated iteration counts. Full
 training can be expensive; LV+ does not reduce the number of sampled rows here.
@@ -682,25 +683,27 @@ operation fits. Keep guards enabled and retain any subsequent work-limit failure
 export EVAL_TEMPFILES="$HOME/project/ann-eval/run01"  # must not exist
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
+export IVF_MAX_REPS=10
 export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
-unset IVF_GT_FILE IVF_GRID_DRY_RUN
-python3 benchmark/IVF/experiment.py --mode workloads --dry-run
+unset IVF_GT_FILE
+bash benchmark/IVF/experiment.sh workloads --dry-run
 ```
 
 Review the preview, then execute:
 
 ```bash
-python3 benchmark/IVF/experiment.py --mode workloads
+bash benchmark/IVF/experiment.sh workloads
 ```
 
-The full-scale preset validates the loaded profile and input shapes, checks GT,
+The SIFT100M runner checks the profile and shared GT,
 then prepares/runs **query, insert, delete, update**, stopping at the first failure.
 It clears stale count, scheduler-seed, run-tag and cost-model overrides. Effective
-settings are recorded in `plan.json`; subprocesses do not change your shell exports.
+settings are recorded in `settings.env`; subprocesses do not change your shell exports.
+The existing prepare/run scripts perform input, cache and native-result validation.
 
 | Recipe setting | Value |
 |---|---|
-| Training | Full-base LV+, 20 workers, seed 0; 10 passes for SIFT100M, 15 for SIFT10M |
+| Training | Full-base LV+, 20 workers, seed 0; `IVF_MAX_REPS=10` in these commands |
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
 | Workload search | nlist 200K, nprobe 64, router breadth 128, Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
@@ -708,11 +711,10 @@ settings are recorded in `plan.json`; subprocesses do not change your shell expo
 | Sequential insertion | 8 workers, staged inputs; override with `IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming` |
 | Warmup | 0 for workloads; 64 for grids, unless explicitly overridden |
 
-Resource and execution-policy exports above remain overridable. Training/search
-settings in this preset are fixed; use the individual workload scripts for other
-experiments. All recipes default to seven days total, one day per index/workload,
-and six hours per grid query pass. Set `IVF_GRID_{TOTAL,NLIST,QUERY}_TIMEOUT_S` or
-the corresponding `--*-timeout-s` options before execution to change those budgets.
+Resources, pass count and execution-policy exports above remain overridable.
+Other training/search settings are fixed; use the individual workload scripts for
+other experiments. `IVF_TIMEOUT_S` defaults to 86400 seconds **per script or GT
+command**, using GNU `timeout`. There are no total/per-index deadline managers.
 Check free space on both input and work/cache filesystems before starting.
 
 `ensure_gt.py` ignores nonexistent shell paths, finds
@@ -720,7 +722,7 @@ existing caches, and checks every query against every declared live population.
 It reuses a passing cache unchanged. Otherwise it recommends a sufficient depth,
 generates exact full-source GT with the existing helper, and checks the new file
 before returning its path. With no cache, it starts at K=1000; that is a starting
-depth, not a coverage guarantee. Pass `--no-generate-gt` to `experiment.py` to
+depth, not a coverage guarantee. Set `IVF_GENERATE_GT=0` for `experiment.sh` to
 check/recommend without permitting an exact scan. For custom GT plans, call
 `ensure_gt.py --help`; `--gt-generator` selects a helper and `--cached-gt` prefers
 an existing cache. `IVF_BUILD_DIR` supplies the default generator location.
@@ -779,7 +781,7 @@ frozen across updates; the execution controls do not change ANN search budgets.
 
 If selecting the optional staged-input policy, all requested insertion coordinates
 must pass memory admission before mutation. For this uint8/128D recipe the staged
-payload is 128 MB for SIFT10M's 1M inserts or 1.28 GB for SIFT100M's 10M inserts,
+payload is 1.28 GB for SIFT100M's 10M inserts,
 in addition to pool/list/router/worker memory. Its version-2 insertion timing
 excludes source loading; streaming version 1 includes worker reads. Do not compare
 the two foreground rates as an isolated worker speedup. Keep preparation and
@@ -794,8 +796,8 @@ Declare a fixed policy before evaluation; zero warmup is not a cold-cache guaran
 See [Insertion workers, input staging and same-process warmup](#insertion-workers-input-staging-and-same-process-warmup)
 for native options, failure behavior and matched-policy examples.
 
-These settings run **10 rounds**: each inserts/deletes 100K rows for SIFT10M or
-1M rows for SIFT100M. There is **no required query ratio or total query quota**.
+These settings run **10 rounds**, each inserting/deleting 1M rows.
+There is **no required query ratio or total query quota**.
 IVF's `update_driven` mode replays the query pool until all mutations complete,
 joins admitted queries, then scores all 10,000 queries after each round. Record
 the actual query count and overlap. This workload does not require reproducing
@@ -838,7 +840,7 @@ without changing the frozen settings:
 
 ```bash
 export EVAL_TEMPFILES="$HOME/project/ann-eval/run02"
-python3 benchmark/IVF/experiment.py --mode workloads
+bash benchmark/IVF/experiment.sh workloads
 ```
 
 Choose a new root for each repetition so preparation starts from the same IVF
@@ -895,23 +897,24 @@ their artifacts; cleanup never recursively removes directories.
 ## Wide-grid setup and preview
 
 Retain the verified `DATA_BIN`, `QUERY_BIN`, `IVF_PQ_PREFIX`, and `IVF_BUILD_DIR`
-from steps 1–3. Choose a fresh absolute work root. Default deadlines are seven days
-total, one day per index and six hours per query pass: budgets, **not completion estimates**.
+from steps 1–3. Choose a fresh absolute work root. Each command has a one-day
+timeout by default (`IVF_TIMEOUT_S`); the complete grid may take days.
 
 ```bash
 export DATASET=sift100m
 export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-wide-grid-01"  # must not exist
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
+export IVF_MAX_REPS=10
 export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
-unset IVF_GT_FILE IVF_GRID_DRY_RUN
-python3 benchmark/IVF/experiment.py --mode sift100m-wide --dry-run
+unset IVF_GT_FILE
+bash benchmark/IVF/experiment.sh sift100m-wide --dry-run
 ```
 
 Review the preview, then execute (this can take days):
 
 ```bash
-python3 benchmark/IVF/experiment.py --mode sift100m-wide
+bash benchmark/IVF/experiment.sh sift100m-wide
 ```
 
 ### Follow-up: reuse the first run and refine 100K-400K
@@ -919,7 +922,8 @@ python3 benchmark/IVF/experiment.py --mode sift100m-wide
 For a second, exploratory run after the wide grid, use the commands below instead
 of the wide-grid commands. Keep the previous run intact;
 successful private query heaps need not exist, but its prepared base indexes,
-`prepared.json` files, `plan.json`, and `selected_gt.txt` must still exist.
+`prepared.json` files and `selected_gt.txt` must still exist. Use the same verified
+source/query/PQ inputs and retain the original base bundles unchanged.
 
 ```bash
 export DATASET=sift100m
@@ -928,15 +932,16 @@ export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-refine-grid-01"  # fresh
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 # Keep the SAME DATA_BIN, QUERY_BIN, IVF_PQ_PREFIX and trained-base settings.
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
+export IVF_MAX_REPS=10
 export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
-unset IVF_GT_FILE IVF_GRID_DRY_RUN
-python3 benchmark/IVF/experiment.py --mode sift100m-refine --dry-run
+unset IVF_GT_FILE
+bash benchmark/IVF/experiment.sh sift100m-refine --dry-run
 ```
 
 Review the preview, then execute:
 
 ```bash
-python3 benchmark/IVF/experiment.py --mode sift100m-refine
+bash benchmark/IVF/experiment.sh sift100m-refine
 ```
 
 This mode executes **80 passes**, in nlist order **100K, 200K, 300K, 400K**:
@@ -973,7 +978,7 @@ their original settings and identities; their 3B allowance is not edited. All
 training guards remain enabled. Rebuild/restore is allowed only for the new 400K
 index; missing previous bases cause a failure, not an accidental retraining job.
 
-The new root holds `plan.json`, `results.csv`, logs, and `heap-cleanup.jsonl`.
+The new root holds `settings.env`, `grid.tsv`, `results.csv`, logs, and `heap-cleanup.log`.
 Use each CSV row's `output_dir` to find its native result: reused-index outputs
 are deliberately outside the new root. Successful private heaps are deleted as
 before, and originals/caches are preserved. This is post-observation exploratory
@@ -981,22 +986,20 @@ tuning, not an independent held-out validation of the original sweep.
 
 ### Runner options and retained evidence
 
-`python3 benchmark/IVF/experiment.py --help` lists the command-line interface.
-`--dry-run` prints the ordered schedule without reading inputs or creating paths.
-`--output` and `--previous-root` can replace `EVAL_TEMPFILES` and
-`IVF_GRID_PREVIOUS_ROOT`. Explicit CLI options win over environment defaults;
-the historical `IVF_GRID_MODE` and `IVF_GRID_DRY_RUN=0|1` exports still work.
+`bash benchmark/IVF/experiment.sh --help` shows the three supported recipes.
+The optional second argument `--dry-run` previews the schedule without reading
+inputs or creating paths. Paths and resources use environment variables, like the
+BufANN/SPFresh scripts. There are no legacy modes, compatibility options, nested
+deadline controllers or extra JSON plan/summary formats. No grid includes nlist 1M.
 
-The runner owns profile/GT gates, deadline handling, plan/phase receipts, CSV
-validation and successful private-heap cleanup. Individual workload scripts still
-own preparation and execution; none is parsed from Markdown. `coarse` and
-`expanded` remain available for the older 24/100-pass schedules (with shorter
-6h/2h/15m default budgets). No mode includes nlist 1M.
-
-Keep `plan.json`, `phases.jsonl`, `results.csv`, `summary.json`, `selected_gt.txt`
-and logs. Failures retain partial evidence and write `failure.json`; rerun into a
-new root, not over an incomplete one. Freeze the plan and warmup policy before
-evaluation. No separate grid guide or generated script is needed.
+Keep `settings.env`, `grid.tsv`, `results.csv`, `selected_gt.txt` and logs. The CSV
+contains native nlist/probe/breadth, Recall@10, QPS, query time and output path.
+Native `result.json` and `execution_protocol.json` remain in each run directory.
+The runner stops on failure and preserves its files; inspect the last command's
+log and retry in a fresh root. It checks previous `prepared.json` files exist;
+you are responsible for choosing matching previous experiment inputs/settings.
+The lower-level harness still verifies prepared query/GT/index identities.
+Freeze the settings and warmup policy before evaluation.
 
 ### Investigating the approximately 99.559% recall ceiling
 
@@ -1059,7 +1062,7 @@ This audits existing GT; it does not establish its correctness by recomputation.
 #### Second: bounded all-lists/vector-rerank diagnostic
 
 This is **optional**, separate from the 80-point grid, and deliberately varies
-vector rerank factor as a diagnostic rather than as the paper-aligned main
+vector rerank factor as a diagnostic rather than as the fixed-factor main
 configuration. It reuses the old 100-list base and existing deeper GT. It searches
 the first 256 queries at **nprobe=100**, returning the top ten after fetching 30,
 100, or 300 PQ candidates. Probing all lists bypasses approximate centroid

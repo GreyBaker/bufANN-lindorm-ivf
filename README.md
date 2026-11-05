@@ -26,7 +26,7 @@ Datasets usually come in two dominant formats: the `.fvecs` or `.bvecs` format, 
 
 For SIFT1M, set `DATA_FVECS` and `QUERY_FVECS` to the downloaded `sift_base.fvecs` and `sift_query.fvecs` files. The scripts convert them to float `.bin` files when needed.
 
-For SIFT10M and SIFT100M, create your own sample from SIFT1B and supply the resulting `.bin` file.
+For SIFT100M, create your own sample from SIFT1B and supply the resulting `.bin` file.
 
 The first `NPTS_BASE` vectors form the initial index. The remaining `UPDATE_POINTS` vectors are reserved for insertion and mixed-update workloads. Verify that `DATA_TYPE`, `DIM`, `NPTS_FULL`, `NPTS_BASE`, and `UPDATE_POINTS` match the configured files.
 

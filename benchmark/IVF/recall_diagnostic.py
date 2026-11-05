@@ -2,6 +2,7 @@
 """Bounded SIFT100M all-lists/vector-rerank diagnostic; no training or GT generation."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import signal
@@ -10,7 +11,6 @@ import sys
 
 from audit_recall import audit
 from common import digest, execute, flags, header, positive, read_json, require, require_absent, write_json
-from experiment import cleanup_private_query_heaps, interrupted, selected_gt
 
 
 def query_prefix(source, output, count):
@@ -36,7 +36,8 @@ def run(args):
     require(args.driver.is_file() and os.access(args.driver, os.X_OK), "missing native IVF driver")
     require(1 <= args.query_count <= 10000, "diagnostic query count must be in [1, 10000]")
     header(args.query, "uint8", 10000, 128)
-    truth = Path(selected_gt(previous / "selected_gt.txt"))
+    truth = Path((previous / "selected_gt.txt").read_text().strip())
+    require(truth.is_file(), "missing selected GT binary")
     args.output.mkdir(parents=True, exist_ok=False)
     subset = args.output / f"query{args.query_count}.bin"
     query_prefix(args.query, subset, args.query_count)
@@ -62,7 +63,12 @@ def run(args):
         report = audit(truth, folder / "neighbors.bin", 90000000, k=10, query_offset=0)
         report.update(deep_gt=str(truth.resolve()), results=str((folder / "neighbors.bin").resolve()))
         write_json(folder / "audit.json", report)
-        cleanup_private_query_heaps(args.output, folder, f"rf{factor}")
+        for name in ("query.heap", "query.heap.pq.bin"):
+            heap = folder / name
+            size = heap.stat().st_size
+            heap.unlink()
+            with (args.output / "heap-cleanup.jsonl").open("a") as log:
+                log.write(json.dumps(dict(phase=f"rf{factor}", path=str(heap), bytes=size, deleted=True)) + "\n")
         print(f"rf{factor}: {folder / 'audit.json'}", flush=True)
 
 
@@ -81,6 +87,10 @@ def main():
         run(args)
     except (OSError, ValueError) as error:
         p.exit(1, f"ERROR: {error}\n")
+
+
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 if __name__ == "__main__":

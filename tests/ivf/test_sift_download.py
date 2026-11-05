@@ -110,7 +110,7 @@ class DownloadTests(unittest.TestCase):
         argv = [
             "download_sift.py",
             "--rows",
-            "10000000",
+            "100000000",
             "--base",
             str(base),
             "--query",
@@ -130,7 +130,7 @@ class DownloadTests(unittest.TestCase):
         argv = [
             "download_sift.py",
             "--rows",
-            "10000000",
+            "100000000",
             "--base",
             str(self.path),
             "--query",
@@ -157,7 +157,7 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(self.path.is_symlink())
 
     def test_cli_profiles(self):
-        for rows in (10_000_000, 100_000_000):
+        for rows in (100_000_000,):
             base, query = self.path.parent / "base.bin", self.path.parent / "query.bin"
             argv = [
                 "download_sift.py",
@@ -176,22 +176,16 @@ class DownloadTests(unittest.TestCase):
                 query_download.assert_called_once_with(query)
 
     def test_invalid_rows(self):
-        argv = [
-            "download_sift.py",
-            "--rows",
-            "3",
-            "--base",
-            str(self.path),
-            "--query",
-            str(self.path.parent / "query.bin"),
-        ]
-        with patch.object(sys, "argv", argv), patch.object(
-            download.urllib.request, "urlopen"
-        ) as request:
-            with self.assertRaises(SystemExit) as refused:
-                download.main()
-            self.assertEqual(refused.exception.code, 2)
-            request.assert_not_called()
+        for rows in (3, 10_000_000):
+            argv = ["download_sift.py", "--rows", str(rows), "--base", str(self.path),
+                    "--query", str(self.path.parent / "query.bin")]
+            with patch.object(sys, "argv", argv), patch.object(
+                download.urllib.request, "urlopen"
+            ) as request:
+                with self.assertRaises(SystemExit) as refused:
+                    download.main()
+                self.assertEqual(refused.exception.code, 2)
+                request.assert_not_called()
         self.assertFalse(self.path.exists())
 
 

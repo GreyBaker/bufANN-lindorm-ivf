@@ -167,6 +167,10 @@ if(IVF_BUILD_CONTRACT_TESTS)
         add_test(NAME ivf_prepare_guards
                  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_prepare_guards.py"
                          --repo "${IVF_ROOT}")
+        add_test(NAME ivf_experiment_script
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_experiment.py"
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/experiment_fixtures")
+        set_tests_properties(ivf_experiment_script PROPERTIES TIMEOUT 240)
     endif()
     add_test(NAME ivf_shared_orchestration
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_orchestration.py"

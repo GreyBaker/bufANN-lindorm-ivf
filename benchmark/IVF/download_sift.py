@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download an IVF SIFT prefix and public queries; never overwrite or resume."""
+"""Download SIFT100M and public queries; never overwrite or resume."""
 
 import argparse
 from pathlib import Path
@@ -57,7 +57,7 @@ def download_queries(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, choices=(10_000_000, 100_000_000), required=True)
+    parser.add_argument("--rows", type=int, choices=(100_000_000,), default=100_000_000)
     parser.add_argument("--base", type=Path, required=True)
     parser.add_argument("--query", type=Path, required=True)
     args = parser.parse_args()
