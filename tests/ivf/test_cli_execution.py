@@ -46,15 +46,13 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
                 workload,
                 "--private_heap_path",
                 str(private),
-                "--checkpoint_prefix",
-                str(saved),
             ]
             + list(extra),
             saved,
             private,
         )
 
-    def search(saved, live):
+    def search(workload, live, extra):
         nonlocal counter
         counter += 1
         truth = root / f"{dtype}_updated_{counter}.gt"
@@ -67,21 +65,7 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
         ]
         write_truth(truth, oracle)
         result = root / f"{dtype}_updated_{counter}.bin"
-        record = run(
-            [
-                args.driver,
-                "--validate_inputs",
-                "0",
-                "--data_type",
-                dtype,
-                "--index_prefix",
-                str(saved),
-                "--index_format",
-                "mutable",
-                "--private_heap_path",
-                str(root / f"{dtype}_query_{counter}.heap"),
-                "--workload",
-                "search_only",
+        cmd, saved, private = command(workload, list(extra) + [
                 "--query_file",
                 str(query),
                 "--gt_file",
@@ -94,14 +78,14 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
                 "8",
                 "--query_threads",
                 "2",
-                "--buffer_frames",
-                "4",
                 "--search_result_file",
                 str(result),
-            ],
-            "query",
-        )
+            ])
+        record = run(cmd, "query")
         assert record["recall"] == 100 and record["live_count"] == len(live)
+        assert record["writeback_dirty_pages_after"] == 0 and record["update_protocol_version"] == 4
+        assert not Path(str(saved) + ".manifest").exists()
+        assert not Path(str(private) + ".meta").exists()
         assert read_results(result) == [[row[0]] for row in oracle]
         scorer = Path(__file__).resolve().parents[2] / "benchmark/SPFresh/utils.py"
         scored = subprocess.run(
@@ -126,7 +110,7 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
     record = run(cmd, "insert")
     assert record["insert_count"] == 1 and record["delete_count"] == 0 and record["live_count"] == 4
     assert record["mutation_workers"] == 1 and record["insert_qps"] > 0 and "recall" not in record
-    search(inserted, range(4))
+    search("insert_then_search", range(4), ["--insert_ids_file", str(insert_ids)])
     cmd, deleted, _ = command("delete_only", ["--delete_ids_file", str(delete_ids)])
     record = run(cmd, "delete")
     assert (
@@ -134,15 +118,24 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
         and record["retained_heap_records"] == 3
         and record["live_count"] == 2
     )
-    search(deleted, range(2))
-    # Repeat a committed deletion after reopening: counted idempotent no-op.
-    cmd, repeated, _ = command(
-        "delete_only", ["--delete_ids_file", str(delete_ids), "--index_format", "mutable"]
-    )
-    cmd[cmd.index("--index_prefix") + 1] = str(deleted)
-    record = run(cmd, "delete")
-    assert record["delete_count"] == 0 and record["missing_delete_count"] == 1
-    search(repeated, range(2))
+    search("delete_then_search", range(2), ["--delete_ids_file", str(delete_ids)])
+    # Legacy mutable format and checkpoint CLI are explicitly unsupported.
+    for extra in (["--index_format", "mutable"], ["--checkpoint_prefix", str(deleted)]):
+        cmd, _, private = command("delete_only", ["--delete_ids_file", str(delete_ids)] + extra)
+        run(cmd)
+        assert not private.exists()
+    for version in (1, 2):
+        legacy = root / f"{dtype}_historical_mutable_{version}"
+        artifacts = {Path(str(legacy) + suffix): raw for suffix, raw in (
+            (".manifest", f"IVFMUTABLE{version} 2 3\n".encode()),
+            (".mlists", b"historical postings"), (".heap.state", b"historical ledger"))}
+        for path, raw in artifacts.items():
+            path.write_bytes(raw)
+        cmd, _, private = command("delete_only", ["--delete_ids_file", str(delete_ids)])
+        cmd[cmd.index("--index_prefix") + 1] = str(legacy)
+        failed = run(cmd)
+        assert "Unsupported IVF index version" in failed.stderr and not private.exists()
+        assert all(path.read_bytes() == raw for path, raw in artifacts.items())
     # Compose sequential updates with post-update query; one canonical record.
     oracle = [
         sorted(
@@ -185,7 +178,8 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
         and record["recall"] == 100
         and read_results(result) == [[row[0]] for row in oracle]
     )
-    search(combined, [0, 1, 3])
+    assert record["writeback_dirty_pages_after"] == 0
+    assert not Path(str(combined) + ".manifest").exists()
     # Invalid/framing/duplicate/live/no-reuse/source/output refusals do not publish success.
     bad_ids = root / f"{dtype}_bad.ids"
     for payload in (
@@ -225,9 +219,9 @@ def mutation_fixtures(args, root, dtype, prefix, data, query, vectors, queries):
     run(cmd)
     assert not private.exists() and not Path(str(saved) + ".manifest").exists()
     cmd, saved, private = command("insert_only", ["--insert_ids_file", str(insert_ids)])
-    Path(str(saved) + ".heap").symlink_to(Path(str(prefix) + ".heap"))
+    private.symlink_to(Path(str(prefix) + ".heap"))
     run(cmd)
-    assert not private.exists() and not Path(str(saved) + ".manifest").exists()
+    assert private.is_symlink() and not Path(str(saved) + ".manifest").exists()
     cmd, saved, private = command("insert_only", ["--insert_ids_file", str(insert_ids)])
     Path(str(private) + ".pq.bin").write_bytes(b"existing")
     run(cmd)

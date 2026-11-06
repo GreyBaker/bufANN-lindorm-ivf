@@ -36,7 +36,7 @@ def fixture(args, root, dtype, fmt):
             cmd += ["--warmup_queries", str(warmups)]
         if update:
             cmd += ["--full_data_file", str(data), "--insert_ids_file", str(insert_ids), "--delete_ids_file", str(delete_ids),
-                    "--private_heap_path", str(private), "--checkpoint_prefix", str(saved), "--insert_threads", "8",
+                     "--private_heap_path", str(private), "--insert_threads", "8",
                     "--insert_input_policy", "staged"]
         elif origin != prefix:
             cmd += ["--index_format", "mutable", "--private_heap_path", str(private)]
@@ -88,15 +88,16 @@ def fixture(args, root, dtype, fmt):
         record = run(cmd, "query")
         check(record, count)
         assert record["insert_count"] == 56 and record["delete_count"] == 1
-        assert "same_process_live_mutable_session_after_checkpoint_no_reopen" in record["query_cache_process_policy"]
+        assert "same_process_live_mutable_session_after_writeback_no_reopen" in record["query_cache_process_policy"]
+        assert record["writeback_dirty_pages_after"] == 0
         assert read_results(output) == [row[:4] for row in gold]
         updated_first = output.read_bytes() if updated_first is None else updated_first
         assert output.read_bytes() == updated_first
-        reopen, output, _, _, _, gold = command(count, origin=saved, live=range(1, 64))
-        record = run(reopen, "query")
-        check(record, count)
-        assert record["query_cache_process_policy"].startswith("private_mutable_copy")
-        assert read_results(output) == [row[:4] for row in gold]
+        assert not Path(str(saved) + ".manifest").exists()
+        reopen, output, result, _, private, _ = command(count, origin=saved, live=range(1, 64))
+        failed = run(reopen)
+        assert "mutable checkpoint loading was removed" in failed.stderr
+        assert not output.exists() and not result.exists() and not private.exists()
     for count in (-1, 100001, "invalid"):
         cmd, output, result, _, private, _ = command(count)
         run(cmd)
@@ -120,7 +121,7 @@ def main():
     root = attempt(args.scratch)
     for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
         fixture(args, root, dtype, fmt)
-    print("Warmup zero/positive controls, full exact query population, checkpoint/reopen, timing and memory refusals passed")
+    print("Warmup controls, same-session writeback/scoring, removed-reopen and memory refusals passed")
 
 
 if __name__ == "__main__":

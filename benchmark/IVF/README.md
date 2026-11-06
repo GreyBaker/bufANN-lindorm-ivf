@@ -123,9 +123,11 @@ it does not change CLI/harness defaults. See the ablation settings below for oth
 training and router choices. The full-scale quickstart handles SIFT100M's pass cap.
 
 Work files live in `eval_tempfiles/<dataset>/IVF/<workload>/`; reusable immutable
-bundles live in `eval_cached/<dataset>/IVF/`. Runs retain logs, `result.json` and
-`neighbors.bin`; mutations also retain `mutation_result.json`,
-and mixed runs retain per-round results and a summary. Cache hits restore a build;
+bundles live in `eval_cached/<dataset>/IVF/`. Runs retain logs, one native
+`result.json` and `neighbors.bin`; mixed runs also retain per-round accounting
+and a summary. Sequential mutation and scoring share one process/session, with
+separately measured final page writeback, not an updated-index export.
+Cache hits restore a build;
 they do not measure a new one. Source, settings and tool identities are checked.
 
 Existing paths, including failed runs, are not overwritten. Use a fresh
@@ -140,7 +142,7 @@ change source-row IDs, mutation volumes, ANN candidate budgets or final queries.
 
 | Shell setting | Native driver option | Default | Supported scope |
 |---|---|---|---|
-| `IVF_INSERT_THREADS=1..256` | `--insert_threads N` | `1` | Sequential `insert_only`/`search_after_update`; effective workers are capped by insert count |
+| `IVF_INSERT_THREADS=1..256` | `--insert_threads N` | `1` | Sequential `insert_only`/`insert_then_search`/`search_after_update`; effective workers are capped by insert count |
 | `IVF_INSERT_INPUT_POLICY=streaming\|staged` | `--insert_input_policy POLICY` | `streaming` | Sequential insertion only; mixed input staging is separate and unchanged |
 | `IVF_WARMUP_QUERIES=0..100000` | `--warmup_queries N` | `0` | Query-producing calls; once before the continuous workload in mixed runs |
 
@@ -160,23 +162,54 @@ calls. The shell harnesses ignore insertion settings outside sequential insertio
   stacks, lists and pool admission—not a total-RSS estimate. Version `2` excludes
   source-row loading from `insert_time_s`, while heap I/O, publication, worker
   launch/join and periodic progress remain included. Full-source before/after
-  integrity checks and a separate verified checkpoint are retained.
+  integrity checks and a separately measured final writeback are retained.
 - **Failures:** all insertion threads launch behind an admission gate. A callback
   or launch failure stops new admission and joins admitted work before rethrowing;
-  a partial mutation workload publishes no successful checkpoint/result. Its owned
+  a partial mutation workload publishes no successful result. Its owned
   heap and failed evidence are retained rather than repaired or overwritten.
 - **Warmup:** inputs come only from frozen base-trained full-coordinate centroids,
   using `floor(i * nlist / requested)` (`frozen_base_centroid_grid_v1`). Integer
   dtypes round halves away from zero and clamp to their range. No final queries or
   GT select the inputs. Every requested warmup executes, even when centroid IDs
   repeat. Warmup is serial on the caller, on the same index object as timed queries,
-   after mutation/checkpoint for sequential workloads, but before all mixed rounds.
+   after mutation/writeback for sequential workloads, but before all mixed rounds.
    Its results are discarded, never
   scored/exported or counted in final query statistics or mixed foreground counts.
   It has its own `warmup_time_s`, outside `query_time_s` but inside driver workflow
   wall time. New query workers do not inherit caller TLS; this is not an OS-cache,
   whole-pool warming or representative-sampling guarantee. A warmup failure prevents
-  final query success output; an already completed checkpoint is preserved.
+  final query success output; the owned private heap and logs are preserved.
+
+### Writeback-only mutable sessions
+
+Only prepared immutable bases can be saved/loaded. Updated sessions are disposable:
+there is no mutable checkpoint export/reopen API, `--checkpoint_prefix`, or
+`--index_format mutable` input. Historical checkpoints are neither loaded nor deleted.
+Native `insert_then_search` and `delete_then_search` combine mutation and scoring;
+`search_after_update` retains sequential delete-plus-insert support. Mutation-only
+`insert_only`/`delete_only` also finish with writeback but cannot be reopened.
+
+After foreground workers join, `MutableIndex::writeback` takes exclusive lifecycle
+admission and drains dirty heap pages in batches of at most 32. Normal dirty eviction
+remains inside foreground timing. Writeback does not copy/hash the index, save
+posting lists or liveness/allocation metadata, issue `fsync`, or acknowledge a WAL
+commit. Page bytes alone cannot restart the updated index. Immutable preparation
+and BufANN's shared snapshot facility are unchanged.
+
+`update_protocol_version=4` reports `writeback_time_s`,
+`writeback_workspace_bytes`, `writeback_heap_page_writes`,
+`writeback_heap_flush_bytes`, and `writeback_dirty_pages_before/after`.
+Foreground counters are captured before writeback; final stable-state scoring
+follows writeback on the same index/pool. Sequential centroid warmup, when selected,
+occurs between writeback and scoring; mixed warmup remains before all rounds.
+Writeback/scoring are outside mutation and mixed foreground time but inside total
+workflow time. These are warm shared-session/cache measurements, not cold-device
+results. Sequential harness runs use the smaller declared mutation/query memory
+budget and the shared frame count for the entire session.
+
+A short/failed page write poisons the session and prevents root success/neighbors.
+Completed mixed round accounting and failed logs/heaps remain partial evidence,
+not a completed run or recoverable index.
 
 After preparing an independent insert work tree, optional controls can use fresh
 tags. Declare them before evaluation; do not select workers or warmup counts by
@@ -361,11 +394,11 @@ matched-recall baseline comparisons.
   storage, tool/runtime and OpenMP/MKL settings; advance `IVF_CACHE_TAG` or change
   cache roots after untracked environment changes.
 - Timeouts retain partial evidence; failed gates exit nonzero. No resume or crash
-  recovery is provided. Checkpoints require joined workers and are not durable
-  transactions; deleted IDs cannot be reused.
+  recovery is provided. Final writeback requires joined workers and is not a durable
+  transaction; deleted IDs cannot be reused.
 - Heap writes retain direct I/O, use aligned page snapshots and require complete
   page writes. A failed/short write makes that session unusable and prevents a
-  successful checkpoint; it is not automatically repaired. If a slot mismatch
+  successful completion; it is not automatically repaired. If a slot mismatch
   is confirmed by a read-only inspection of the heap, preserve the failed
   artifacts and reconstruct into fresh work/cache roots after fixing the cause.
   Rebuilding the driver does not repair an already inconsistent heap.
@@ -387,7 +420,7 @@ matched-recall baseline comparisons.
   capped at 256. Pins release before admission credits. Tiny/skewed pools stay
   bounded, but admission/lock contention can reduce high-worker warm-cache
   throughput; this is not a universal concurrency speedup. Terminal read/AIO
-  failures poison the heap/pool, wake admission waiters and refuse checkpoints;
+  failures poison the heap/pool, wake admission waiters and refuse further work;
   strict full-read/completion validation does not apply a blanket behavior change
   to unrelated legacy readers.
 - `fetch_adapter_mutex_wait_us_total`, `fetch_pin_admission_wait_us_total` and
@@ -429,6 +462,8 @@ that enforces strict write alignment even on permissive filesystems. It checks
 eviction, explicit/background flushing, reopen, failed-checkpoint admission,
 write errors, short writes and interruption retries without requiring an ext3
 server. These fixtures do not establish crash durability or full-scale results.
+`ivf_writeback_cli` additionally injects short/failed final page writes into private
+IVF heaps and checks mutation-only, sequential scoring and mixed failure publication.
 
 ### Maintaining shared code without merging different contracts
 
@@ -449,7 +484,7 @@ the call site rather than creating another orchestration layer:
 | `src/bufann/ivf_artifacts.cpp` | Byte-copy mechanics; callers still own claims, stream checks, close and independent verification |
 | `src/bufann/ivf_index.cpp` | Ordered component digest operations below each manifest family's explicit schema |
 | `tests/ivf_training_settings.h` | Identical build/calibration training-option parsing; diagnostic defaults remain separate |
-| `tests/ivf_cli_execution.cpp` | Native checkpoint progress, counter snapshots and timing shared by sequential/mixed updates |
+| `tests/ivf_cli_execution.cpp` | Native writeback progress, counter snapshots and timing shared by sequential/mixed updates |
 | `tests/ivf/ivf_test_support.py` | Test-only binary framing and shared synthetic populations, with no import-time I/O or production oracle dependency |
 
 Some apparent repetition is intentional. Do not merge immutable/mutable visibility
@@ -471,7 +506,7 @@ SPFresh is tested through its pre-existing infrastructure, not this guide.
 You need sudo access, internet access and an AVX2-capable CPU.
 
 Prefer **16 physical CPU cores, 128–256 GB RAM and at least 1 TB free SSD space**.
-Index copies and retained checkpoints take much more space than the vector download
+Index copies and retained private heaps take much more space than the vector download
 (12.8 GB for SIFT100M). Expect long-running jobs, especially training and mixed updates.
 
 | Test | SIFT100M |
@@ -785,7 +820,7 @@ payload is 1.28 GB for SIFT100M's 10M inserts,
 in addition to pool/list/router/worker memory. Its version-2 insertion timing
 excludes source loading; streaming version 1 includes worker reads. Do not compare
 the two foreground rates as an isolated worker speedup. Keep preparation and
-checkpoint costs alongside mutation throughput.
+writeback costs alongside mutation throughput.
 
 `IVF_WARMUP_QUERIES=64`, if explicitly selected, runs 64 serial frozen-centroid
 queries on the same index object before the timed final pass for sequential/query
@@ -793,7 +828,7 @@ runs. In mixed runs it instead executes once before the continuous workload.
 It uses neither
 final queries nor GT, discards results and reports separate warmup time. It does
 not count toward the 10,000 scored queries or mixed foreground queries, and does
-not transfer an application cache between the mutation and query processes.
+not require a separate query process: mutation, writeback and scoring share the pool.
 Declare a fixed policy before evaluation; zero warmup is not a cold-cache guarantee.
 See [Insertion workers, input staging and same-process warmup](#insertion-workers-input-staging-and-same-process-warmup)
 for native options, failure behavior and matched-policy examples.
@@ -817,18 +852,17 @@ Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
 `delete/` and `update/`.
 Retain logs, structured results and input identities.
 For sequential/query runs, inspect `execution_protocol.json` for the declared
-input/worker/warmup policy and separate process wall costs; `result.json` retains
-the native scored-query metrics unchanged. Mutation completion costs live in
-`mutation_result.json`. The driver writes these metrics directly; no duplicate
+input/worker/warmup policy and native process wall cost (protocol version 2);
+`result.json` retains the native query, mutation and writeback metrics unchanged.
+The driver writes these metrics directly; no duplicate
 native/extracted JSON files are produced. Mixed runs retain
 `rounds/round_<r>.json` accounting records (no intermediate recall), one native
 root `result.json`, final `neighbors.bin`, one private heap, `round_schedule.txt`,
 `run.log`, and a version-3 `summary.json`. Query attribution to rounds is by
 completion, including queries crossing a boundary. `mixed_wall_s` is the single
 continuous interval, not summed worker time. Root final-pass `query_qps` is not
-concurrent foreground QPS. No mutable checkpoint is created by mixed execution;
-sequential checkpoint APIs remain pending the next implementation phase. Keep failed logs and
-owned heaps; a failed mutation session must not be checkpointed or reused.
+concurrent foreground QPS. No workload creates a mutable checkpoint. Keep failed
+logs and owned heaps; a failed mutation session must not be reused.
 
 For three query repetitions at the same frozen settings:
 

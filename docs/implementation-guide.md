@@ -10,7 +10,7 @@ The most consequential departures are:
 2. **Global, non-residual PQ8 with a scalar scanner:** not the paper's evaluated four-bit SIMD scanning configuration; RaBitQ is absent.
 3. **Explicit interpretations of underspecified training details:** fixed iteration counts, deterministic sampling/reduction, initial-only refinement, and PCA refitting between assignments.
 4. **A controlled HNSW implementation and ablation suite:** checksum-pinned stock hnswlib plus a separately maintained modified variant, rather than the paper's Faiss comparison.
-5. **In-process publication safety and clean checkpoints, not WAL-backed commits:** update visibility is carefully ordered, but there is no crash recovery or durable transaction protocol.
+5. **In-process publication safety and page writeback, not WAL-backed commits:** update visibility is carefully ordered, but updated sessions cannot be exported/reopened and there is no crash recovery or durable transaction protocol.
 6. **Engineering beyond description:** bounded buffer-pin admission, page-local allocation, failure poisoning, artifact identity checks, resource guards, and explicit measurement contracts.
 
 ## 1. System boundary and component architecture
@@ -28,7 +28,7 @@ MutableIndex<T>
   ├─ frozen router and PQ
   ├─ MutablePostingLists  per-list locks, capacity and ID states
   ├─ private writable coordinate heap and logical-state ledger
-  └─ lifecycle admission, checkpoint composition and failure state
+  └─ lifecycle admission, bounded page writeback and failure state
 ```
 
 The implementation uses C++ templates for float32, int8, and uint8 coordinates. Centroids are float32 even when database coordinates are integers. The supported index metric is squared Euclidean distance; the presence of other metrics elsewhere in the inherited repository does not make them IVF features.
@@ -280,7 +280,7 @@ The conservative bound assumes all requests might hit one shard. It bounds aggre
 
 The scoped IVF backend path checks complete reads/AIO completions and aligned full-page writes, including eviction and flush paths. Short writes fail; interruptions are retried where implemented. Aligned page snapshots avoid depending on an ordinary byte vector satisfying direct-I/O alignment.
 
-Terminal heap/pool failures poison the session and admission mechanism, wake waiters, and prevent a later successful checkpoint. This does not provide crash durability or silently repair an inconsistent artifact. These protections are scoped to the IVF path, not a blanket claim about every inherited reader.
+Terminal heap/pool failures poison the session and admission mechanism, wake waiters, and prevent successful completion or further work. This does not provide crash durability or silently repair an inconsistent artifact. These protections are scoped to the IVF path, not a blanket claim about every inherited reader.
 
 **Sources:** [`ivf_heap.cpp`](../src/bufann/ivf_heap.cpp), [`ivf_pin_admission.h`](../include/bufann/ivf_pin_admission.h), [`exact_aio.h`](../include/bufann/exact_aio.h), [`inplace_backend.h`](../include/bufann/inplace_backend.h), [`inplace_backend.cpp`](../src/bufann/inplace_backend.cpp).
 
@@ -331,7 +331,7 @@ Centroids, final graphs, PCA, and PQ stay frozen across updates. There is no ada
 
 ## 10. Concurrency and consistency: safe overlap without snapshot isolation
 
-Ordinary mutable queries and mutations take shared lifecycle admission; checkpointing takes it exclusively. Each list scan holds that list's shared lock for its full scan; growth and deletion need its exclusive lock. Lists are scanned independently, not under one collection-wide read lock.
+Ordinary mutable queries and mutations take shared lifecycle admission; writeback takes it exclusively. Each list scan holds that list's shared lock for its full scan; growth and deletion need its exclusive lock. Lists are scanned independently, not under one collection-wide read lock.
 
 Therefore a query can observe different lists at different times. Insertions after a list's scan may be missed. Deletion can invalidate a retained PQ candidate before reranking. The code checks candidate membership before fetching, after fetching, and when filtering sorted exact hits. Stale candidates are dropped **without rescanning or refilling**, so fewer than k hits may remain. A deletion can still overlap the final liveness check and return.
 
@@ -361,15 +361,15 @@ The paper persists index metadata/codes through wide tables (§3.4); this implem
 
 ### Mutation never writes into a reusable immutable source
 
-`fork` validates the base and makes real private copies of its heap and PQ sidecar. Frozen router/PQ objects are reused in memory where appropriate, while immutable CSR lists become mutable lists. Reopening a mutable checkpoint similarly creates a new private writable heap. This isolates runs and prevents shared-cache corruption; it is not zero-copy cloning or a distributed shared-storage implementation.
+`fork` validates the base and makes real private copies of its heap and PQ sidecar. Frozen router/PQ objects are reused in memory where appropriate, while immutable CSR lists become mutable lists. This isolates runs and prevents shared-cache corruption; it is not zero-copy cloning or a distributed shared-storage implementation.
 
-Mutable checkpoints add `.mlists`, `.heap.state`, and `.origin`. Under exclusive lifecycle admission they require no pending reservations and matching heap/list live and tombstone state. They flush and write a **fresh immutable checkpoint family**; the current session remains writable afterward. Reopen validates retained physical records, metadata/bitmaps/locators, coordinates and padding, logical state, and unchanged frozen router/PQ identities. Deleted/aborted records persist across reopening.
+Mutable checkpoint export/reopen APIs, posting-list/heap-ledger formats and CLI options have been removed. Historical artifacts are preserved, not migrated or loaded. `MutableIndex::writeback` instead takes exclusive lifecycle admission, checks health, workspace, pending reservations and heap/list live-count consistency, then drains dirty heap pages in batches of at most 32. Its scratch estimate is `65536 + 32 * (page_size + 64)` bytes, independent of the full buffer-pool size. It exports no metadata, copies/hashes no index family, and does not issue `fsync`. The session remains writable after a successful drain; a failed/short write poisons it. Written coordinate pages cannot recover postings, logical liveness or complete allocation state. Immutable base save/load and shared `InPlaceGraphStore` snapshot facilities remain intact.
 
-### Manifest-last is not a transaction
+### Immutable publication and mutable writeback are not transactions
 
-Output paths are freshly/exclusively claimed and existing files are refused. A completed manifest is written last, but publication is not an atomic rename/fsync transaction. Partial files and failed evidence are retained. There is no WAL, rollback, automatic recovery, interrupted-run resume, or crash-safe generation switch.
+Output paths are freshly/exclusively claimed and existing files are refused. An immutable preparation manifest is written last, but publication is not an atomic rename/fsync transaction. Partial files and failed evidence are retained. There is no WAL, rollback, automatic recovery, interrupted-run resume, or crash-safe generation switch.
 
-This is the largest correctness-contract difference from paper §4.4: Lindorm commits only after data/index WAL persistence; this engine publishes in-process visibility and later creates clean checkpoints. Successful insertion must not be described as crash-durable insertion. Flush/storage failure poisons a session; a later output-copy failure can leave a partial checkpoint without necessarily invalidating an otherwise healthy session.
+This is the largest correctness-contract difference from paper §4.4: Lindorm commits only after data/index WAL persistence; this engine publishes in-process visibility and separately writes back dirty pages. Successful insertion or writeback must not be described as a crash-durable commit. Repository BufANN likewise flushes pages without saving updated metadata at workload completion; repository SPFresh uses default asynchronous RocksDB WAL behavior for postings while logical metadata is volatile. These are repository behavior observations, not equivalent durability guarantees.
 
 **Sources:** [`ivf_index.cpp`](../src/bufann/ivf_index.cpp), [`ivf_artifacts.cpp`](../src/bufann/ivf_artifacts.cpp), serialization/load paths in [`ivf_router.cpp`](../src/bufann/ivf_router.cpp), [`ivf_heap.cpp`](../src/bufann/ivf_heap.cpp), [`ivf_posting_lists.cpp`](../src/bufann/ivf_posting_lists.cpp).
 
@@ -405,7 +405,7 @@ Thus the model chooses a **routing-plus-scan estimate**, not a proven end-to-end
 
 ## 13. Resource and numerical contracts are architectural, not incidental
 
-Build, training, open, query, growth, checkpoint, and calibration have explicit preflight size/work checks with overflow protection. Estimates include relevant persistent structures, scratch, temporary replacement buffers, and conservative thread-stack allowances. They are **admission estimates, not hard process-RSS caps**.
+Build, training, open, query, growth, writeback, and calibration have explicit preflight size/work checks with overflow protection. Estimates include relevant persistent structures, scratch, temporary replacement buffers, and conservative thread-stack allowances. They are **admission estimates, not hard process-RSS caps**.
 
 Training normally permits at most three billion assignment searches: `S × (max_reps + 1)`. Main recipes fix fifteen mean-update passes plus final assignment: 90M rows require 1.44B assignments, while 100M require 1.60B. Exact training still separately limits distance evaluations (default 1B). PCA covariance/solver/validation and refinement retain separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. Raising a PCA/routing limit does not raise the training-search limit.
 
@@ -442,7 +442,7 @@ OpenMP/MKL concurrency is constrained before mixed execution to avoid hidden ove
 
 ### Concurrent query timing is separate from recall scoring
 
-Mixed foreground queries run against weakly consistent changing state and are not scored against a fictitious fixed GT. All mixed rounds now share one process, mutable session and worker pool, with ordered mutation rounds and continuous queries. Only after the entire workload joins does a final query pass measure recall against the actual final live population on that same index. **Final-pass query QPS is not concurrent foreground QPS.** No mixed checkpoints, reopen cycles, intermediate scoring or per-round warmups occur. Version-3 round records attribute queries by completion, not admission; queries can cross boundaries. One largest-round coordinate buffer is reused, with later-round staging included in continuous elapsed time while query workers remain active. Sequential checkpoint APIs remain for the subsequent removal phase.
+Mixed foreground queries run against weakly consistent changing state and are not scored against a fictitious fixed GT. All mixed rounds share one process, mutable session and worker pool, with ordered mutation rounds and continuous queries. After the entire workload joins, final writeback is measured separately, then a final query pass measures recall against the actual final live population on that same index/pool. **Final-pass query QPS is not concurrent foreground QPS.** No checkpoints, reopen cycles, intermediate scoring or per-round warmups occur. Version-3 round records attribute queries by completion, not admission; queries can cross boundaries. One largest-round coordinate buffer is reused, with later-round staging included in continuous elapsed time while query workers remain active. Sequential insert/delete harness runs likewise use one combined native command (`insert_then_search`/`delete_then_search`) with the smaller mutation/query memory budget and one canonical root result. Sequential warmup follows writeback; mixed warmup precedes all rounds. Version-4 update fields report writeback duration, workspace, page/byte counts and dirty pages before/after. Foreground time/I/O snapshots precede writeback and final scoring; total workflow time includes both. Final scoring retains session/cache effects and is not cold-device timing. A writeback failure prevents root success/neighbors while preserving completed mixed accounting as partial evidence.
 
 Overlap means admitted operation intervals overlap, including waits; it does not prove simultaneous CPU execution. Update-driven query volume is unbounded in advance, so percentile storage uses a seeded reservoir capped at 65,536 samples, while means use all queries. Very short update rounds may admit no queries or show no overlap.
 
@@ -501,7 +501,7 @@ Large-data recipes explicitly override these. The SIFT recipe uses 64 PQ8 chunks
 | PQ/RaBitQ and SIMD fast scan | Only global non-residual PQ8 and scalar scanning implemented; no RaBitQ/PQ4 FastScan. |
 | One final full-vector batch-get stage | Logical pattern preserved; bounded local batch calls/page reads replace database/network gets. |
 | Immediate compact posting mutations | Implemented, including +16 growth and swap deletion. |
-| Data/index WAL-backed durable commit | Not implemented; publication-safe memory state and clean checkpoint families instead. |
+| Data/index WAL-backed durable commit | Not implemented; publication-safe memory state and page writeback only. Updated sessions are disposable. |
 | Distributed regions, random sharding, broadcast/merge | Not implemented. |
 | LDMaster coordination, failover, elasticity, replication | Not implemented. |
 | Filter planning, pre/post filtering, attribute pushdown | Not implemented as IVF query features. Live-ID GT filtering is evaluation, not filtered ANN. |

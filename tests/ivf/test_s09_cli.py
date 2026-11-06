@@ -187,34 +187,24 @@ def main():
                             "--index_prefix",
                             str(prefix),
                             "--workload",
-                            "insert_only",
+                            "insert_then_search",
+                            "--query_file", str(query), "--nprobe", "4",
+                            "--recall_at", "1", "--rerank_factor", "64",
                             "--full_data_file",
                             str(data),
                             "--insert_ids_file",
                             str(ids),
                             "--private_heap_path",
                             str(root / (dtype + "_" + mode + "_private.heap")),
-                            "--checkpoint_prefix",
-                            str(saved),
                             "--buffer_frames",
                             "4",
                         ],
-                        "insert",
-                    )
-                    assert update["trainer_mode"] == mode
-                    assert Path(str(saved) + ".origin").read_text() == manifest
-                    reopened = search.copy()
-                    reopened[reopened.index("--index_prefix") + 1] = str(saved)
-                    metrics = run(
-                        reopened
-                        + [
-                            "--index_format",
-                            "mutable",
-                            "--private_heap_path",
-                            str(root / (dtype + "_" + mode + "_reopened.heap")),
-                        ],
                         "query",
                     )
+                    assert update["trainer_mode"] == mode
+                    assert not Path(str(saved) + ".origin").exists()
+                    assert update["writeback_dirty_pages_after"] == 0
+                    metrics = update
                     assert metrics["trainer_mode"] == mode and metrics["training_breadth"] == 16
                 assert hashes == {
                     s: hashlib.sha256(Path(str(prefix) + s).read_bytes()).hexdigest()
@@ -315,27 +305,25 @@ def main():
                         "--index_prefix",
                         str(prefix),
                         "--workload",
-                        "insert_only",
+                        "insert_then_search",
+                        "--query_file", str(query), "--nprobe", "4",
+                        "--recall_at", "1", "--rerank_factor", "64",
                         "--full_data_file",
                         str(data),
                         "--insert_ids_file",
                         str(ids),
                         "--private_heap_path",
                         str(root / (dtype + "_legacy_private" + str(version) + ".heap")),
-                        "--checkpoint_prefix",
-                        str(saved),
                         "--buffer_frames",
                         "4",
                     ],
-                    "insert",
+                    "query",
                 )
-                assert Path(str(saved) + ".origin").read_text() == text
-                search[search.index("--index_prefix") + 1] = str(saved)
+                assert not Path(str(saved) + ".origin").exists()
+                assert Path(str(prefix) + ".manifest").read_text() == text
                 reopened = run(
                     search
                     + [
-                        "--index_format",
-                        "mutable",
                         "--private_heap_path",
                         str(root / (dtype + "_legacy_reopen" + str(version) + ".heap")),
                     ],

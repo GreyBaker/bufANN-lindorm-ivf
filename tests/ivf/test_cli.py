@@ -111,7 +111,8 @@ def main():
             ("--checkpoint_prefix", "new"),
         ):
             run(driver + ["--workload", "search_only", flag, value], False)
-        for workload in ("insert_only", "delete_only", "search_after_update", "mixed"):
+        for workload in ("insert_only", "delete_only", "insert_then_search",
+                         "delete_then_search", "search_after_update", "mixed"):
             run(
                 driver
                 + [

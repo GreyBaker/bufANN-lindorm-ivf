@@ -376,14 +376,14 @@ namespace ivf_cli {
 
     // Sequential foreground updates, distinct from concurrent mixed scheduling.
     // Full-source identity prevents changing row-ID meaning between build and
-    // insertion. Partial failures keep owned files but publish neither a
-    // checkpoint nor a success record.
+    // insertion. Partial failures keep owned files but publish no success record.
     struct UpdateStats {
       uint64_t       inserted = 0, deleted = 0, missing = 0, bytes = 0;
-      double         insert_s = 0, delete_s = 0, checkpoint_s = 0;
+      double         insert_s = 0, delete_s = 0, writeback_s = 0;
+      uint32_t       dirty_before = 0, dirty_after = 0;
       double         source_before_s = 0, input_validation_s = 0;
       double         coordinate_validation_s = 0, source_after_s = 0;
-      HeapIOCounters foreground_io, checkpoint_io;
+      HeapIOCounters foreground_io, writeback_io;
       uint32_t       insert_threads_requested = 0, insert_threads_effective = 0;
       uint32_t insert_peak_active = 0, insert_runtime_threads_before_launch = 0;
       uint64_t insert_worker_allowance_bytes = 0;
@@ -400,21 +400,21 @@ namespace ivf_cli {
           << " heap_eviction_write_ns=" << io.eviction_write_ns;
     }
     template<typename T>
-    void checkpoint_update(const Arguments& args, MutableIndex<T>& index,
-                           UpdateStats& s) {
-      const auto     checkpoint_before = index.heap_io_counters();
-      DriverProgress checkpoint(
-          "checkpoint_flush_copy_verify", std::nullopt, "operations",
+    void writeback_update(MutableIndex<T>& index, UpdateStats& s) {
+      const auto before = index.heap_io_counters();
+      s.dirty_before = index.dirty_pages();
+      DriverProgress progress(
+          "final_heap_writeback", std::nullopt, "operations",
           [&](std::ostream& out) {
-            heap_progress(out,
-                          index.heap_io_counters().since(checkpoint_before));
+            heap_progress(out, index.heap_io_counters().since(before));
           });
       const auto start = Clock::now();
-      index.checkpoint(args.require("--checkpoint_prefix"),
-                       index.estimated_checkpoint_bytes());
-      s.checkpoint_s = seconds(start);
-      s.checkpoint_io = index.heap_io_counters().since(checkpoint_before);
-      checkpoint.finish();
+      index.writeback(index.estimated_writeback_bytes());
+      s.writeback_s = seconds(start);
+      s.writeback_io = index.heap_io_counters().since(before);
+      s.dirty_after = index.dirty_pages();
+      check(s.dirty_after == 0, "Final writeback left dirty pages");
+      progress.finish();
     }
     template<typename T>
     UpdateStats mixed_index(const Arguments& args, MutableIndex<T>& index,
@@ -543,6 +543,7 @@ namespace ivf_cli {
       add(worker_bytes, query_bytes);
       add(worker_bytes, mutation_bytes);
       add(s.bytes, plan.pool_threads, worker_bytes);
+      add(s.bytes, index.estimated_writeback_bytes());
       add(s.bytes, 1024 * 1024);
       check(s.bytes <= budget, "CLI composed mixed workload exceeds allowance");
       s.input_validation_s = input_validation.finish();
@@ -645,17 +646,7 @@ namespace ivf_cli {
         paths.push_back(args.require("--private_heap_path"));
         paths.push_back(args.require("--private_heap_path") + ".pq.bin");
       }
-      if (updating && args.require("--workload") != "mixed") {
-        const auto prefix = args.require("--checkpoint_prefix");
-        paths.push_back(prefix + ".manifest");
-        for (auto suffix : mutable_component_suffixes)
-          paths.push_back(prefix + suffix);
-        for (auto suffix : native_router_suffixes)
-          paths.push_back(prefix + suffix);
-        args.require("--private_heap_path");
-      } else
-        args.reject_present({"--checkpoint_prefix"},
-                             "not used by mixed or search-only execution");
+      if (updating) args.require("--private_heap_path");
       std::vector<std::filesystem::path> normalized;
       for (const auto& path : paths) {
         check(!std::filesystem::exists(std::filesystem::symlink_status(path)),
@@ -674,15 +665,9 @@ namespace ivf_cli {
       const MutableIndexOptions options{args.u32("--buffer_frames", 64),
                                         budget};
       const auto format = args.get("--index_format", "immutable");
-      check(format == "immutable" || format == "mutable",
-            "Unknown index_format");
-      return format == "mutable"
-                 ? MutableIndex<T>::reopen(args.require("--index_prefix"),
-                                           args.require("--private_heap_path"),
-                                           options)
-                 : MutableIndex<T>::fork(args.require("--index_prefix"),
-                                         args.require("--private_heap_path"),
-                                         options);
+      check(format == "immutable", "Only immutable bases can be opened; updated sessions cannot be reopened");
+      return MutableIndex<T>::fork(args.require("--index_prefix"),
+                                   args.require("--private_heap_path"), options);
     }
     template<typename T>
     const IndexManifest& cli_manifest(const NativeIndex<T>& index) {
@@ -705,8 +690,8 @@ namespace ivf_cli {
                              uint64_t budget, uint64_t resident_bytes) {
       const auto& m = index.origin_manifest();
       const auto  workload = args.require("--workload");
-      const bool  insert = workload != "delete_only",
-                 erase = workload != "insert_only";
+      const bool insert = workload != "delete_only" && workload != "delete_then_search",
+                 erase = workload != "insert_only" && workload != "insert_then_search";
       args.reject_present({"--pq_prefix"},
                           "frozen bundle PQ is used for updates");
       if (!insert)
@@ -736,7 +721,7 @@ namespace ivf_cli {
           add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
       add(s.bytes, m.training.dim, sizeof(T));
       add(s.bytes, index.estimated_mutation_bytes());
-      add(s.bytes, index.estimated_checkpoint_bytes());
+      add(s.bytes, index.estimated_writeback_bytes());
       add(s.bytes, 1024 * 1024);
       check(s.bytes <= budget,
             "CLI composed update exceeds workspace allowance");
@@ -913,7 +898,6 @@ namespace ivf_cli {
             "CLI insertion exceeded admitted retained growth allowance");
       check(s.bytes <= budget,
             "CLI post-growth update exceeds workspace allowance");
-      checkpoint_update(args, index, s);
       return s;
     }
     template<typename T>
@@ -961,7 +945,15 @@ namespace ivf_cli {
       }
       emit("delete_qps",
            bufann_bench::safe_div(s.deleted + s.missing, s.delete_s));
-      if (!mixed) emit("checkpoint_time_s", s.checkpoint_s);
+      emit("writeback_time_s", s.writeback_s);
+      emit("writeback_workspace_bytes", index.estimated_writeback_bytes());
+      emit("writeback_heap_page_writes", s.writeback_io.page_writes);
+      emit("writeback_heap_flush_bytes", s.writeback_io.flush_bytes);
+      emit("writeback_dirty_pages_before", s.dirty_before);
+      emit("writeback_dirty_pages_after", s.dirty_after);
+      emit("writeback_policy", "quiescent_bounded_page_writeback_no_fsync_no_metadata_export");
+      emit("writeback_order", "after_foreground_join_before_final_warmup_and_scoring");
+      emit("update_protocol_version", 4);
       emit("source_identity_before_time_s", s.source_before_s);
       emit("update_input_validation_time_s", s.input_validation_s);
       emit("coordinate_validation_or_staging_time_s",
@@ -974,24 +966,12 @@ namespace ivf_cli {
       emit("foreground_heap_read_wait_ns", s.foreground_io.read_wait_ns);
       emit("foreground_heap_eviction_write_ns",
            s.foreground_io.eviction_write_ns);
-      if (!mixed) {
-        emit("checkpoint_heap_page_writes", s.checkpoint_io.page_writes);
-        emit("checkpoint_heap_flush_bytes", s.checkpoint_io.flush_bytes);
-      }
       emit("heap_io_counter_scope", mixed
                                         ? "backend_pool_phase_deltas_includes_"
                                           "concurrent_queries_not_device_io"
                                         : "backend_pool_phase_deltas_excludes_"
                                           "source_reads_not_device_io");
-      emit("mutation_completion_policy", mixed ? "joined_visible_publications_no_checkpoint"
-           : "joined_publications_then_quiescent_verified_checkpoint");
-      if (!mixed) {
-        emit("checkpoint_heap_io_scope",
-             "pool_flush_only_excludes_checkpoint_file_copy_hash_metadata");
-        emit("checkpoint_completion_scope",
-             "flush_copy_hash_metadata_not_wal_or_crash_durability");
-        emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
-      }
+      emit("mutation_completion_policy", "online_visibility_then_final_writeback_not_durable_commit");
       emit("driver_progress_policy",
            "phase_boundaries_completed_counts_time_and_count_limited_no_"
            "heartbeat_thread");
@@ -1008,7 +988,7 @@ namespace ivf_cli {
                  ? "serial_delete_then_bounded_parallel_insert_no_query_overlap"
                  : "sequential_delete_then_insert_no_query_overlap");
         emit("mutation_timing_scope",
-             "foreground_loops_excludes_open_validation_hash_checkpoint_and_"
+             "foreground_loops_excludes_open_validation_hash_writeback_and_"
              "post_update_query");
       } else {
         emit("mixed_protocol_version", 3);
@@ -1091,8 +1071,7 @@ namespace ivf_cli {
         emit("runtime_threads_before_mixed_launch",
              mixed->runtime_threads_before_launch);
       }
-      emit("publication", mixed ? "online_visibility_no_durable_commit_or_checkpoint"
-                                : "manifest_last_nonatomic_no_fsync");
+      emit("publication", "online_visibility_no_durable_commit_or_checkpoint");
       const auto& m = index.origin_manifest();
       emit("base_count", m.training.base_count);
       emit("source_rows", m.source_rows);
@@ -1121,8 +1100,7 @@ namespace ivf_cli {
           {"--query_file", "--gt_file", "--search_result_file",
            "--query_threads", "--recall_at", "--nprobe", "--rerank_factor",
            "--router_mode", "--router_rerank_factor", "--router_breadth"},
-          "not used by mutation-only execution; query the saved checkpoint "
-          "separately");
+          "not used by mutation-only execution; use insert_then_search or delete_then_search");
       validate_driver_paths(args, true);
       const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
       DriverProgress opening("open_private_copy_verify");
@@ -1135,8 +1113,9 @@ namespace ivf_cli {
             "CLI/manifest dimension mismatch");
       check(!args.has("--nlist") || args.u32("--nlist") == m.training.nlist,
             "CLI/manifest nlist mismatch");
-      const auto s =
+      auto s =
           update_index(args, *index, budget, index->estimated_retained_bytes());
+      writeback_update(*index, s);
       std::ostringstream record;
       const auto         phase =
           args.require("--workload") == "insert_only" ? "insert" : "delete";
@@ -1168,8 +1147,7 @@ namespace ivf_cli {
                       Clock::time_point workflow_start) {
       DriverProgress loading("query_input_validation_load");
       const bool     is_mixed = args.require("--workload") == "mixed";
-      const bool     updating =
-          args.require("--workload") == "search_after_update" || is_mixed;
+      const bool updating = args.require("--workload") != "search_only";
       const auto  budget = budget_bytes(args.real("--memory_budget_gb", 1.0));
       const auto& manifest = cli_manifest(*index);
       const auto  dim = manifest.training.dim;
@@ -1256,6 +1234,7 @@ namespace ivf_cli {
           query_bytes = post_query_bytes;
           check(bytes <= budget,
                 "CLI post-update search exceeds workspace allowance");
+          writeback_update(*index, updates);
         }
       }
       if (!is_mixed) warmup();
@@ -1455,11 +1434,11 @@ namespace ivf_cli {
             "query_cache_process_policy",
             warmup_requested
                 ? (updating ? "same_process_live_mutable_session_after_"
-                              "checkpoint_no_reopen_frozen_base_centroid_warmup"
+                               "writeback_no_reopen_frozen_base_centroid_warmup"
                             : "private_mutable_copy_opened_in_this_process_"
                               "frozen_base_centroid_warmup")
             : updating
-                ? "same_process_live_mutable_session_after_checkpoint_no_"
+                ? "same_process_live_mutable_session_after_writeback_no_"
                   "reopen_no_explicit_warmup"
                 : "private_mutable_copy_opened_in_this_process_no_"
                   "explicit_warmup");
@@ -1486,21 +1465,23 @@ namespace ivf_cli {
       const bool mixed = workload == "mixed";
       check(workload == "search_only" || workload == "insert_only" ||
                 workload == "delete_only" ||
+                workload == "insert_then_search" || workload == "delete_then_search" ||
                 workload == "search_after_update" || mixed,
             "Unsupported native workload");
       if (args.has("--warmup_queries")) {
         check(workload == "search_only" || workload == "search_after_update" ||
+                  workload == "insert_then_search" || workload == "delete_then_search" ||
                   mixed,
               "warmup_queries only applies to query-producing workloads");
         validate_warmup_count(args.u32("--warmup_queries"));
       }
       if (args.has("--insert_threads")) {
-        check(workload == "insert_only" || workload == "search_after_update",
+        check(workload == "insert_only" || workload == "insert_then_search" || workload == "search_after_update",
               "insert_threads only applies to sequential insertion workloads");
         effective_insert_workers(0, args.u32("--insert_threads"));
       }
       if (args.has("--insert_input_policy")) {
-        check(workload == "insert_only" || workload == "search_after_update",
+        check(workload == "insert_only" || workload == "insert_then_search" || workload == "search_after_update",
               "insert_input_policy only applies to sequential insertion "
               "workloads");
         parse_insert_input_policy(args.require("--insert_input_policy"));
@@ -1516,21 +1497,20 @@ namespace ivf_cli {
       }
       if (workload == "insert_only" || workload == "delete_only")
         return mutate_typed<T>(args, type, workflow_start);
-      const bool updating = workload == "search_after_update" || mixed;
+      const bool updating = workload != "search_only";
       validate_driver_paths(args, updating);
       if (!updating)
         args.reject_present({"--pq_prefix", "--full_data_file",
                              "--insert_ids_file", "--delete_ids_file"},
                             "not used by search-only execution");
       const auto format = args.get("--index_format", "immutable");
-      check(format == "immutable" || format == "mutable",
-            "Unknown index_format");
+      check(format == "immutable", "Only immutable bases are supported; mutable checkpoint loading was removed");
       const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
       DriverProgress opening("open_private_copy_verify");
       const auto     start = Clock::now();
       // A private heap requests a mutable session even for an immutable input
       // bundle. Search-only forks the base without applying any mutations.
-      if (updating || format == "mutable" || args.has("--private_heap_path")) {
+      if (updating || args.has("--private_heap_path")) {
         auto       index = open_mutable<T>(args, budget);
         const auto open_time = seconds(start);
         opening.finish();

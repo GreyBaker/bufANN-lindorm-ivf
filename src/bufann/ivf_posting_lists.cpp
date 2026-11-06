@@ -2,14 +2,10 @@
 #include "bufann/ivf_numeric_internal.h"
 
 #include <algorithm>
-#include <bit>
 #include <cmath>
-#include <filesystem>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <utility>
-#include "bufann/ivf_artifacts.h"
 
 namespace diskann::ivf {
   namespace {
@@ -41,48 +37,6 @@ namespace diskann::ivf {
       return bytes;
     }
     using detail::candidate_nearer;
-    template<typename T>
-    T read(std::istream& in) {
-      T value{};
-      in.read(reinterpret_cast<char*>(&value), sizeof(value));
-      check(bool(in), "Truncated mutable IVF lists");
-      return value;
-    }
-    template<typename T>
-    void write(std::ostream& out, T value) {
-      out.write(reinterpret_cast<const char*>(&value), sizeof(value));
-    }
-    constexpr uint64_t        mutable_header_bytes = 44;
-    MutableListCheckpointInfo checkpoint_header(
-        std::istream& in, const MutableListOptions& expected) {
-      validate(expected);
-      char magic[8]{};
-      in.read(magic, sizeof(magic));
-      check(bool(in) && std::equal(magic, magic + 8, "IVFMPL1\0") &&
-                read<uint32_t>(in) == 1,
-            "Invalid mutable IVF list header/version");
-      check(read<uint32_t>(in) == expected.nlist &&
-                read<uint32_t>(in) == expected.chunks &&
-                read<uint32_t>(in) == expected.first_id &&
-                read<uint32_t>(in) == expected.id_capacity,
-            "Mutable IVF list shape mismatch");
-      MutableListCheckpointInfo result;
-      result.live = read<uint32_t>(in);
-      result.deleted = read<uint32_t>(in);
-      result.missing_deletes = read<uint64_t>(in);
-      check(uint64_t(result.live) + result.deleted <=
-                uint64_t(expected.id_capacity) - expected.first_id,
-            "Invalid mutable IVF list counts");
-      return result;
-    }
-    uint64_t checkpoint_file_bytes(const MutableListOptions& options,
-                                   uint32_t                  live) {
-      uint64_t bytes = mutable_header_bytes + 8 +
-                       uint64_t(options.id_capacity) - options.first_id;
-      add(bytes, mul(options.nlist, 12));
-      add(bytes, mul(live, uint64_t(options.chunks) + 4));
-      return bytes;
-    }
   }  // namespace
 
   uint64_t MutablePostingLists::estimate_empty_bytes(
@@ -114,23 +68,18 @@ namespace diskann::ivf {
   }
 
   MutablePostingLists::MutablePostingLists(const MutableListOptions& options,
-                                           const PostingLists*       input,
-                                           bool allocate_buffers)
+                                            const PostingLists*       input)
       : _options(options) {
     uint64_t bytes = estimate_empty_bytes(options);
     if (input)
       add(bytes,
           mul(input->size(), uint64_t(options.chunks) + sizeof(uint32_t)));
-    if (!allocate_buffers)
-      bytes -= mul(options.nlist, buffer_bytes(16, options.chunks));
     check(bytes <= options.memory_budget_bytes && bytes <= SIZE_MAX,
           "Mutable IVF lists exceed declared memory estimate budget");
     _estimated_bytes = _peak_estimated_bytes = bytes;
     _lists = std::make_unique<List[]>(options.nlist);
     _locator = std::make_unique<Locator[]>(uint64_t(options.id_capacity) -
                                            options.first_id);
-    if (!allocate_buffers)
-      return;
     for (uint32_t c = 0; c < options.nlist; ++c) {
       auto&      list = _lists[c];
       const auto ids = input ? input->ids(c) : std::span<const uint32_t>{};
@@ -357,152 +306,6 @@ namespace diskann::ivf {
            State::Deleted;
   }
 
-  void MutablePostingLists::save_checkpoint(const std::string& path) const {
-    static_assert(std::endian::native == std::endian::little);
-    check(pending_insertions() == 0,
-          "Mutable IVF checkpoint requires no pending reservations");
-    uint32_t live = 0, deleted_count = 0;
-    for (uint32_t id = first_id(); id < id_capacity(); ++id) {
-      const auto state = _locator[id - first_id()].state.load();
-      check(state != State::Reserved,
-            "Mutable IVF checkpoint contains a reserved ID");
-      live += state == State::Live;
-      deleted_count += state == State::Deleted;
-    }
-    check(live == size(), "Mutable IVF checkpoint live-count mismatch");
-    claim_artifact(path);
-    std::ofstream out(path, std::ios::binary);
-    out.write("IVFMPL1\0", 8);
-    for (uint32_t value : {1u, nlist(), chunks(), first_id(), id_capacity(),
-                           live, deleted_count})
-      write(out, value);
-    write(out, missing_deletes());
-    for (uint32_t id = first_id(); id < id_capacity(); ++id)
-      write(out, uint8_t(_locator[id - first_id()].state.load()));
-    uint64_t entries = 0;
-    for (uint32_t c = 0; c < nlist(); ++c) {
-      const auto&      list = _lists[c];
-      std::shared_lock lock(list.mutex);
-      write(out, list.length);
-      write(out, list.capacity);
-      for (uint32_t s = 0; s < list.length; ++s) {
-        const auto  id = list.ids[s];
-        const auto& loc = _locator[relative_id(id)];
-        check(loc.state.load() == State::Live && loc.list == c && loc.slot == s,
-              "Mutable IVF checkpoint locator mismatch");
-        write(out, id);
-      }
-      out.write(reinterpret_cast<const char*>(list.codes.get()),
-                size_t(list.length) * chunks());
-      entries += list.length;
-    }
-    out.close();
-    check(bool(out) && entries == live,
-          "Mutable IVF list checkpoint write/population failure");
-    const auto bytes = checkpoint_file_bytes(_options, live);
-    check(std::filesystem::file_size(path) == bytes - 8,
-          "Mutable IVF list checkpoint length mismatch");
-    const auto    hash = artifact_hash_prefix(path, bytes - 8);
-    std::ofstream trailer(path, std::ios::binary | std::ios::app);
-    write(trailer, hash);
-    trailer.close();
-    check(bool(trailer), "Mutable IVF list checksum write failure");
-  }
-
-  MutableListCheckpointInfo MutablePostingLists::inspect_checkpoint(
-      const std::string& path, const MutableListOptions& expected) {
-    static_assert(std::endian::native == std::endian::little);
-    std::ifstream in(path, std::ios::binary);
-    auto          info = checkpoint_header(in, expected);
-    const auto    bytes = checkpoint_file_bytes(expected, info.live);
-    check(bytes <= INT64_MAX && std::filesystem::file_size(path) == bytes,
-          "Invalid mutable IVF list checkpoint length");
-    in.seekg(static_cast<std::streamoff>(bytes - 8));
-    check(read<uint64_t>(in) == artifact_hash_prefix(path, bytes - 8),
-          "Mutable IVF list checksum mismatch");
-    in.seekg(mutable_header_bytes);
-    uint32_t live = 0, deleted_count = 0;
-    for (uint32_t id = expected.first_id; id < expected.id_capacity; ++id) {
-      const auto state = read<uint8_t>(in);
-      check(state == uint8_t(State::Absent) || state == uint8_t(State::Live) ||
-                state == uint8_t(State::Deleted),
-            "Invalid/pending mutable IVF checkpoint state");
-      live += state == uint8_t(State::Live);
-      deleted_count += state == uint8_t(State::Deleted);
-    }
-    check(live == info.live && deleted_count == info.deleted,
-          "Mutable IVF checkpoint state counts mismatch");
-    info.estimated_bytes =
-        estimate_empty_bytes(expected) -
-        mul(expected.nlist, buffer_bytes(16, expected.chunks));
-    uint64_t entries = 0;
-    for (uint32_t c = 0; c < expected.nlist; ++c) {
-      const auto length = read<uint32_t>(in);
-      const auto capacity = read<uint64_t>(in);
-      check(length <= live && capacity >= std::max<uint64_t>(16, length) &&
-                capacity <=
-                    uint64_t(expected.id_capacity) - expected.first_id + 16,
-            "Invalid mutable IVF checkpoint capacity");
-      add(info.estimated_bytes, buffer_bytes(capacity, expected.chunks));
-      entries += length;
-      const auto payload = mul(length, uint64_t(expected.chunks) + 4);
-      check(uint64_t(in.tellg()) <= bytes - 8 &&
-                payload <= bytes - 8 - uint64_t(in.tellg()),
-            "Mutable IVF list payload exceeds framing");
-      in.seekg(static_cast<std::streamoff>(payload), std::ios::cur);
-    }
-    check(entries == live && uint64_t(in.tellg()) == bytes - 8 &&
-              info.estimated_bytes <= SIZE_MAX,
-          "Mutable IVF checkpoint list totals/framing mismatch");
-    return info;
-  }
-
-  std::unique_ptr<MutablePostingLists> MutablePostingLists::load_checkpoint(
-      const std::string& path, const MutableListOptions& expected) {
-    const auto info = inspect_checkpoint(path, expected);
-    check(info.estimated_bytes <= expected.memory_budget_bytes,
-          "Mutable IVF checkpoint exceeds list allocation allowance");
-    auto result = std::unique_ptr<MutablePostingLists>(
-        new MutablePostingLists(expected, nullptr, false));
-    std::ifstream in(path, std::ios::binary);
-    checkpoint_header(in, expected);
-    for (uint32_t id = expected.first_id; id < expected.id_capacity; ++id) {
-      const auto state = static_cast<State>(read<uint8_t>(in));
-      result->_locator[id - expected.first_id].state.store(
-          state == State::Live ? State::Reserved : state);
-    }
-    for (uint32_t c = 0; c < expected.nlist; ++c) {
-      auto& list = result->_lists[c];
-      list.length = read<uint32_t>(in);
-      list.capacity = read<uint64_t>(in);
-      result->reserve_bytes(buffer_bytes(list.capacity, expected.chunks));
-      list.ids = std::make_unique<uint32_t[]>(size_t(list.capacity));
-      list.codes = std::make_unique<uint8_t[]>(
-          size_t(mul(list.capacity, expected.chunks)));
-      for (uint32_t s = 0; s < list.length; ++s) {
-        const auto id = read<uint32_t>(in);
-        auto&      loc = result->_locator[result->relative_id(id)];
-        check(loc.state.load() == State::Reserved,
-              "Duplicate/non-live mutable IVF checkpoint ID");
-        list.ids[s] = id;
-        loc.list = c;
-        loc.slot = s;
-        loc.state.store(State::Live);
-      }
-      in.read(reinterpret_cast<char*>(list.codes.get()),
-              size_t(list.length) * expected.chunks);
-      check(bool(in), "Truncated mutable IVF checkpoint codes");
-    }
-    for (uint32_t id = expected.first_id; id < expected.id_capacity; ++id)
-      check(result->_locator[id - expected.first_id].state.load() !=
-                State::Reserved,
-            "Mutable IVF live locator has no list entry");
-    result->_live_count = info.live;
-    result->_missing_deletes = info.missing_deletes;
-    check(result->estimated_bytes() == info.estimated_bytes,
-          "Mutable IVF checkpoint allocation estimate mismatch");
-    return result;
-  }
   ListSnapshot MutablePostingLists::copy_list(uint32_t owner,
                                               uint64_t workspace) const {
     const auto&      list = checked_list(owner);

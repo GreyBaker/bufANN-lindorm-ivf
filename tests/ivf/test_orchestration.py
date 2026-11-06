@@ -413,7 +413,9 @@ class SharedOrchestrationTests(unittest.TestCase):
             commands.append(command)
             Path(log).write_text("fake native execution\n")
             result = Path(command[command.index("--result_file") + 1])
-            workload = "mixed" if command[command.index("--workload") + 1] == "mixed" else "query"
+            requested = command[command.index("--workload") + 1]
+            workload = ("mixed" if requested == "mixed" else
+                        "search_after_update" if requested.endswith("_then_search") else "query")
             record = {
                 "baseline": "IVF", "phase": "query", "workload": workload, "recall": 100,
                 "explicit_warmup_query_count": 7, "warmup_policy": "fixture",
@@ -421,7 +423,14 @@ class SharedOrchestrationTests(unittest.TestCase):
                 "mixed_wall_s": 0.25, "concurrent_query_count": 5, "overlapping_query_count": 3,
                 "native_only_field": "must survive without a Python rewrite",
                 "mixed_protocol_version": 3, "mixed_round_count": 1,
+                "update_protocol_version": 4, "writeback_dirty_pages_after": 0,
+                "writeback_time_s": 0.01, "writeback_heap_page_writes": 1,
+                "writeback_heap_flush_bytes": 4096,
             }
+            if requested.endswith("_then_search"):
+                record.update(insert_count=int(requested.startswith("insert")),
+                              delete_count=int(requested.startswith("delete")),
+                              live_count=4 if requested.startswith("insert") else 2)
             if workload == "mixed":
                 rounds = Path(command[command.index("--round_results_dir") + 1])
                 rounds.mkdir()
@@ -479,7 +488,26 @@ class SharedOrchestrationTests(unittest.TestCase):
             self.assertEqual((failed_out / "private.heap").read_bytes(), b"partial owned session")
             self.assertFalse((failed_out / "result.json").exists())
             self.assertFalse((failed_out / "summary.json").exists())
-        self.assertEqual(len(commands), 2)
+            for workload, row, budget in (("insert", 3, "2"), ("delete", 2, "1")):
+                args.workload, args.update_count = workload, 1
+                args.output_dir = work / (workload + "-run")
+                (work / (workload + "_ids.bin")).write_bytes(struct.pack("<II", 1, row))
+                (work / "mutation_prepared.json").write_text(json.dumps(harness.mutation_identity(args, work)))
+                # Exercise both sides of the shared-session minimum-budget rule.
+                with patch.dict(os.environ, {"IVF_MEMORY_BUDGET_GB": "3" if workload == "insert" else "1"}):
+                    harness.run(args)
+                command = commands[-1]
+                self.assertEqual(command[command.index("--workload") + 1], workload + "_then_search")
+                self.assertEqual(command[command.index("--index_prefix") + 1], str(prefix))
+                self.assertEqual(command[command.index("--memory_budget_gb") + 1], budget)
+                self.assertNotIn("--checkpoint_prefix", command)
+                self.assertNotIn("--index_format", command)
+                protocol = common.read_json(args.output_dir / "execution_protocol.json")
+                self.assertEqual(protocol["version"], 2)
+                self.assertEqual(protocol["native_driver_process_count"], 1)
+                self.assertFalse((args.output_dir / "mutation_result.json").exists())
+                self.assertFalse((args.output_dir / "checkpoint").exists())
+        self.assertEqual(len(commands), 4)
         opening = [
             "fake-driver", "--validate_inputs", "0", "--data_type", "float", "--metric", "l2",
             "--dim", "2", "--nlist", "2", "--index_prefix", str(prefix),

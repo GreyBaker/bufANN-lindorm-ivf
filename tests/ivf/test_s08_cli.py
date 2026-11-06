@@ -151,23 +151,19 @@ def main():
                     str(ids),
                     "--private_heap_path",
                     str(root / (dtype + "_private.heap")),
-                    "--checkpoint_prefix",
-                    str(saved),
                     "--buffer_frames",
                     "4",
                 ]
             )
             assert inserted["insert_count"] == 1
-            assert set(harness.bundle_suffixes(saved, mutable=True)) >= {
+            assert inserted["writeback_dirty_pages_after"] == 0
+            assert set(harness.bundle_suffixes(prefix)) >= {
                 ".patched.hnsw",
                 ".refined.hnsw",
                 ".pca",
             }
             for suffix in (".patched.hnsw", ".refined.hnsw", ".pca"):
-                assert (
-                    Path(str(prefix) + suffix).read_bytes()
-                    == Path(str(saved) + suffix).read_bytes()
-                )
+                assert not Path(str(saved) + suffix).exists()
             assert all(
                 hashlib.sha256(path.read_bytes()).digest() == value
                 for path, value in original.items()

@@ -211,14 +211,14 @@ def main():
         record = json.loads((work / "result.json").read_text())
         assert not (work / "native_result.json").exists()
         protocol = json.loads((work / "execution_protocol.json").read_text())
-        assert protocol["native_driver_process_count"] == 1 and protocol["mutation_process_wall_s"] is None
+        assert protocol["native_driver_process_count"] == 1 and protocol["version"] == 2
         assert protocol["insert_input_policy"] is None
         assert protocol["process_boundary_policy"] == "standalone_query_driver"
         assert protocol["query_session_policy"] == "immutable_base_forked_to_mutable_session_without_updates"
         assert record["index_format"] == "mutable" and record["input_index_format"] == "immutable"
         assert record["live_count"] == 3
         assert (work / "query.heap").is_file() and (work / "query.heap.pq.bin").is_file()
-        assert protocol["harness_workflow_wall_s"] >= protocol["query_process_wall_s"] >= record["driver_workflow_time_s"]
+        assert protocol["harness_workflow_wall_s"] >= protocol["native_process_wall_s"] >= record["driver_workflow_time_s"]
         assert (
             record["baseline"] == "IVF" and record["recall"] == 100 and record["query_count"] == 2
         )
@@ -332,9 +332,8 @@ def main():
         assert reused_link.is_symlink() and reused_link.resolve() == shared_truth
         link.unlink()  # Removing old eval input links must not delete shared GT.
         assert shared_truth.is_file() and reused_link.is_file()
-        # S05 prepare/run pairs use canonical shared split/ID/GT helpers, then
-        # reopen the NEW mutable checkpoint in a separate query process. Cache
-        # and original working bundles remain immutable, never writable aliases.
+        # Prepare/run pairs use shared split/ID/GT helpers and one mutation,
+        # writeback, scoring session. Source bundles remain immutable.
         for workload in ("insert", "delete"):
             mutation_prepare = repo / f"benchmark/IVF/sift/{workload}_prepare.sh"
             mutation_run = repo / f"benchmark/IVF/sift/{workload}.sh"
@@ -348,29 +347,25 @@ def main():
             source_bundle = {p: checksum(p) for p in (mutation_work / "index").iterdir()}
             cache_bundle = {p: checksum(p) for p in (cache / "index").iterdir()}
             run(mutation_run, env)
-            update = json.loads((mutation_work / "mutation_result.json").read_text())
             final = json.loads((mutation_work / "result.json").read_text())
-            assert update["phase"] == workload and update[workload + "_count"] == 1
+            update = final
+            assert update["phase"] == "query" and update[workload + "_count"] == 1
+            assert not (mutation_work / "mutation_result.json").exists()
             assert not (mutation_work / "mutation_metrics.json").exists()
             assert update["live_count"] == (4 if workload == "insert" else 2)
             assert final["recall"] == 100 and final["live_count"] == update["live_count"]
             assert not (mutation_work / "native_result.json").exists()
             protocol = json.loads((mutation_work / "execution_protocol.json").read_text())
-            assert protocol["version"] == 1 and protocol["completed"] is True
-            assert protocol["native_driver_process_count"] == 2
-            assert "separate_query_driver_private_copy" in protocol["process_boundary_policy"]
+            assert protocol["version"] == 2 and protocol["completed"] is True
+            assert protocol["native_driver_process_count"] == 1
+            assert "same_session_scoring" in protocol["process_boundary_policy"]
             assert protocol["application_cache_transfer_between_driver_processes"] is False
             assert protocol["explicit_warmup_query_count"] == 0
             assert protocol["canonical_native_query_metrics_rewritten"] is False
-            assert protocol["harness_workflow_wall_s"] >= protocol["mutation_process_wall_s"] + protocol["query_process_wall_s"]
-            assert protocol["query_process_wall_s"] >= final["driver_workflow_time_s"]
-            assert protocol["mutation_process_wall_s"] >= update["driver_workflow_time_s"]
-            checkpoint = mutation_work / "checkpoint/tiny"
-            assert (
-                Path(str(checkpoint) + ".mlists").is_file()
-                and Path(str(checkpoint) + ".heap.state").is_file()
-            )
-            assert not any(p.is_symlink() for p in (mutation_work / "checkpoint").iterdir())
+            assert protocol["harness_workflow_wall_s"] >= protocol["native_process_wall_s"] >= final["driver_workflow_time_s"]
+            assert final["writeback_dirty_pages_after"] == 0 and final["update_protocol_version"] == 4
+            assert not (mutation_work / "checkpoint").exists()
+            assert (mutation_work / "private.heap").is_file() and not (mutation_work / "query.heap").exists()
             scorer = repo / "benchmark/SPFresh/utils.py"
             truth_path = json.loads((mutation_work / "prepared.json").read_text())["truth"]
             scored = subprocess.run(
@@ -401,10 +396,10 @@ def main():
                 json.loads((mutation_work / "runs/repeat/result.json").read_text())["recall"] == 100
             )
             if workload == "insert":
-                repeated = json.loads((mutation_work / "runs/repeat/mutation_result.json").read_text())
+                repeated = json.loads((mutation_work / "runs/repeat/result.json").read_text())
                 assert repeated["insert_input_policy"] == "staged" and repeated["insert_timing_contract_version"] == 2
                 protocol = json.loads((mutation_work / "runs/repeat/execution_protocol.json").read_text())
-                assert protocol["insert_input_policy"] == "staged" and protocol["native_driver_process_count"] == 2
+                assert protocol["insert_input_policy"] == "staged" and protocol["native_driver_process_count"] == 1
                 del env["IVF_INSERT_INPUT_POLICY"]
             env["IVF_RUN_TAG"] = "protocol_collision"
             collision = mutation_work / "runs/protocol_collision"

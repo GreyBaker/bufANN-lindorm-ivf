@@ -280,11 +280,11 @@ class NativeRunnerContracts(unittest.TestCase):
             record = {"baseline": "IVF", "phase": phase, "insert_count": 3,
                       "delete_count": 1, "missing_delete_count": 1,
                       "foreground_heap_flush_bytes": 8192, "foreground_heap_page_writes": 2,
-                      "checkpoint_heap_flush_bytes": 4096, "checkpoint_heap_page_writes": 1,
+                       "writeback_heap_flush_bytes": 4096, "writeback_heap_page_writes": 1,
                       "heap_io_counter_scope": "not_device_io"}
             self.assertEqual(self.invoke(record, phase, progress), record)
             for key, value in (("insert_count", 4), ("missing_delete_count", 0),
-                               ("foreground_heap_flush_bytes", 1), ("checkpoint_heap_flush_bytes", 1),
+                                ("foreground_heap_flush_bytes", 1), ("writeback_heap_flush_bytes", 1),
                                ("heap_io_counter_scope", "wrong")):
                 with self.subTest(phase=phase, key=key), self.assertRaises(AssertionError):
                     self.invoke(dict(record, **{key: value}), phase, progress)

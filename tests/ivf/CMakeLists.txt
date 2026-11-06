@@ -228,6 +228,11 @@ if(IVF_BUILD_CONTRACT_TESTS)
                                         "${IVF_ROOT}/src/ann_exception.cpp")
     target_link_libraries(ivf_pq_helper_parity PRIVATE ivf_contracts)
     if(TARGET ivf_cli_execution)
+        add_test(NAME ivf_writeback_cli
+                 COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_writeback.py"
+                         --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>
+                         --scratch "${CMAKE_CURRENT_BINARY_DIR}/writeback_fixtures")
+        set_tests_properties(ivf_writeback_cli PROPERTIES TIMEOUT 180)
         add_test(NAME ivf_parallel_insert
                  COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_parallel_insert.py"
                          --build $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver>

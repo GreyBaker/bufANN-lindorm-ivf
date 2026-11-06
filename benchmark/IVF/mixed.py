@@ -166,9 +166,11 @@ def run(args):
             and record["mixed_round_count"] == args.rounds
             and record["insert_count"] == args.insert_count
             and record["delete_count"] == args.delete_count
-            and record["live_count"] == args.base_count + args.insert_count - args.delete_count
+             and record["live_count"] == args.base_count + args.insert_count - args.delete_count
+             and record["update_protocol_version"] == 4
+             and record["writeback_dirty_pages_after"] == 0
             and "recall" in record,
-            "mixed execution count/live-set/scoring mismatch")
+             "mixed execution count/live-set/scoring mismatch")
     round_results = []
     totals = {"concurrent_query_count": 0, "overlapping_query_count": 0}
     for r in range(args.rounds):
@@ -196,6 +198,10 @@ def run(args):
             "round_results": round_results,
             "final_recall": record["recall"],
             "mixed_wall_s": record["mixed_wall_s"],
+            "writeback_time_s": record["writeback_time_s"],
+            "writeback_heap_page_writes": record["writeback_heap_page_writes"],
+            "writeback_heap_flush_bytes": record["writeback_heap_flush_bytes"],
+            "writeback_dirty_pages_after": record["writeback_dirty_pages_after"],
             "native_driver_process_count": 1,
             "native_process_wall_s": process_wall_s,
             "harness_workflow_wall_s": time.monotonic() - workflow_start,

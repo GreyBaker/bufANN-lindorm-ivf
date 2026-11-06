@@ -55,11 +55,11 @@ namespace diskann::ivf {
   // Graph-free typed storage. Immutable build/checkpoint operations require
   // quiescent access. Mutable writes serialize; copies use bounded aggregate
   // pin admission, per-page guards and short logical-state locks. MutableIndex
-  // owns a separate checkpoint
-  // family; the legacy immutable checkpoint method refuses mutable sessions.
+  // exposes writeback only for mutable sessions; immutable snapshots remain
+  // a separate preparation facility.
   // IDs are bounded external IDs and also the backend node IDs (never
-  // remapped). A failed stream or backend mutation poisons checkpointing;
-  // discard that build.
+  // remapped). A failed stream or backend mutation poisons the session;
+  // discard that build/session.
   template<typename T>
   class HeapStorage {
    public:
@@ -69,8 +69,7 @@ namespace diskann::ivf {
         const HeapOptions& options, const std::string& heap_path,
         const std::string& snapshot_path);
     // Opt-in mutable session: owns a NEW heap or an explicitly private copy of
-    // an immutable v1 heap. Mutable checkpoint composition is private to
-    // MutableIndex.
+    // an immutable v1 heap. Updated sessions cannot be reopened.
     static std::unique_ptr<HeapStorage> create_mutable(
         const HeapOptions& options, const std::string& heap_path);
     void prepare_insert(uint32_t id, std::span<const T> coordinates);
@@ -120,6 +119,14 @@ namespace diskann::ivf {
       return _writer_waiters.load(std::memory_order_acquire);
     }
     HeapIOCounters io_counters() const;
+    // Caller quiesces mutations. No snapshot, fsync, or recoverable metadata.
+    uint64_t writeback_workspace_bytes() const {
+      return 65536ull + 32ull * (_options.page_size + 64ull);
+    }
+    void writeback(uint64_t workspace_bytes);
+    uint32_t dirty_pages() const {
+      return _store.dirty_page_count();
+    }
     // New snapshot path only; writes backend metadata plus .ivf descriptor.
     // Clean shutdown only, not atomic heap generations or crash/WAL recovery.
     void     checkpoint(const std::string& snapshot_path);
@@ -141,21 +148,11 @@ namespace diskann::ivf {
 
    private:
     friend class MutableIndex<T>;
-    static std::unique_ptr<HeapStorage> reopen_physical(
-        const HeapOptions& options, const std::string& heap_path,
-        const std::string& snapshot_path, const char* descriptor_magic);
     // Only the native session may reopen a copy, after its exclusive claim and
     // component-content digest checks. Never make an immutable source writable.
     static std::unique_ptr<HeapStorage> reopen_mutable_copy(
         const HeapOptions& options, const std::string& private_heap_path,
         const std::string& immutable_snapshot_path);
-    static std::unique_ptr<HeapStorage> reopen_mutable_checkpoint_copy(
-        const HeapOptions& options, const std::string& private_heap_path,
-        const std::string& snapshot_path, const std::string& state_path);
-    void checkpoint_mutable_copy(const std::string& new_heap_path,
-                                 const std::string& snapshot_path,
-                                 const std::string& state_path);
-    void validate_retained_coordinates();
     explicit HeapStorage(const HeapOptions& options, std::string path);
     static DataType              type();
     void                         init();

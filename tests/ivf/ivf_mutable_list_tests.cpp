@@ -1,5 +1,4 @@
 #include "bufann/ivf_posting_lists.h"
-#include "bufann/ivf_artifacts.h"
 
 #include <algorithm>
 #include <array>
@@ -583,95 +582,6 @@ namespace {
     lists->insert(400, 2, code(400));
     audit(*lists);
   }
-  void checkpoints(const std::filesystem::path& root) {
-    std::filesystem::create_directories(root);
-    const MutableListOptions options{4, 3, 164, 100};
-    auto                     lists = MutablePostingLists::create(options);
-    for (uint32_t id = 100; id < 148; ++id)
-      lists->insert(id, id % 2, code(id));
-    for (uint32_t id : {100u, 105u, 112u, 147u})
-      require(lists->erase(id), "checkpoint fixture erase failed");
-    require(!lists->erase(100) && !lists->erase(163),
-            "checkpoint fixture missing delete failed");
-    const auto path = (root / "mutable.lists").string();
-    {
-      auto pending = lists->reserve_insert(160);
-      rejects([&] { lists->save_checkpoint(path); });
-      require(!std::filesystem::exists(path),
-              "pending checkpoint claimed output");
-    }
-    lists->save_checkpoint(path);
-    const auto info = MutablePostingLists::inspect_checkpoint(path, options);
-    require(info.live == 44 && info.deleted == 4 && info.missing_deletes == 2 &&
-                info.estimated_bytes == lists->estimated_bytes(),
-            "checkpoint counts/capacity estimate changed");
-    auto tight = options;
-    tight.memory_budget_bytes = info.estimated_bytes - 1;
-    rejects([&] { MutablePostingLists::load_checkpoint(path, tight); });
-    tight.memory_budget_bytes = info.estimated_bytes;
-    auto loaded = MutablePostingLists::load_checkpoint(path, tight);
-    audit(*loaded);
-    for (uint32_t c = 0; c < options.nlist; ++c) {
-      const auto before = lists->copy_list(c), after = loaded->copy_list(c);
-      require(before.ids == after.ids && before.codes == after.codes &&
-                  before.capacity_slots == after.capacity_slots,
-              "mutable checkpoint changed swap order/codes/capacity");
-    }
-    for (uint32_t id = options.first_id; id < options.id_capacity; ++id)
-      require(lists->location(id) == loaded->location(id) &&
-                  lists->deleted(id) == loaded->deleted(id),
-              "checkpoint locator/tombstone reconstruction mismatch");
-    rejects([&] { loaded->insert(100, 0, code(100)); });
-    loaded->insert(160, 0, code(160));
-    audit(*loaded);
-    const auto identity = artifact_digest(path);
-    bool       existing_refused = false;
-    try {
-      loaded->save_checkpoint(path);
-    } catch (const std::runtime_error&) {
-      existing_refused = true;
-    }
-    require(existing_refused, "checkpoint did not refuse existing artifact");
-    require(artifact_digest(path) == identity,
-            "checkpoint overwrote existing output");
-    auto wrong = options;
-    ++wrong.chunks;
-    rejects([&] { MutablePostingLists::load_checkpoint(path, wrong); });
-    for (uint32_t id = options.first_id; id < options.id_capacity; ++id)
-      if (loaded->contains(id))
-        loaded->erase(id);
-    const auto empty = (root / "empty.lists").string();
-    loaded->save_checkpoint(empty);
-    auto empty_loaded = MutablePostingLists::load_checkpoint(empty, options);
-    require(empty_loaded->size() == 0 && empty_loaded->deleted(160) &&
-                empty_loaded->deleted(100),
-            "empty mutable checkpoint lost tombstones");
-    audit(*empty_loaded);
-    // Duplicate IDs survive a recomputed file checksum but must not reconstruct
-    // two locators pointing to one record. This mutation touches owned fixtures
-    // only.
-    const auto duplicate = (root / "duplicate.lists").string();
-    std::filesystem::copy_file(path, duplicate);
-    const uint64_t first_list_ids =
-        44 + options.id_capacity - options.first_id + 12;
-    const auto copied = lists->copy_list(0);
-    require(copied.ids.size() > 1, "duplicate fixture needs two entries");
-    {
-      std::fstream out(duplicate,
-                       std::ios::binary | std::ios::in | std::ios::out);
-      out.seekp(first_list_ids + 4);
-      out.write(reinterpret_cast<const char*>(&copied.ids[0]), 4);
-    }
-    const auto bytes = std::filesystem::file_size(duplicate),
-               hash = artifact_hash_prefix(duplicate, bytes - 8);
-    {
-      std::fstream out(duplicate,
-                       std::ios::binary | std::ios::in | std::ios::out);
-      out.seekp(bytes - 8);
-      out.write(reinterpret_cast<const char*>(&hash), 8);
-    }
-    rejects([&] { MutablePostingLists::load_checkpoint(duplicate, options); });
-  }
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -686,7 +596,6 @@ int main(int argc, char** argv) {
     reservations();
     adc();
     races();
-    checkpoints(root / "checkpoints");
     conversion<float>(root / "float");
     conversion<int8_t>(root / "int8");
     conversion<uint8_t>(root / "uint8");

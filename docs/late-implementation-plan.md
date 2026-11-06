@@ -1,6 +1,6 @@
 # Late implementation plan
 
-Status: phases 1 and 2 implemented and validated. Phases 3 and 4 remain unstarted.
+Status: phases 1–3 implemented and validated. Phase 4 remains unstarted.
 
 Beware that this document may require modification. 
 
@@ -25,7 +25,7 @@ Do not mark full-scale experiments complete on the strength of synthetic tests.
 |---|---|---|---|
 | 1. Training and guards | Complete | Passed | 3B allowance; fixed 15-pass recipes; evidence below |
 | 2. Persistent mixed execution | Complete | Passed | One process/session/pool; version-3 accounting; evidence below |
-| 3. Writeback-only mutable sessions | Pending | Pending | |
+| 3. Writeback-only mutable sessions | Complete | Passed | Bounded writeback; same-session scoring; 59 passed / 1 skipped; evidence below |
 | 4. FAISS HNSW migration | Pending | Pending | |
 
 ## End-state contract and boundaries
@@ -36,8 +36,8 @@ Do not mark full-scale experiments complete on the strength of synthetic tests.
 - Mixed rounds share one native process, mutable index, heap, buffer pool, and
   worker infrastructure. Round transitions do not drain all workers, serialize
   the index, reopen it, or run standalone recall scoring.
-- After the last round, join foreground workers and score the stable final live
-  set on the same index. Writeback is separately measured and is not a snapshot.
+- After the last round, join foreground workers, separately measure writeback,
+  then score the stable final live set on the same index. Writeback is not a snapshot.
 - Dirty eviction and explicit page writeback remain real storage operations.
   No WAL, per-update persistence barrier, crash recovery, or complete updated-index
   restart guarantee is introduced.
@@ -267,35 +267,35 @@ posting lists, logical liveness ledger, or complete allocation metadata.
 
 ### Implementation tasks
 
-- [ ] Add a narrow explicit writeback operation at the IVF heap/index boundary,
+- [x] Add a narrow explicit writeback operation at the IVF heap/index boundary,
   independent of copying, hashing, serialization, or manifest publication.
-- [ ] Define writeback as a quiescent lifecycle operation: drain foreground work
+- [x] Define writeback as a quiescent lifecycle operation: drain foreground work
   before the final explicit flush. Keep normal dirty eviction during execution.
-- [ ] Measure final writeback duration, bytes/pages written, and remaining dirty
+- [x] Measure final writeback duration, bytes/pages written, and remaining dirty
   pages where available. Do not call it checkpoint, commit, or durable sync.
-- [ ] Order final processing explicitly: join foreground workers, perform and
+- [x] Order final processing explicitly: join foreground workers, perform and
   measure writeback, then score on the same index. Snapshot phase counters so
   writeback and scoring I/O do not contaminate foreground metrics. Document the
   ordering and any cache effects.
-- [ ] Make writeback errors prevent an overall success record. Existing completed
+- [x] Make writeback errors prevent an overall success record. Existing completed
   foreground records may remain as partial evidence, clearly marked incomplete.
-- [ ] Apply the same single-session mutation-then-scoring policy to sequential
+- [x] Apply the same single-session mutation-then-scoring policy to sequential
   insert/delete workloads in `benchmark/IVF/harness.py`; remove their separate
   query process dependence on exported updated checkpoints.
-- [ ] Remove `MutableIndex::checkpoint`, mutable-checkpoint `reopen`, and their
+- [x] Remove `MutableIndex::checkpoint`, mutable-checkpoint `reopen`, and their
   exclusive mutable-only formats, helpers, CLI flags, metrics, and path checks.
-- [ ] Remove checkpoint-specific workspace admission from normal mutation and
+- [x] Remove checkpoint-specific workspace admission from normal mutation and
   mixed execution; keep genuine mutation/query/writeback resource estimates.
-- [ ] Remove now-unused mutable posting-list and heap-ledger serialization code
+- [x] Remove now-unused mutable posting-list and heap-ledger serialization code
   after checking all callers. Do not remove structures needed for live operation.
-- [ ] Keep immutable preparation save/load, private-session conversion, and shared
+- [x] Keep immutable preparation save/load, private-session conversion, and shared
   `InPlaceGraphStore` snapshot facilities needed by BufANN or immutable IVF builds.
   A symbol containing `snapshot` is not automatically obsolete.
-- [ ] Retain I/O error propagation, poisoned-session handling, publication ordering,
+- [x] Retain I/O error propagation, poisoned-session handling, publication ordering,
   pin admission, liveness checks, and concurrency protections.
-- [ ] Reject removed mutable formats/options clearly. Do not add legacy fallback
+- [x] Reject removed mutable formats/options clearly. Do not add legacy fallback
   loading, silently reinterpret old checkpoints, or delete their files.
-- [ ] Update README, implementation contracts, and result fields to state online
+- [x] Update README, implementation contracts, and result fields to state online
   visibility plus writeback, with no WAL/durable acknowledgment/crash recovery.
 
 Primary locations: `include/bufann/ivf_index.h`, `include/bufann/ivf_heap.h`,
@@ -305,26 +305,91 @@ serialization, `tests/ivf_cli_execution.cpp`, `benchmark/IVF/harness.py`,
 
 ### Validation and completion gate
 
-- [ ] Replace mutable checkpoint round-trip tests with session visibility,
+- [x] Replace mutable checkpoint round-trip tests with session visibility,
   writeback, storage-failure, and immutable-base protection tests.
-- [ ] Verify explicit writeback writes dirty data without creating an exported
+- [x] Verify explicit writeback writes dirty data without creating an exported
   index family. Verify it does not claim complete updated-index restartability.
-- [ ] Verify foreground metrics exclude the separately reported final writeback,
+- [x] Verify foreground metrics exclude the separately reported final writeback,
   while total workflow time includes it and in-workload eviction is not excluded.
-- [ ] Verify failure propagation and no false successful completion on short/failed
+- [x] Verify failure propagation and no false successful completion on short/failed
   writes. Fault tests validate error handling, not a new crash-recovery guarantee.
-- [ ] Run sequential update, persistent mixed, query-only, storage, and relevant
+- [x] Run sequential update, persistent mixed, query-only, storage, and relevant
   BufANN regression suites to catch accidental removal of shared functionality.
-- [ ] Confirm no active evaluator requires mutable checkpoint prefixes, mutable
+- [x] Confirm no active evaluator requires mutable checkpoint prefixes, mutable
   checkpoint manifests, or checkpoint workspace admission.
 
 Evidence / commands:
 
-<!-- Fill in executed commands, results, and retained evidence paths. -->
+Full Linux/WSL build and evidence directory:
+`C:\Users\GBaker\AppData\Local\Temp\opencode\ivf-layout-build-01`
+(Linux `/mnt/c/Users/GBaker/AppData/Local/Temp/opencode/ivf-layout-build-01`).
+The full build includes `BufANN`, `BufANN_s`, `bufann_driver` and its preparation
+tools as well as the native IVF drivers/tests. Mounted-workspace clock-skew warnings
+remain; they are not compiler/sanitizer findings.
+
+```bash
+BUILD=/mnt/c/Users/GBaker/AppData/Local/Temp/opencode/ivf-layout-build-01
+cmake --build "$BUILD" -j4
+ctest --test-dir "$BUILD" -R '^ivf_' -j2 --output-on-failure \
+  --output-log "$BUILD/phase3-ctest.log"
+```
+
+Full regression result: **59 passed, 1 skipped, 0 failed** (60 entries),
+**333.77 seconds**. `ivf_gt_depth` skips because the configured `/usr/bin/python3`
+lacks optional NumPy. The passing storage tests include the shared BufANN
+`InPlaceGraphStore::save_snapshot` round trip (`ivf_heap_storage`), immutable
+heap/base save/load, direct-I/O faults and concurrent fetch/pin admission. All
+four optimized mutable routing modes pass alongside the default native session.
+`bufann_driver --help` also succeeds after the full build; no baseline performance
+or full-system sanitizer qualification is inferred from these checks.
+
+After final test-only cleanup, rebuilding the mutable test targets and rerunning
+`ivf_(mutable_index_session|mutable_posting_lists|writeback_cli|cli_contracts)`
+passes **4/4** in **17.85 seconds**; log: `phase3-final-checks.log`. A final
+all-dtype native CLI oracle run also passes, including preservation/refusal of
+both historical mutable manifest versions. The updated writeback fault fixture
+explicitly checks foreground completion before writeback and writeback completion
+before final queries; it passes independently and in the final four-test run.
+
+Targeted validation passes the native mutable list/session, parallel insertion,
+input-policy budget, sequential scoring/warmup, optimized-router/training, real
+shell-harness and persistent mixed suites. `ivf_writeback_cli` passes all nine
+mutation-only/sequential/mixed success/error/short-completion combinations. Its
+fixture-local `LD_PRELOAD` shim targets only the owned private heap's `pwrite`,
+with enough frames to avoid foreground dirty eviction. Failed drains return
+nonzero, publish neither root success nor neighbors, and preserve heap/PQ/logs
+and completed mixed round accounting. These are error-handling checks, not
+crash-recovery tests. Evidence remains under `tests/ivf/writeback_fixtures/run-*/`.
+
+Native session tests cover real dirty-page drain/accounting, clean idempotence,
+continued mutation, exclusive writeback admission overlapping query/delete,
+workspace refusal, tombstone/aborted-slot visibility and real `RLIMIT_FSIZE`
+write failure poisoning. The multi-batch heap fixture has more than 32 dirty
+pages, exercising repeated bounded drains. Immutable shared-storage snapshot,
+reopen, direct-I/O and read-failure regression tests are retained.
+
+Shared orchestration tests pass **22/22**, including both sides of the minimum
+mutation/query budget rule, a single combined command and unchanged driver-owned
+native JSON. Python compileall, **73 Bash scripts / 26 README Bash blocks** syntax
+checks and `git diff --check` pass; syntax evidence is `phase3-syntax-checks.json`
+in the build directory.
 
 Notes / remaining issues:
 
-<!-- Fill in limitations or deviations before marking the phase complete. -->
+Writeback uses `flush_dirty_budget(32)` with scratch admission
+`65536 + 32 * (page_size + 64)`, not full-pool snapshot allocation. Update results
+use protocol version 4; sequential harness provenance uses version 2. Persistent
+mixed round/summary version 3 and completion-round attribution stay unchanged.
+The same index/pool survives mutation, writeback and scoring. Sequential warmup
+follows writeback; mixed warmup remains before all rounds. Foreground counters
+and timers exclude final writeback/scoring, while normal dirty eviction remains
+included. Workflow time includes writeback.
+
+No WAL, `fsync`, updated metadata export, resume, durable acknowledgment or updated
+index restartability is provided. No existing artifact migration/deletion, full-scale
+experiment, commit or push was performed. Phase 4 remains unstarted. Historical
+phase-1/2 checkpoint notes and older S05/S06 sanitizer results describe their
+milestones, not current mutable persistence or phase-3 sanitizer qualification.
 
 ## 4. Migrate to FAISS HNSW last
 

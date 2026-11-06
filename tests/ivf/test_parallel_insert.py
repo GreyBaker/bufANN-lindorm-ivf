@@ -28,7 +28,7 @@ def fixture(args, root, dtype, fmt):
         command = [args.driver, "--validate_inputs", "0", "--data_type", dtype,
                    "--index_prefix", str(origin), "--workload", workload,
                    "--full_data_file", str(data), "--private_heap_path", str(private),
-                   "--checkpoint_prefix", str(saved), "--buffer_frames", str(frames),
+                    "--buffer_frames", str(frames),
                    "--result_file", str(result)]
         if origin != prefix:
             command += ["--index_format", "mutable"]
@@ -36,29 +36,30 @@ def fixture(args, root, dtype, fmt):
             command += ["--insert_threads", str(workers)]
         return command + list(extra), saved, private, result
 
-    def search(saved, live):
+    def scoring(cmd, live):
         nonlocal ordinal
         ordinal += 1
         truth, output = work / f"truth-{ordinal}.bin", work / f"neighbors-{ordinal}.bin"
         oracle = [sorted([(i, sum((a-b)**2 for a, b in zip(q, vectors[i]))) for i in live],
                          key=lambda hit: (hit[1], hit[0])) for q in queries]
         write_truth(truth, oracle)
-        record = run([args.driver, "--validate_inputs", "0", "--data_type", dtype,
-                      "--index_prefix", str(saved), "--index_format", "mutable",
-                      "--private_heap_path", str(work / f"query-{ordinal}.heap"),
-                      "--workload", "search_only", "--query_file", str(query), "--gt_file", str(truth),
+        workload = cmd.index("--workload") + 1
+        cmd[workload] = {"insert_only": "insert_then_search", "delete_only": "delete_then_search"}.get(cmd[workload], cmd[workload])
+        cmd += ["--query_file", str(query), "--gt_file", str(truth),
                       "--nprobe", "2", "--recall_at", "4", "--rerank_factor", "16",
-                      "--query_threads", "2", "--buffer_frames", "2", "--search_result_file", str(output)], "query")
+                       "--query_threads", "2", "--search_result_file", str(output)]
+        record = run(cmd, "query")
         assert record["recall"] == 100 and record["live_count"] == len(live)
+        assert record["writeback_dirty_pages_after"] == 0
         assert read_results(output) == [row[:4] for row in oracle]
-        return output.read_bytes()
+        return record, output.read_bytes()
 
     first = None
     for frames in (2, 64):
         for workers in (1, 2, 8):
             cmd, saved, _, output = update("insert_only", workers=workers, frames=frames,
                                           extra=["--insert_ids_file", str(insert_ids)])
-            record = run(cmd, "insert")
+            record, observed = scoring(cmd, range(64))
             assert json.loads(output.read_text()) == record
             assert record["insert_count"] == 56 and record["live_count"] == record["retained_heap_records"] == 64
             assert record["insert_threads_requested"] == record["insert_threads_effective"] == workers
@@ -66,23 +67,19 @@ def fixture(args, root, dtype, fmt):
             assert record["insert_time_s"] > 0 and record["insert_qps"] > 0
             assert "no_gt" in record["insert_time_scope"] and "distance_then_id" in record["insert_order_policy"]
             assert record["insert_worker_allowance_bytes"] > 0 and record["insert_list_growth_allowance_bytes"] > 0
-            observed = search(saved, range(64))
             if first is None:
                 first = observed
-            assert observed == first  # Logical oracle, not byte-identical list/checkpoint layout.
+            assert observed == first  # Logical oracle, not byte-identical list layout.
     cmd, saved, _, _ = update("insert_only", workers=8, extra=["--insert_ids_file", str(empty)])
-    record = run(cmd, "insert")
+    record, _ = scoring(cmd, range(8))
     assert record["insert_threads_effective"] == record["insert_count"] == record["insert_peak_active"] == 0
-    search(saved, range(8))
     cmd, deleted, _, _ = update("delete_only", extra=["--delete_ids_file", str(delete_ids)])
-    record = run(cmd, "delete")
+    record, _ = scoring(cmd, range(1, 8))
     assert record["mutation_workers"] == 1 and record["insert_threads_effective"] == 0
-    search(deleted, range(1, 8))
-    # A retired ID passes 'not live' preflight, then reserve_insert rejects it.
-    # Earlier valid inserts can finish, but failure must publish no checkpoint/result.
+    # An already-live ID must fail preflight without publishing a result.
     bad = work / "partial-failure.ids"
     ids(bad, list(range(8, 64)) + [0])
-    cmd, saved, private, result = update("insert_only", origin=deleted, workers=2,
+    cmd, saved, private, result = update("insert_only", workers=2,
                                         extra=["--insert_ids_file", str(bad)])
     failed = run(cmd)
     assert "event=failed" in failed.stderr and private.exists()
@@ -106,13 +103,11 @@ def fixture(args, root, dtype, fmt):
     failed = run(cmd)
     assert "workers exceed workspace" in failed.stderr and not output.exists()
     assert not list(work.glob(saved.name + ".*"))
-    # Sequential delete then joined parallel inserts, queries only after checkpoint.
+    # Sequential delete then joined parallel inserts, scoring only after writeback.
     cmd, saved, _, _ = update("search_after_update", workers=8,
-        extra=["--insert_ids_file", str(insert_ids), "--delete_ids_file", str(delete_ids),
-               "--query_file", str(query), "--nprobe", "2", "--recall_at", "4", "--rerank_factor", "16"])
-    record = run(cmd, "query")
+        extra=["--insert_ids_file", str(insert_ids), "--delete_ids_file", str(delete_ids)])
+    record, _ = scoring(cmd, range(1, 64))
     assert record["insert_count"] == 56 and record["delete_count"] == 1 and record["live_count"] == 63
-    search(saved, range(1, 64))
     assert hashlib.sha256(data.read_bytes()).hexdigest() == source_hash
     assert all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p, digest in originals.items())
 
@@ -126,7 +121,7 @@ def main():
     root = attempt(args.scratch)
     for dtype, fmt in (("float", "f"), ("int8", "b"), ("uint8", "B")):
         fixture(args, root, dtype, fmt)
-    print("Parallel insertion native full-population, reopen, budgets and failure publication passed")
+    print("Parallel insertion native full-population, writeback/scoring, budgets and failure publication passed")
 
 
 if __name__ == "__main__":

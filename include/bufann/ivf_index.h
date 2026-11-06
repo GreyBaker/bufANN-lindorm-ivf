@@ -8,9 +8,8 @@
 namespace diskann::ivf {
   template<typename T>
   class MutableIndex;
-  // Immutable and mutable manifests share these first eight component
-  // positions. Names clarify ownership; numeric order is part of the persisted
-  // wire contract.
+  // Immutable manifest component positions. Numeric order is part of the
+  // persisted wire contract.
   enum class IndexComponent : std::size_t {
     Centroids,
     Graph,
@@ -31,15 +30,12 @@ namespace diskann::ivf {
   inline constexpr std::array<const char*, 8> index_component_suffixes{
       ".centroids.bin", ".hnsw",      ".router",        ".lists",
       ".heap",          ".heap.meta", ".heap.meta.ivf", ".pq.bin"};
-  inline constexpr std::array<const char*, 10> mutable_component_suffixes{
-      ".centroids.bin", ".hnsw",          ".router", ".mlists",     ".heap",
-      ".heap.meta",     ".heap.meta.ivf", ".pq.bin", ".heap.state", ".origin"};
   inline constexpr std::array<const char*, 3> native_router_suffixes{
       ".patched.hnsw", ".refined.hnsw", ".pca"};
 
   struct IndexManifest {
     uint32_t format_version =
-        3;  // Preserve loaded framing versions in mutable origin checkpoints.
+        3;  // Preserve loaded immutable framing versions.
     BuildConfig   training;
     RouterOptions routing;
     HeapOptions   heap;
@@ -115,10 +111,9 @@ namespace diskann::ivf {
   };
 
   // Native mutable session, forked onto a verified private heap file. Original
-  // bundle artifacts remain immutable. Mutable checkpoints are separate
-  // immutable families; reopen copies onto a new private heap/PQ sidecar. CLI
-  // updates use this API. Frozen router/codebook; logically deleted/aborted
-  // physical slots are retained.
+  // bundle artifacts remain immutable. Sessions are disposable: no mutable
+  // save/load, WAL, crash recovery or durable acknowledgment. Frozen router and
+  // codebook; logically deleted/aborted physical slots are retained.
   template<typename T>
   class MutableIndex {
    public:
@@ -126,16 +121,15 @@ namespace diskann::ivf {
         const std::string&         immutable_prefix,
         const std::string&         new_private_heap_path,
         const MutableIndexOptions& options = {});
-    static std::unique_ptr<MutableIndex> reopen(
-        const std::string&         checkpoint_prefix,
-        const std::string&         new_private_heap_path,
-        const MutableIndexOptions& options = {});
-    // Exclusive lifecycle admission waits for current operations to quiesce;
-    // new operations resume afterward. NEW prefix only, manifest written last.
-    // Preserve partial failures; no fsync/atomic generation/crash recovery.
-    void                 checkpoint(const std::string& new_prefix,
-                                    uint64_t           workspace_bytes = 64ull * 1024 * 1024);
-    uint64_t             estimated_checkpoint_bytes() const;
+    // Exclusive admission drains current operations. Writes dirty pages in
+    // bounded batches, without exporting index metadata or providing durability.
+    void writeback(uint64_t workspace_bytes);
+    uint64_t estimated_writeback_bytes() const {
+      return _heap->writeback_workspace_bytes();
+    }
+    uint32_t dirty_pages() const {
+      return _heap->dirty_pages();
+    }
     const IndexManifest& origin_manifest() const {
       return _origin;
     }
@@ -191,13 +185,10 @@ namespace diskann::ivf {
    private:
     MutableIndex() = default;
     void                      require_healthy() const;
-    void                      validate_checkpoint_membership() const;
     mutable std::shared_mutex _lifecycle;
     IndexManifest             _origin;
     uint64_t                  _fork_bytes = 0, _other_bytes = 0;
     std::atomic<bool>         _failed{false};
-    std::string
-        _pq_artifact_path;  // Owned immutable private-heap + .pq.bin sidecar.
     std::unique_ptr<CentroidRouter>      _router;
     std::unique_ptr<PQCodebook<T>>       _pq;
     std::unique_ptr<MutablePostingLists> _lists;

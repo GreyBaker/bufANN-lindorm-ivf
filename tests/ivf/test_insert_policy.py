@@ -27,7 +27,7 @@ def fixture(args, root, dtype, fmt):
         saved, private, result = work / f"saved-{ordinal}", work / f"private-{ordinal}.heap", work / f"result-{ordinal}.json"
         cmd = [args.driver, "--validate_inputs", "0", "--data_type", dtype,
                "--index_prefix", str(prefix), "--workload", workload, "--full_data_file", str(data),
-               "--private_heap_path", str(private), "--checkpoint_prefix", str(saved),
+               "--private_heap_path", str(private),
                "--buffer_frames", str(frames), "--insert_threads", str(workers), "--result_file", str(result)]
         if policy is not None:
             cmd += ["--insert_input_policy", policy]
@@ -44,23 +44,21 @@ def fixture(args, root, dtype, fmt):
         assert "excludes_gt_and_export" in record["query_timing_scope"]
         assert record["driver_workflow_time_s"] >= record["open_time_s"] + record["query_time_s"]
 
-    def search(saved, live):
+    def search(cmd, live):
         nonlocal ordinal
         ordinal += 1
         truth, output = work / f"truth-{ordinal}.bin", work / f"neighbors-{ordinal}.bin"
         gold = oracle(live)
         write_truth(truth, gold)
-        record = run([args.driver, "--validate_inputs", "0", "--data_type", dtype,
-                      "--index_prefix", str(saved), "--index_format", "mutable",
-                      "--private_heap_path", str(work / f"query-{ordinal}.heap"),
-                      "--workload", "search_only", "--query_file", str(query), "--gt_file", str(truth),
+        cmd[cmd.index("--workload") + 1] = "insert_then_search"
+        record = run(cmd + ["--query_file", str(query), "--gt_file", str(truth),
                       "--nprobe", "2", "--recall_at", "4", "--rerank_factor", "16", "--query_threads", "2",
-                      "--buffer_frames", "2", "--search_result_file", str(output)], "query")
+                      "--search_result_file", str(output)], "query")
         check_query(record)
-        assert record["query_cache_process_policy"].startswith("private_mutable_copy")
+        assert record["query_cache_process_policy"].startswith("same_process_live_mutable_session_after_writeback")
         assert record["recall"] == 100 and record["live_count"] == len(live)
         assert read_results(output) == [row[:4] for row in gold]
-        return output.read_bytes()
+        return record, output.read_bytes()
 
     def check_update(record, policy, count=56):
         assert record["insert_count"] == count and record["insert_input_policy"] == policy
@@ -69,31 +67,30 @@ def fixture(args, root, dtype, fmt):
         assert record["insert_input_preparation_time_s"] == record["coordinate_validation_or_staging_time_s"]
         assert "not_additive" in record["insert_input_preparation_time_scope"]
         assert ("no_source_reads" in record["insert_time_scope"]) == (policy == "staged")
-        assert record["mutation_completion_policy"].startswith("joined_publications")
-        assert "not_wal_or_crash_durability" in record["checkpoint_completion_scope"]
+        assert record["mutation_completion_policy"] == "online_visibility_then_final_writeback_not_durable_commit"
+        assert record["writeback_dirty_pages_after"] == 0
+        assert "no_fsync_no_metadata_export" in record["writeback_policy"]
         assert record["driver_workflow_time_s"] >= (
-            record["open_time_s"] + record["insert_time_s"] + record["checkpoint_time_s"] + record["insert_input_preparation_time_s"])
+            record["open_time_s"] + record["insert_time_s"] + record["writeback_time_s"] + record["insert_input_preparation_time_s"])
         assert "before_canonical_record_write_not_process_lifetime" in record["driver_workflow_time_scope"]
 
     first = None
-    stream_allowance = None
     for policy in (None, "staged"):
         actual = policy or "streaming"
         for frames in (2, 64):
             for workers in (1, 8):
                 cmd, saved, _, output = update(policy, workers, frames, extra=["--insert_ids_file", str(insert_ids)])
-                record = run(cmd, "insert")
+                record, observed = search(cmd, range(64))
                 assert json.loads(output.read_text()) == record
                 check_update(record, actual)
                 assert record["insert_threads_effective"] == workers
                 assert record["live_count"] == record["retained_heap_records"] == 64
-                if policy is None and frames == 2 and workers == 1:
-                    stream_allowance = record["estimated_update_workspace_bytes"]
-                observed = search(saved, range(64))
                 first = observed if first is None else first
                 assert observed == first
     # Synthetic budget control: hold the streaming allowance fixed, then refuse
     # the additional staged payload before loading/mutation, without reducing rows.
+    cmd, _, _, _ = update("streaming", extra=["--insert_ids_file", str(insert_ids)])
+    stream_allowance = run(cmd, "insert")["estimated_update_workspace_bytes"]
     budget = format((stream_allowance + 64) / (1 << 30), ".17g")
     cmd, _, _, _ = update("streaming", extra=["--insert_ids_file", str(insert_ids), "--memory_budget_gb", budget])
     run(cmd, "insert")
@@ -104,10 +101,9 @@ def fixture(args, root, dtype, fmt):
     assert not output.exists() and not list(work.glob(saved.name + ".*"))
     for policy in ("streaming", "staged"):
         cmd, saved, _, _ = update(policy, workers=8, extra=["--insert_ids_file", str(empty)])
-        record = run(cmd, "insert")
+        record, _ = search(cmd, range(8))
         check_update(record, policy, 0)
         assert record["insert_threads_effective"] == 0
-        search(saved, range(8))
         truth, result = work / f"combined-{policy}.gt", work / f"combined-{policy}.bin"
         gold = oracle(range(1, 64))
         write_truth(truth, gold)
@@ -118,10 +114,9 @@ def fixture(args, root, dtype, fmt):
         record = run(cmd, "query")
         check_update(record, policy)
         check_query(record)
-        assert "same_process_live_mutable_session_after_checkpoint_no_reopen" in record["query_cache_process_policy"]
+        assert "same_process_live_mutable_session_after_writeback_no_reopen" in record["query_cache_process_policy"]
         assert record["recall"] == 100 and record["live_count"] == 63
         assert read_results(result) == [row[:4] for row in gold]
-        search(saved, range(1, 64))
     for policy in ("auto", "unknown"):
         cmd, saved, private, output = update(policy)
         failed = run(cmd)

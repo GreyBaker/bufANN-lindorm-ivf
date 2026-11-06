@@ -350,67 +350,6 @@ namespace diskann::ivf {
       check(!std::filesystem::exists(std::filesystem::symlink_status(path)),
             "Mutable IVF output artifact exists");
     }
-    uint64_t mutable_other_allowance(const IndexManifest& m, uint32_t frames,
-                                     uint64_t heap_file_bytes) {
-      const uint64_t slot_bytes = 8 + ((uint64_t(m.heap.dim) + 7) / 8 * 8) *
-                                          element_size(m.training.data_type);
-      const auto slots = (m.heap.page_size - 16) / (slot_bytes + 1);
-      check(slots > 0 && heap_file_bytes % m.heap.page_size == 0,
-            "Invalid mutable IVF heap layout/file size");
-      const auto pages =
-          ((uint64_t(m.heap.id_capacity) + 256 * slots - 1) / (256 * slots)) *
-          256;
-      uint64_t bytes = heap_allowance(
-          m, frames, std::max(pages, heap_file_bytes / m.heap.page_size));
-      add(bytes, m.heap.id_capacity);
-      add(bytes, pq_allowance(m));
-      add(bytes, CentroidRouter::estimate_build_bytes(
-                     m.training.dim, m.training.nlist, m.routing));
-      add(bytes, 65536);
-      return bytes;
-    }
-    struct MutableManifest {
-      uint32_t                       live = 0, retained = 0;
-      std::array<ArtifactDigest, 10> components{};
-      bool                           native = false;
-      std::array<ArtifactDigest, 3>  native_components{};
-    };
-    MutableManifest read_mutable_manifest(const std::string& prefix) {
-      check(std::filesystem::file_size(prefix + ".manifest") <= 4096,
-            "Mutable IVF manifest exceeds framing limit");
-      std::ifstream in(prefix + ".manifest", std::ios::binary);
-      in.imbue(std::locale::classic());
-      std::string version;
-      in >> version;
-      check(version == "IVFMUTABLE1" || version == "IVFMUTABLE2",
-            "Unsupported mutable IVF version");
-      MutableManifest m;
-      m.native = version == "IVFMUTABLE2";
-      m.live = integer<uint32_t>(in);
-      m.retained = integer<uint32_t>(in);
-      read_component_digests(in, mutable_component_suffixes, m.components);
-      if (m.native)
-        read_component_digests(in, native_router_suffixes, m.native_components);
-      in >> std::ws;
-      check(in.eof(), "Trailing mutable IVF manifest data");
-      return m;
-    }
-    void validate_frozen_components(const MutableManifest& current,
-                                    const IndexManifest&   origin) {
-      check(current.native == origin.routing.native_modes &&
-                (!current.native ||
-                 current.native_components == origin.native_components),
-            "Mutable IVF checkpoint changed native router/PCA identity");
-      for (auto component : {IndexComponent::Centroids, IndexComponent::Graph,
-                             IndexComponent::Router, IndexComponent::PQ}) {
-        const auto i = component_index(component);
-        check(current.components[i] == origin.components[i],
-              "Mutable IVF checkpoint changed frozen router/PQ identity");
-      }
-      check(current.live <= current.retained &&
-                current.retained <= origin.heap.id_capacity - origin.first_id,
-            "Invalid mutable IVF checkpoint population");
-    }
   }  // namespace
 
   template<typename T>
@@ -681,9 +620,9 @@ namespace diskann::ivf {
     copy_component(
         source + ".heap",
         heap_path);  // Exclusive claim, real bytes, no writable source symlink.
-    result->_pq_artifact_path = heap_path + ".pq.bin";
-    copy_component(source + ".pq.bin", result->_pq_artifact_path);
-    check(artifact_digest(result->_pq_artifact_path) ==
+    const auto pq_artifact_path = heap_path + ".pq.bin";
+    copy_component(source + ".pq.bin", pq_artifact_path);
+    check(artifact_digest(pq_artifact_path) ==
               m.components[component_index(IndexComponent::PQ)],
           "Mutable IVF private PQ copy integrity mismatch");
     check(artifact_digest(heap_path) ==
@@ -705,9 +644,7 @@ namespace diskann::ivf {
   }
   template<typename T>
   void MutableIndex<T>::require_healthy() const {
-    check(!failed(),
-          "Mutable IVF session failed; discard owned heap rather than "
-          "checkpointing");
+    check(!failed(), "Mutable IVF session failed; discard owned heap");
   }
   template<typename T>
   uint64_t MutableIndex<T>::estimated_mutation_bytes(bool exact) const {
@@ -805,162 +742,14 @@ namespace diskann::ivf {
   }
 
   template<typename T>
-  void MutableIndex<T>::validate_checkpoint_membership() const {
-    check(_lists->pending_insertions() == 0 && _lists->size() == _heap->size(),
-          "Mutable IVF checkpoint is not quiescent/consistent");
-    for (uint32_t id = 0; id < _heap->id_capacity(); ++id) {
-      const auto state = _heap->_mutable_states[id];
-      if (id < _lists->first_id()) {
-        check(state == HeapStorage<T>::MutableState::Absent,
-              "Mutable IVF heap record below allowed ID range");
-        continue;
-      }
-      check(_lists->contains(id) ==
-                    (state == HeapStorage<T>::MutableState::Live) &&
-                _lists->deleted(id) ==
-                    (state == HeapStorage<T>::MutableState::Deleted) &&
-                state != HeapStorage<T>::MutableState::Prepared,
-            "Mutable IVF heap/list live/tombstone mismatch");
-    }
-  }
-  template<typename T>
-  uint64_t MutableIndex<T>::estimated_checkpoint_bytes() const {
-    uint64_t bytes = 65536;
-    add(bytes, _heap->id_capacity(), 32);
-    add(bytes, _heap->retained_file_bytes() / _origin.heap.page_size, 16);
-    add(bytes, _origin.training.nlist, 16);
-    add(bytes, _origin.training.dim, sizeof(float));
-    if (_router->has_native_modes())
-      add(bytes, _router->nlist(),
-          32);  // Native graph validation BFS/indegrees.
-    return bytes;
-  }
-  template<typename T>
-  void MutableIndex<T>::checkpoint(const std::string& prefix,
-                                   uint64_t           workspace_bytes) {
+  void MutableIndex<T>::writeback(uint64_t workspace_bytes) {
     std::unique_lock admission(_lifecycle);
     require_healthy();
-    check(!prefix.empty() && estimated_checkpoint_bytes() <= workspace_bytes,
-          "Mutable IVF checkpoint exceeds workspace allowance/empty prefix");
-    validate_checkpoint_membership();
-    require_new_artifact(prefix + ".manifest");
-    for (auto suffix : mutable_component_suffixes)
-      require_new_artifact(prefix + suffix);
-    if (_origin.routing.native_modes)
-      for (auto suffix : native_router_suffixes)
-        require_new_artifact(prefix + suffix);
-    check(artifact_digest(_pq_artifact_path) ==
-              _origin.components[component_index(IndexComponent::PQ)],
-          "Mutable IVF private PQ sidecar changed");
-    claim_artifact(prefix + ".manifest");  // Exclusive prefix reservation;
-                                           // empty on partial failure.
-    _router->save(prefix);
-    _lists->save_checkpoint(prefix + ".mlists");
-    _heap->checkpoint_mutable_copy(prefix + ".heap", prefix + ".heap.meta",
-                                   prefix + ".heap.state");
-    copy_component(_pq_artifact_path, prefix + ".pq.bin");
-    claim_artifact(prefix + ".origin");
-    write_manifest_file(prefix + ".origin", _origin);
-    MutableManifest current;
-    current.live = _lists->size();
-    current.retained = _heap->retained_size();
-    current.native = _origin.routing.native_modes;
-    collect_component_digests(prefix, mutable_component_suffixes,
-                              current.components);
-    if (current.native)
-      collect_component_digests(prefix, native_router_suffixes,
-                                current.native_components);
-    validate_frozen_components(current, _origin);
-    std::ofstream out(prefix + ".manifest", std::ios::binary);
-    out.imbue(std::locale::classic());
-    out << (current.native ? "IVFMUTABLE2" : "IVFMUTABLE1") << ' '
-        << current.live << ' ' << current.retained << '\n';
-    write_component_digests(out, mutable_component_suffixes, current.components);
-    if (current.native)
-      write_component_digests(out, native_router_suffixes,
-                              current.native_components);
-    out.close();
-    check(bool(out), "Mutable IVF checkpoint manifest write failure");
-  }
-  template<typename T>
-  std::unique_ptr<MutableIndex<T>> MutableIndex<T>::reopen(
-      const std::string& prefix, const std::string& heap_path,
-      const MutableIndexOptions& options) {
-    check(!prefix.empty() && !heap_path.empty() && options.buffer_frames >= 2,
-          "Invalid mutable IVF reopen options");
-    require_new_artifact(heap_path);
-    require_new_artifact(heap_path + ".pq.bin");
-    const auto current = read_mutable_manifest(prefix);
-    verify_component_digests(prefix, mutable_component_suffixes,
-                             current.components,
-                             "Mutable IVF checkpoint integrity mismatch");
-    if (current.native)
-      verify_component_digests(prefix, native_router_suffixes,
-                               current.native_components,
-                               "Mutable native component integrity mismatch");
-    auto origin = read_manifest_file(prefix + ".origin");
-    validate_frozen_components(current, origin);
-    check(origin.training.data_type == type<T>(),
-          "Mutable IVF checkpoint dtype mismatch");
-    const auto other = mutable_other_allowance(
-        origin, options.buffer_frames,
-        current.components[component_index(IndexComponent::Heap)].bytes);
-    check(other < options.memory_budget_bytes,
-          "Mutable IVF reopen components exceed memory allowance");
-    MutableListOptions list_options{origin.training.nlist, origin.chunks,
-                                    origin.heap.id_capacity, origin.first_id,
-                                    options.list_memory_budget_bytes
-                                        ? options.list_memory_budget_bytes
-                                        : options.memory_budget_bytes - other};
-    check(
-        list_options.memory_budget_bytes <= options.memory_budget_bytes - other,
-        "Mutable IVF reopen list budget exceeds composed allowance");
-    const auto list_info = MutablePostingLists::inspect_checkpoint(
-        prefix + ".mlists", list_options);
-    check(list_info.live == current.live &&
-              list_info.estimated_bytes <= list_options.memory_budget_bytes,
-          "Mutable IVF reopen list population/budget mismatch");
-    auto result = std::unique_ptr<MutableIndex>(new MutableIndex);
-    result->_origin = origin;
-    result->_other_bytes = other;
-    result->_fork_bytes = other + list_info.estimated_bytes;
-    result->_lists =
-        MutablePostingLists::load_checkpoint(prefix + ".mlists", list_options);
-    const auto router_bytes = CentroidRouter::estimate_build_bytes(
-        origin.training.dim, origin.training.nlist, origin.routing);
-    result->_router = CentroidRouter::load(prefix, router_bytes);
-    check(result->_router->dim() == origin.training.dim &&
-              result->_router->nlist() == origin.training.nlist &&
-              same_routing(result->_router->options(), origin.routing) &&
-              (!origin.routing.native_modes ||
-               result->_router->projected_dim() == origin.pca_retained_dim),
-          "Mutable IVF checkpoint router mismatch");
-    result->_pq = std::make_unique<PQCodebook<T>>(
-        prefix + ".pq.bin", origin.training.dim, origin.chunks);
-    copy_component(prefix + ".heap", heap_path);
-    result->_pq_artifact_path = heap_path + ".pq.bin";
-    copy_component(prefix + ".pq.bin", result->_pq_artifact_path);
-    check(artifact_digest(heap_path) ==
-                  current.components[component_index(IndexComponent::Heap)] &&
-              artifact_digest(result->_pq_artifact_path) ==
-                  current.components[component_index(IndexComponent::PQ)],
-          "Mutable IVF reopen private copy integrity mismatch");
-    auto runtime_heap = origin.heap;
-    runtime_heap.buffer_frames = options.buffer_frames;
-    result->_heap = HeapStorage<T>::reopen_mutable_checkpoint_copy(
-        runtime_heap, heap_path, prefix + ".heap.meta", prefix + ".heap.state");
-    check(result->_heap->size() == current.live &&
-              result->_heap->retained_size() == current.retained,
-          "Mutable IVF checkpoint heap population mismatch");
-    result->validate_checkpoint_membership();
-    verify_component_digests(prefix, mutable_component_suffixes,
-                             current.components,
-                             "Mutable IVF checkpoint changed during reopen");
-    if (current.native)
-      verify_component_digests(prefix, native_router_suffixes,
-                               current.native_components,
-                               "Mutable native checkpoint changed during reopen");
-    return result;
+    check(estimated_writeback_bytes() <= workspace_bytes,
+          "Mutable IVF writeback exceeds workspace allowance");
+    check(_lists->pending_insertions() == 0 && _lists->size() == _heap->size(),
+          "Mutable IVF writeback is not quiescent/consistent");
+    _heap->writeback(workspace_bytes);
   }
   template class MutableIndex<float>;
   template class MutableIndex<int8_t>;

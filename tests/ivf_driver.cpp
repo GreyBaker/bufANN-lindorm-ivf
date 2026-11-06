@@ -38,7 +38,6 @@ int main(int argc, char** argv) {
                              "--search_result_file",
                              "--index_format",
                              "--private_heap_path",
-                             "--checkpoint_prefix",
                              "--scheduler",
                              "--pool_threads",
                              "--query_ratio",
@@ -55,7 +54,7 @@ int main(int argc, char** argv) {
              "float|int8|uint8\n"
              "  --index_prefix PATH --dim N --nlist N --query_file PATH\n"
              "  --workload "
-             "search_only|insert_only|delete_only|search_after_update|mixed\n"
+             "search_only|insert_only|delete_only|insert_then_search|delete_then_search|search_after_update|mixed\n"
              "  [--pq_prefix PATH] [--gt_file PATH] [--recall_at N] "
              "[--query_threads N]\n"
              "  [--warmup_queries 0..100000] (default 0, frozen base-centroid "
@@ -70,16 +69,16 @@ int main(int argc, char** argv) {
              "  [--search_result_file SPFresh_BINARY_PATH]\n";
       std::cout << "Native search_only: --private_heap_path NEW_PATH forks an "
                    "immutable base into a mutable session without updates.\n";
-      std::cout << "Updates: --private_heap_path NEW_PATH --checkpoint_prefix "
-                   "NEW_PREFIX\n"
+      std::cout << "Updates: --private_heap_path NEW_PATH\n"
                    "  --full_data_file ORIGINAL_FULL_SOURCE "
                    "--insert_ids_file/--delete_ids_file COUNTED_IDS\n"
-                   "  [--index_format immutable|mutable] (default immutable; "
-                   "mutable requires a new private heap)\n"
+                   "  [--index_format immutable] (updated sessions cannot be reopened)\n"
                    "insert_only/delete_only need no queries. "
                    "search_after_update deletes then inserts,\n"
-                   "checkpoints and queries the final live set; no concurrent "
+                   "writes dirty pages and queries the final live set; no concurrent "
                    "mixed scheduling.\n";
+      std::cout << "insert_then_search/delete_then_search mutate and score in one session.\n"
+                   "Final page writeback is separate from mutation timing, not a durable commit.\n";
       std::cout
           << "Sequential insertion: [--insert_threads 1..256] (default 1);\n"
              "  only insert_only/search_after_update; delete phase stays "
@@ -123,7 +122,7 @@ int main(int argc, char** argv) {
     args.reject_present(
         {"--memory_budget_gb", "--buffer_frames", "--result_file",
          "--search_result_file", "--index_format", "--private_heap_path",
-         "--checkpoint_prefix", "--scheduler", "--pool_threads",
+          "--scheduler", "--pool_threads",
          "--query_ratio", "--query_count", "--scheduler_seed", "--router_mode",
          "--router_rerank_factor", "--router_breadth", "--insert_threads",
           "--insert_input_policy", "--warmup_queries", "--round_schedule",
@@ -143,6 +142,7 @@ int main(int argc, char** argv) {
     const std::string workload = args.require("--workload");
     if (workload != "search_only" && workload != "insert_only" &&
         workload != "delete_only" && workload != "search_after_update" &&
+        workload != "insert_then_search" && workload != "delete_then_search" &&
         workload != "mixed") {
       throw std::invalid_argument("unsupported IVF workload");
     }
@@ -157,11 +157,11 @@ int main(int argc, char** argv) {
     if (workload != "search_only" || !args.get("--full_data_file").empty()) {
       const auto vectors =
           inspect_vectors(args.require("--full_data_file"), type, dim);
-      if (workload == "insert_only" || workload == "search_after_update" ||
+      if (workload == "insert_only" || workload == "insert_then_search" || workload == "search_after_update" ||
           workload == "mixed") {
         load_counted_ids(args.require("--insert_ids_file"), vectors.rows);
       }
-      if (workload == "delete_only" || workload == "search_after_update" ||
+      if (workload == "delete_only" || workload == "delete_then_search" || workload == "search_after_update" ||
           workload == "mixed") {
         load_counted_ids(args.require("--delete_ids_file"), vectors.rows);
       }

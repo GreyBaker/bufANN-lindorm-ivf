@@ -55,34 +55,19 @@ SUFFIXES = (
     ".pq.bin",
     ".manifest",
 )
-MUTABLE_SUFFIXES = (
-    ".centroids.bin",
-    ".hnsw",
-    ".router",
-    ".mlists",
-    ".heap",
-    ".heap.meta",
-    ".heap.meta.ivf",
-    ".pq.bin",
-    ".heap.state",
-    ".origin",
-    ".manifest",
-)
 NATIVE_SUFFIXES = (".patched.hnsw", ".refined.hnsw", ".pca")
 
 
-def bundle_suffixes(prefix, mutable=False):
+def bundle_suffixes(prefix):
     manifest = Path(str(prefix) + ".manifest")
     require(
         manifest.is_file() and not manifest.is_symlink() and manifest.stat().st_size <= 16384,
         "missing/symlink/oversized IVF manifest",
     )
     version = manifest.read_text().split(maxsplit=1)[0]
-    family = "IVFMUTABLE" if mutable else "IVFINDEX"
     require(
-        version in (family + "1", family + "2")
-        or (not mutable and version in ("IVFINDEX3", "IVFINDEX4")),
-        "unsupported IVF bundle version",
+        version in ("IVFINDEX1", "IVFINDEX2", "IVFINDEX3", "IVFINDEX4"),
+        "unsupported immutable IVF bundle version; mutable checkpoints are not supported",
     )
     native = version.endswith("2")
     if version in ("IVFINDEX3", "IVFINDEX4"):
@@ -96,7 +81,7 @@ def bundle_suffixes(prefix, mutable=False):
             "invalid optimized-mode flag",
         )
         native = fields[0][1] == "1"
-    return (MUTABLE_SUFFIXES if mutable else SUFFIXES) + (NATIVE_SUFFIXES if native else ())
+    return SUFFIXES + (NATIVE_SUFFIXES if native else ())
 
 
 def mutation_identity(args, work):
@@ -280,17 +265,22 @@ def driver_open_command(args, nlist, prefix):
 
 def run(args):
     workflow_start = time.monotonic()
-    mutation_process_wall_s = None
     work = args.work_dir.resolve()
     prepared = read_json(work / "prepared.json")
     query_resources = runtime_resources(prepared["settings"]["page_size"], query=True)
     mutation_resources = (runtime_resources(prepared["settings"]["page_size"])
-                           if args.workload != "query" else None)
+                            if args.workload != "query" else None)
+    # One session must respect both declared phase budgets, not silently use
+    # the larger allowance. Frame settings are shared by these resource views.
+    resources = dict(query_resources)
+    if mutation_resources is not None:
+        resources["memory_budget_gb"] = min(
+            query_resources["memory_budget_gb"], mutation_resources["memory_budget_gb"], key=float)
     insert_workers = insertion_threads() if args.workload == "insert" else None
     query_warmups = warmup_queries()
     insert_policy = insertion_input_policy() if args.workload == "insert" else None
     if insert_policy == "staged":
-        validate_insertion_staging(mutation_resources, args.update_count, args.dim, args.dtype)
+        validate_insertion_staging(resources, args.update_count, args.dim, args.dtype)
     require(
         prepared["version"] == 1 and prepared["profile"] == profile(args),
         "profile changed since prepare",
@@ -334,6 +324,11 @@ def run(args):
         "execution_protocol.json",
         "query.heap",
         "query.heap.pq.bin",
+        "private.heap",
+        "private.heap.pq.bin",
+        "mutation_result.json",
+        "mutation.log",
+        "checkpoint",
     ):
         path = output / name
         require_absent(
@@ -342,65 +337,9 @@ def run(args):
         )
     # The driver writes canonical metrics directly; provenance stays separate.
     write_json(output / "nlist_selection.json", selection)
-    if mutation is not None:
-        for name in (
-            "mutation.log",
-            "mutation_result.json",
-            "private.heap",
-            "private.heap.pq.bin",
-            "checkpoint",
-        ):
-            path = output / name
-            require_absent(path, f"mutation output exists: {path}")
-        checkpoint = output / "checkpoint"
-        checkpoint.mkdir()
-        saved = checkpoint / args.dataset
-        command = driver_open_command(args, prepared["settings"]["nlist"], prefix) + [
-            "--workload",
-            args.workload + "_only",
-            "--full_data_file",
-            str(work / "data/full.bin"),
-            "--" + args.workload + "_ids_file",
-            str(work / (args.workload + "_ids.bin")),
-            "--private_heap_path",
-            str(output / "private.heap"),
-            "--checkpoint_prefix",
-            str(saved),
-            "--buffer_frames",
-            mutation_resources["buffer_frames"],
-            "--memory_budget_gb",
-            mutation_resources["memory_budget_gb"],
-            "--result_file",
-            str(output / "mutation_result.json"),
-        ]
-        if insert_workers is not None:
-            command += ["--insert_threads", insert_workers, "--insert_input_policy", insert_policy]
-        mutation_start = time.monotonic()
-        command_log(command, output / "mutation.log")
-        mutation_process_wall_s = time.monotonic() - mutation_start
-        record = read_json(output / "mutation_result.json")
-        require(
-            record["phase"] == args.workload
-            and record[args.workload + "_count"] == args.update_count
-            and record["live_count"]
-            == args.base_count
-            + (args.update_count if args.workload == "insert" else -args.update_count),
-            "mutation execution count/live set mismatch",
-        )
-        require(
-            mutation_identity(args, work) == mutation, "source/update IDs changed during mutation"
-        )
-        require(
-            all(
-                Path(str(saved) + suffix).is_file() and not Path(str(saved) + suffix).is_symlink()
-                for suffix in bundle_suffixes(saved, mutable=True)
-            ),
-            "missing mutable checkpoint family",
-        )
-        prefix = saved
     command = driver_open_command(args, prepared["settings"]["nlist"], prefix) + [
         "--workload",
-        "search_only",
+        args.workload + "_then_search" if mutation is not None else "search_only",
         "--query_file",
         prepared["query"],
         "--gt_file",
@@ -409,51 +348,61 @@ def run(args):
         str(args.recall_at),
     ] + query_search_flags() + [
         "--buffer_frames",
-        query_resources["buffer_frames"],
+        resources["buffer_frames"],
         "--memory_budget_gb",
-        query_resources["memory_budget_gb"],
+        resources["memory_budget_gb"],
         "--result_file",
         str(output / "result.json"),
         "--search_result_file",
         str(output / "neighbors.bin"),
     ]
     if mutation is not None:
-        command += ["--index_format", "mutable"]
+        command += ["--full_data_file", str(work / "data/full.bin"),
+                    "--" + args.workload + "_ids_file", str(work / (args.workload + "_ids.bin"))]
+        if insert_workers is not None:
+            command += ["--insert_threads", insert_workers, "--insert_input_policy", insert_policy]
     # Always serve queries from a private mutable session.
-    command += ["--private_heap_path", str(output / "query.heap")]
+    command += ["--private_heap_path", str(output / ("private.heap" if mutation is not None else "query.heap"))]
     command += query_policy_flags(query_warmups)
     query_start = time.monotonic()
     command_log(command, output / "run.log")
     query_process_wall_s = time.monotonic() - query_start
     record = read_json(output / "result.json")
     require(
-        is_query_record(record, "query")
+        is_query_record(record, "search_after_update" if mutation is not None else "query")
         and "recall" in record,
         "missing canonical native query record",
     )
     require(record["explicit_warmup_query_count"] == int(query_warmups),
-            "native warmup completion count differs from requested policy")
+             "native warmup completion count differs from requested policy")
+    if mutation is not None:
+        require(record[args.workload + "_count"] == args.update_count
+                and record["live_count"] == args.base_count + (args.update_count if args.workload == "insert" else -args.update_count)
+                and record["update_protocol_version"] == 4
+                and record["writeback_dirty_pages_after"] == 0,
+                "mutation count/live-set/writeback mismatch")
+        require(mutation_identity(args, work) == mutation, "source/update IDs changed during execution")
     write_json(output / "execution_protocol.json", {
-        "version": 1,
+        "version": 2,
         "kind": "ivf_sequential_harness_execution_protocol",
         "completed": True,
         "insert_input_policy": insert_policy,
         "insert_threads_requested": int(insert_workers) if insert_workers is not None else None,
-        "native_driver_process_count": 2 if mutation is not None else 1,
+        "native_driver_process_count": 1,
         "process_boundary_policy": (
-            "mutation_driver_verified_checkpoint_then_separate_query_driver_private_copy"
+            "one_driver_mutation_writeback_then_same_session_scoring"
             if mutation is not None else "standalone_query_driver"),
         "application_cache_transfer_between_driver_processes": False,
         "query_session_policy": (
-            "mutable_checkpoint_reopened_as_private_mutable_session"
+            "immutable_base_forked_once_mutated_and_scored_without_reopen"
             if mutation is not None else "immutable_base_forked_to_mutable_session_without_updates"),
         "warmup_query_count_requested": int(query_warmups),
         "explicit_warmup_query_count": record["explicit_warmup_query_count"],
         "warmup_policy": record["warmup_policy"],
-        "warmup_process_policy": "inside_query_driver_same_index_object_frozen_base_centroids_not_transferred_from_mutation_driver",
+        "warmup_process_policy": "inside_query_driver_same_index_object_frozen_base_centroids_after_writeback_for_sequential_updates",
         "os_cache_policy": "not_controlled_validation_hash_and_copy_may_touch_pages",
-        "mutation_process_wall_s": mutation_process_wall_s,
-        "query_process_wall_s": query_process_wall_s,
+        "native_process_wall_s": query_process_wall_s,
+        "effective_memory_budget_gb": resources["memory_budget_gb"],
         "process_wall_scope": "parent_spawn_wait_includes_native_record_write_and_log_streaming_not_cpu_or_device_time",
         "harness_workflow_wall_s": time.monotonic() - workflow_start,
         "harness_workflow_scope": "run_entry_through_native_record_validation_pre_protocol_write_excludes_prepare_script_and_outer_shell_exports",

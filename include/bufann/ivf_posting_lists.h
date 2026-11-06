@@ -27,14 +27,10 @@ namespace diskann::ivf {
     std::vector<uint8_t>  codes;
     uint64_t              capacity_slots = 0;
   };
-  struct MutableListCheckpointInfo {
-    uint32_t live = 0, deleted = 0;
-    uint64_t missing_deletes = 0, estimated_bytes = 0;
-  };
 
   // Mutable list component seam, NOT a heap transaction or persisted
   // NativeIndex. Caller supplies already encoded global PQ8 bytes. MutableIndex
-  // composes readiness/ publication and quiescent checkpoints separately for
+  // composes readiness/publication for
   // native mutation workloads. Lists/locator storage is stable; IDs cannot be
   // reused after a successful erase.
   class MutablePostingLists {
@@ -78,13 +74,6 @@ namespace diskann::ivf {
     static std::unique_ptr<MutablePostingLists> from_immutable(
         const PostingLists& input,
         uint64_t            memory_budget_bytes = 1024ull * 1024 * 1024);
-    // Separate mutable framing: arbitrary membership/order, capacities and
-    // tombstones. Caller MUST quiesce operations and reservations during save.
-    void save_checkpoint(const std::string& path) const;
-    static MutableListCheckpointInfo inspect_checkpoint(
-        const std::string& path, const MutableListOptions& expected);
-    static std::unique_ptr<MutablePostingLists> load_checkpoint(
-        const std::string& path, const MutableListOptions& expected);
     bool deleted(uint32_t id) const;
     MutablePostingLists(const MutablePostingLists&) = delete;
     MutablePostingLists& operator=(const MutablePostingLists&) = delete;
@@ -153,8 +142,7 @@ namespace diskann::ivf {
       uint64_t                    capacity = 0;
     };
     MutablePostingLists(const MutableListOptions& options,
-                        const PostingLists*       input,
-                        bool                      allocate_buffers = true);
+                        const PostingLists*       input);
     size_t      relative_id(uint32_t id) const;
     List&       checked_list(uint32_t list);
     const List& checked_list(uint32_t list) const;

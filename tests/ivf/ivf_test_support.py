@@ -131,7 +131,7 @@ def run_native_cli(command, phase=None):
                 finished = [p for p in progress if p["phase"] == name and p["event"] == "complete"]
                 assert len(finished) == 1 and int(finished[0]["completed"]) == count, progress
             assert records[0]["foreground_heap_flush_bytes"] == records[0]["foreground_heap_page_writes"] * 4096
-            assert records[0]["checkpoint_heap_flush_bytes"] == records[0]["checkpoint_heap_page_writes"] * 4096
+            assert records[0]["writeback_heap_flush_bytes"] == records[0]["writeback_heap_page_writes"] * 4096
             assert "not_device_io" in records[0]["heap_io_counter_scope"]
     return records[0]
 

@@ -12,8 +12,6 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
-#include <sstream>
-#include <iterator>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -82,97 +80,8 @@ namespace {
     return a.squared_distance < b.squared_distance ||
            (a.squared_distance == b.squared_distance && a.id < b.id);
   }
-  template<typename T>
-  void replace_at(const std::string& path, uint64_t offset, T value) {
-    std::fstream out(path, std::ios::binary | std::ios::in | std::ios::out);
-    out.seekp(offset);
-    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
-    require(bool(out), "corruption fixture write failed");
-  }
-  void rehash_trailer(const std::string& path) {
-    const auto bytes = std::filesystem::file_size(path);
-    replace_at(path, bytes - 8, artifact_hash_prefix(path, bytes - 8));
-  }
-  void rehash_manifest(const std::string& prefix) {
-    std::ifstream in(prefix + ".manifest");
-    std::string   header;
-    std::getline(in, header);
-    std::ostringstream text;
-    text << header << '\n';
-    for (auto suffix : mutable_component_suffixes) {
-      const auto digest = artifact_digest(prefix + suffix);
-      text << suffix << ' ' << digest.bytes << ' ' << digest.hash << '\n';
-    }
-    if (std::filesystem::exists(prefix + ".patched.hnsw"))
-      for (auto suffix : native_router_suffixes) {
-        const auto digest = artifact_digest(prefix + suffix);
-        text << suffix << ' ' << digest.bytes << ' ' << digest.hash << '\n';
-      }
-    in.close();
-    std::ofstream out(prefix + ".manifest");
-    out << text.str();
-    require(bool(out), "manifest fixture write failed");
-  }
-  void copy_checkpoint(const std::string& from, const std::string& to) {
-    for (auto suffix : mutable_component_suffixes)
-      std::filesystem::copy_file(from + suffix, to + suffix);
-    if (std::filesystem::exists(from + ".patched.hnsw"))
-      for (auto suffix : native_router_suffixes)
-        std::filesystem::copy_file(from + suffix, to + suffix);
-    std::filesystem::copy_file(from + ".manifest", to + ".manifest");
-  }
-  template<typename T>
-  void manifest_framing_fixtures(const std::filesystem::path& root,
-                                 const std::string& checkpoint, bool native) {
-    for (bool origin : {false, true})
-      for (uint32_t edit = 0; edit < (native ? 3u : 2u); ++edit) {
-        const auto bad =
-            (root / (std::string(origin ? "origin" : "mutable") +
-                     " framing " + std::to_string(edit)))
-                .string();
-        copy_checkpoint(checkpoint, bad);
-        const auto path = bad + (origin ? ".origin" : ".manifest");
-        std::ifstream input(path, std::ios::binary);
-        std::string   text((std::istreambuf_iterator<char>(input)), {});
-        input.close();
-        if (edit == 0)
-          text += "unexpected trailing token\n";
-        else {
-          const std::string a =
-              edit == 1 ? index_component_suffixes[0] : native_router_suffixes[0];
-          const std::string b =
-              edit == 1 ? index_component_suffixes[1] : native_router_suffixes[1];
-          const auto first = text.find("\n" + a + " ");
-          const auto second = text.find("\n" + b + " ");
-          require(first != std::string::npos && second != std::string::npos &&
-                      first < second,
-                  "Missing ordered manifest fixture fields");
-          // Swap labels only: a parser must require suffix order, not merely
-          // accept a set of known fields or rely on later digest checks.
-          text.replace(second + 1, b.size(), a);
-          text.replace(first + 1, a.size(), b);
-        }
-        {
-          std::ofstream output(path, std::ios::binary);
-          output << text;
-          output.close();
-          require(bool(output), "Manifest framing fixture write failed");
-        }
-        if (origin)
-          rehash_manifest(bad);  // Exercise inner framing, not its outer hash.
-        const auto output = bad + ".private.heap";
-        rejects([&] { MutableIndex<T>::reopen(bad, output, {2}); },
-                edit != 0 ? "Invalid IVF manifest field"
-                          : (origin ? "Trailing IVF manifest data"
-                                    : "Trailing mutable IVF manifest data"));
-        require(!std::filesystem::exists(output) &&
-                    !std::filesystem::exists(output + ".pq.bin"),
-                "Manifest framing refusal claimed private copy artifacts");
-      }
-  }
   // Restrict only this fixture process, and restore even when a check throws.
-  // Growth fixtures have no dirty pages; output-copy fixtures have a clean
-  // source.
+  // Exercise real file-growth and dirty-page pwrite failures.
   class RefuseFileGrowth {
    public:
     explicit RefuseFileGrowth(rlim_t bytes = 0) {
@@ -199,6 +108,30 @@ namespace {
     struct rlimit    _saved {};
     struct sigaction _signal {};
   };
+
+  void writeback_batches(const std::filesystem::path& root) {
+    std::filesystem::create_directories(root);
+    auto heap = HeapStorage<uint8_t>::create_mutable(
+        {2048, 80, 4096, 128}, (root / "batched writeback.heap").string());
+    std::vector<uint8_t> row(2048, 17);
+    for (uint32_t id = 0; id < 80; ++id) {
+      heap->prepare_insert(id, row);
+      heap->publish_insert(id);
+    }
+    const auto pages = heap->dirty_pages();
+    require(pages > 32, "writeback fixture must span multiple flush batches");
+    const auto allowance = heap->writeback_workspace_bytes();
+    require(allowance == 65536 + 32 * (4096 + 64), "writeback scratch is not bounded");
+    rejects([&] { heap->writeback(allowance - 1); });
+    require(!heap->failed() && heap->dirty_pages() == pages,
+            "workspace refusal changed/poisoned dirty data");
+    const auto before = heap->io_counters();
+    heap->writeback(allowance);
+    const auto io = heap->io_counters().since(before);
+    require(heap->dirty_pages() == 0 && io.page_writes == pages &&
+                io.flush_bytes == uint64_t(pages) * 4096 && heap->size() == 80,
+            "multi-batch writeback lost pages/accounting");
+  }
 
   template<typename T>
   void heap_lifecycle(const std::filesystem::path& root) {
@@ -268,7 +201,7 @@ namespace {
             "real backend file-growth failure did not poison/hide the entry");
     rejects([&] { failed->prepare_insert(2, vector); });
     rejects([&] { failed->publish_insert(2); });
-    rejects([&] { failed->checkpoint((root / "failed.meta").string()); });
+    rejects([&] { failed->writeback(failed->writeback_workspace_bytes()); });
     require(!std::filesystem::exists(root / "failed.meta"),
             "failed heap published a checkpoint");
   }
@@ -338,7 +271,7 @@ namespace {
     const auto         query = row(60);
     const SearchConfig config{4, 5, 32, 2};
     // Real frozen IVF composition under all schedulers, three matching
-    // round barriers/checkpoint reopens. All inserts target the SAME centroid,
+    // round barriers/writeback. All inserts target the SAME centroid,
     // overlapping its +16 growth/swap deletion and rerank with eight queries.
     for (uint32_t policy : {0u, 1u, 2u}) {
       const bool fixed = policy == 1, driven = policy == 2;
@@ -434,13 +367,9 @@ namespace {
         require(entries == base && mixed->size() == base &&
                     mixed->query(query, config).hits == expected,
                 "mixed barrier exact oracle/count failure");
-        const auto saved =
-            (root / (std::string(label) + " round " + std::to_string(round)))
-                .string();
-        mixed->checkpoint(saved);
-        mixed = MutableIndex<T>::reopen(saved, saved + ".private.heap", {2});
+        mixed->writeback(mixed->estimated_writeback_bytes());
         require(mixed->query(query, config).hits == expected,
-                "mixed round checkpoint reopen changed results");
+                "mixed round writeback changed results");
       }
       rejects([&] { mixed->insert(first, row(0)); });
     }
@@ -669,34 +598,18 @@ namespace {
     rejects([&] { limited->insert(failed_id, row(0)); });
     require(limited->retained_heap_records() == retained,
             "retry allocated a second retained slot");
-    const auto aborted_checkpoint = (root / "aborted checkpoint").string();
-    limited->checkpoint(aborted_checkpoint);
-    auto aborted = MutableIndex<T>::reopen(
-        aborted_checkpoint, (root / "aborted reopened.heap").string(),
-        {2, 1024ull * 1024 * 1024, initial_list_bytes});
-    require(aborted->retained_heap_records() == retained &&
-                !aborted->contains(failed_id),
-            "checkpoint lost/activated aborted physical slot");
-    rejects([&] { aborted->insert(failed_id, row(0)); });
-    require(aborted->retained_heap_records() == retained,
-            "aborted reopen retry allocated another slot");
-    require(aborted->erase(first), "aborted reopen could not delete base ID");
-    aborted->insert(failed_id, row(0));
-    require(aborted->retained_heap_records() == retained &&
-                aborted->contains(failed_id),
-            "aborted reopen retry did not reuse its unpublished slot");
+    limited->writeback(limited->estimated_writeback_bytes());
+    require(limited->retained_heap_records() == retained && !limited->contains(failed_id),
+            "writeback activated/reclaimed an aborted slot");
     require(limited->erase(first), "growth retry could not free a list slot");
     limited->insert(failed_id, row(0));
     require(limited->contains(failed_id) &&
                 limited->retained_heap_records() == retained &&
                 limited->size() == base + 16,
             "failed-insert retry did not publish correct live set");
-    const auto checkpoint = (root / "live checkpoint").string();
-    const auto checkpoint_workspace = index->estimated_checkpoint_bytes();
-    rejects([&] { index->checkpoint(checkpoint, checkpoint_workspace - 1); });
-    require(!std::filesystem::exists(checkpoint + ".manifest"),
-            "checkpoint workspace refusal claimed a prefix");
-    // Checkpoint lifecycle admission overlaps real C++ query/delete workers.
+    const auto writeback_workspace = index->estimated_writeback_bytes();
+    rejects([&] { index->writeback(writeback_workspace - 1); });
+    // Writeback lifecycle admission overlaps real C++ query/delete workers.
     {
       std::barrier                      gate(3);
       std::array<std::exception_ptr, 2> errors{};
@@ -705,7 +618,7 @@ namespace {
         try {
           require(
               index->erase(first + base + 1) && index->erase(first + base + 2),
-              "checkpoint-overlap deletion failed");
+               "writeback-overlap deletion failed");
         } catch (...) {
           errors[0] = std::current_exception();
         }
@@ -716,7 +629,7 @@ namespace {
           for (uint32_t i = 0; i < 10; ++i)
             for (auto hit : index->query(query, config).hits)
               require(hit == distance(hit.id),
-                                            "checkpoint-overlap query copied mismatched coordinates");
+                                            "writeback-overlap query copied mismatched coordinates");
         } catch (...) {
           errors[1] = std::current_exception();
         }
@@ -724,7 +637,7 @@ namespace {
       gate.arrive_and_wait();
       std::exception_ptr failure;
       try {
-        index->checkpoint(checkpoint, checkpoint_workspace);
+        index->writeback(writeback_workspace);
       } catch (...) {
         failure = std::current_exception();
       }
@@ -737,219 +650,46 @@ namespace {
           std::rethrow_exception(error);
       live[base + 1] = live[base + 2] = 0;
     }
-    std::array<ArtifactDigest, 10> checkpoint_identity;
-    for (size_t i = 0; i < checkpoint_identity.size(); ++i)
-      checkpoint_identity[i] =
-          artifact_digest(checkpoint + mutable_component_suffixes[i]);
-    require(artifact_digest(checkpoint + ".origin") == source_identity.back(),
-            "Checkpoint origin reserialization changed manifest bytes");
-    auto reopened = MutableIndex<T>::reopen(
-        checkpoint, (root / "reopened live.heap").string(), {2});
-    std::vector<ExactHit> checkpoint_oracle;
-    for (uint32_t r = 0; r < rows; ++r)
-      if (reopened->contains(first + r))
-        checkpoint_oracle.push_back(distance(first + r));
-    std::sort(checkpoint_oracle.begin(), checkpoint_oracle.end(), nearer);
-    if (checkpoint_oracle.size() > config.recall_at)
-      checkpoint_oracle.resize(config.recall_at);
-    require(reopened->query(query, config).hits == checkpoint_oracle &&
-                reopened->retained_heap_records() == rows &&
-                reopened->missing_deletes() >= 2,
-            "mutable checkpoint exact results/counts/counters changed");
-    rejects([&] { reopened->insert(first, row(0)); });
-    rejects([&] { NativeIndex<T>::open(checkpoint); });
-    rejects([&] {
-      HeapStorage<T>::reopen({dim, capacity, 4096, 2}, checkpoint + ".heap",
-                             checkpoint + ".heap.meta");
-    });
-    rejects([&] {
-      MutableIndex<T>::reopen(prefix, (root / "wrong format.heap").string());
-    });
-    rejects([&] { index->checkpoint(checkpoint); });
-    const auto no_budget = (root / "reopen budget refusal.heap").string();
-    rejects([&] {
-      MutableIndex<T>::reopen(checkpoint, no_budget,
-                              {2, reopened->estimated_retained_bytes() - 1});
-    });
-    require(!std::filesystem::exists(no_budget),
-            "reopen memory refusal copied a heap");
-    const auto sidecar_collision = (root / "sidecar collision.heap").string();
+    index->writeback(writeback_workspace);
+    require(index->dirty_pages() == 0 && index->query(query, config).hits == oracle(),
+            "writeback changed visibility/results");
+    // No extra index family is created; the private heap is not reopenable.
+    require(!std::filesystem::exists(private_heap + ".meta") &&
+                !std::filesystem::exists(private_heap + ".state") &&
+                !std::filesystem::exists(private_heap + ".manifest"),
+            "writeback exported mutable index metadata");
+    const auto before_writeback = index->heap_io_counters();
+    index->writeback(writeback_workspace);  // idempotent clean drain
+    require(index->heap_io_counters().since(before_writeback).page_writes == 0,
+            "clean writeback unexpectedly wrote pages");
+    // Real pwrite failure after successful publication poisons the session.
     {
-      std::ofstream out(sidecar_collision + ".pq.bin");
-      out << "owned existing sidecar";
-    }
-    rejects([&] { MutableIndex<T>::reopen(checkpoint, sidecar_collision); });
-    require(!std::filesystem::exists(sidecar_collision),
-            "reopen sidecar refusal claimed a heap");
-    const auto checkpoint_alias = (root / "checkpoint alias").string();
-    std::filesystem::create_symlink(checkpoint + ".heap",
-                                    checkpoint_alias + ".heap");
-    rejects([&] { index->checkpoint(checkpoint_alias); });
-    require(!std::filesystem::exists(checkpoint_alias + ".manifest"),
-            "checkpoint symlink refusal claimed manifest");
-    const auto relocated = (root / "relocated checkpoint").string();
-    copy_checkpoint(checkpoint, relocated);
-    auto relocated_index = MutableIndex<T>::reopen(
-        relocated, (root / "relocated reopened.heap").string(), {2});
-    require(relocated_index->query(query, config).hits == checkpoint_oracle,
-            "relocated checkpoint used original prefix paths");
-    // Both sessions can keep mutating after checkpointing/reopen; saved family
-    // stays immutable.
-    reopened->insert(first + rows, row(0));
-    const auto second_checkpoint = (root / "second checkpoint").string();
-    reopened->checkpoint(second_checkpoint);
-    auto second = MutableIndex<T>::reopen(
-        second_checkpoint, (root / "second reopened.heap").string(), {2});
-    require(second->contains(first + rows) &&
-                second->retained_heap_records() == rows + 1,
-            "second generation lost post-reopen insert");
-    for (size_t i = 0; i < checkpoint_identity.size(); ++i)
-      require(artifact_digest(checkpoint + mutable_component_suffixes[i]) ==
-                  checkpoint_identity[i],
-              "continued mutation modified checkpoint family");
-    if constexpr (std::is_same_v<T, float>) {
-      manifest_framing_fixtures<T>(root, checkpoint, routing.native_modes);
-      uint32_t corruption = 0;
-      auto     bad_case = [&](auto edit, bool preflight = false) {
-        const auto bad =
-            (root / ("corrupt checkpoint " + std::to_string(corruption)))
-                .string();
-        copy_checkpoint(checkpoint, bad);
-        edit(bad);
-        rehash_manifest(bad);
-        const auto output =
-            (root / ("corrupt reopen " + std::to_string(corruption) + ".heap"))
-                .string();
-        rejects([&] { MutableIndex<T>::reopen(bad, output, {2}); },
-                preflight ? "Unsupported IVF index producer" : nullptr);
-        if (preflight)
-          require(!std::filesystem::exists(output) &&
-                          !std::filesystem::exists(output + ".pq.bin"),
-                      "Rejected producer claimed a private output");
-        ++corruption;
-      };
-      // Rehash the outer checkpoint so refusal exercises the origin's producer
-      // policy rather than its content digest. No private heap may be claimed.
-      for (const auto* backend :
-           {"hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"})
-        bad_case(
-            [&](const std::string& bad) {
-              std::ifstream input(bad + ".origin");
-              std::string   text((std::istreambuf_iterator<char>(input)), {});
-              const auto    at = text.find(router_backend_id);
-              require(at != std::string::npos,
-                      "Missing stock producer in origin");
-              text.replace(at, std::string(router_backend_id).size(), backend);
-              input.close();
-              {
-                std::ofstream output(bad + ".origin");
-                output << text;
-              }
-            },
-            true);
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".mlists", 44, uint8_t(1));
-        rehash_trailer(bad + ".mlists");
-      });  // Reserved state.
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".mlists", 44 + capacity - first + 4, UINT64_MAX);
-        rehash_trailer(bad + ".mlists");
-      });
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".heap.state", 36 + first, uint8_t(1));
-        rehash_trailer(bad + ".heap.state");
-      });  // Prepared state.
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".heap.state", 36 + first, uint8_t(4));
-        rehash_trailer(bad + ".heap.state");
-      });  // Deleted -> Aborted mismatch.
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".heap.meta", 112,
-                   capacity);  // ID outside metadata arrays.
-        std::ofstream out(bad + ".heap.meta.ivf");
-        const auto    meta = artifact_digest(bad + ".heap.meta");
-        out << "IVFHEAPM1 float " << dim << ' ' << capacity << " 4096 " << rows
-            << ' ' << meta.bytes << ' '
-            << std::filesystem::file_size(bad + ".heap") << ' ' << meta.hash
-            << '\n';
-      });
-      auto repair_meta_descriptor = [&](const std::string& bad) {
-        std::ofstream out(bad + ".heap.meta.ivf");
-        const auto    meta = artifact_digest(bad + ".heap.meta");
-        out << "IVFHEAPM1 float " << dim << ' ' << capacity << " 4096 " << rows
-            << ' ' << meta.bytes << ' '
-            << std::filesystem::file_size(bad + ".heap") << ' ' << meta.hash
-            << '\n';
-      };
-      bad_case([&](const std::string& bad) {
-        std::ifstream in(bad + ".heap.meta", std::ios::binary);
-        in.seekg(116);
-        uint64_t locator = 0;
-        in.read(reinterpret_cast<char*>(&locator), 8);
-        replace_at(bad + ".heap.meta", 128, locator);
-        repair_meta_descriptor(bad);  // Two IDs sharing a slot.
-      });
-      bad_case([&](const std::string& bad) {
-        std::ifstream in(bad + ".heap.meta", std::ios::binary);
-        in.seekg(36);
-        uint32_t slots = 0;
-        in.read(reinterpret_cast<char*>(&slots), 4);
-        in.seekg(116);
-        uint32_t page = 0;
-        uint16_t slot = 0;
-        in.read(reinterpret_cast<char*>(&page), 4);
-        in.read(reinterpret_cast<char*>(&slot), 2);
-        const uint64_t coordinates = uint64_t(page) * 4096 + 8 +
-                                     (slots + 7) / 8 +
-                                     uint64_t(slot) * (8 + 16 * 4) + 8;
-        replace_at(bad + ".heap", coordinates,
-                   std::numeric_limits<float>::quiet_NaN());
-      });
-      bad_case([&](const std::string& bad) {
-        const auto bytes = std::filesystem::file_size(bad + ".heap");
-        replace_at(bad + ".heap", bytes - 4096 + 8,
-                   uint8_t(1));  // Ghost bitmap slot on a spare page.
-      });
-      bad_case([&](const std::string& bad) {
-        std::ofstream out(bad + ".heap.state",
-                          std::ios::binary | std::ios::app);
-        out.put('\0');
-      });
-      bad_case([&](const std::string& bad) {
-        replace_at(bad + ".pq.bin", 4096 + 8, float(999));
-      });  // Frozen PQ identity.
-      const auto damaged = (root / "hash-damaged checkpoint").string();
-      copy_checkpoint(checkpoint, damaged);
-      replace_at(damaged + ".heap", 0, uint8_t(123));
-      const auto damaged_output = (root / "hash-damaged reopen.heap").string();
-      rejects([&] { MutableIndex<T>::reopen(damaged, damaged_output); });
-      require(!std::filesystem::exists(damaged_output),
-              "digest refusal wrote a private heap");
-      const auto partial = (root / "partial checkpoint").string();
-      { std::ofstream out(partial + ".manifest"); }
-      rejects([&] {
-        MutableIndex<T>::reopen(partial,
-                                (root / "partial reopen.heap").string());
-      });
-      const auto failed_output = (root / "failed checkpoint output").string();
+      auto failed = MutableIndex<T>::fork(prefix, (root / "failed writeback.heap").string(), {64});
+      failed->insert(first + base, row(base));
+      require(failed->dirty_pages() > 0, "writeback failure needs dirty pages");
       {
-        RefuseFileGrowth refuse(
-            4096);  // Router/lists succeed; the new heap copy fails.
-        rejects([&] { index->checkpoint(failed_output); },
-                "Mutable IVF heap copy write failure");
+        RefuseFileGrowth refuse;
+        rejects([&] { failed->writeback(failed->estimated_writeback_bytes()); });
       }
-      require(!index->failed() && index->query(query, config).hits == oracle(),
-              "checkpoint output failure poisoned/changed healthy session");
-      require(std::filesystem::exists(failed_output + ".manifest"),
-              "checkpoint failure did not preserve owned prefix reservation");
-      require(
-          std::filesystem::exists(failed_output + ".heap") &&
-              std::filesystem::file_size(failed_output + ".heap") <= 4096,
-          "checkpoint failure did not exercise/preserve partial heap output");
-      rejects([&] {
-        MutableIndex<T>::reopen(failed_output,
-                                (root / "failed output reopen.heap").string());
-      });
+      require(failed->failed(), "writeback failure did not poison session");
+      rejects([&] { failed->query(query, config); });
+      rejects([&] { failed->writeback(failed->estimated_writeback_bytes()); });
+    }
+    {
+      auto dirty = MutableIndex<T>::fork(prefix, (root / "successful writeback.heap").string(), {64});
+      dirty->insert(first + base, row(base));
+      const auto pages = dirty->dirty_pages();
+      const auto io = dirty->heap_io_counters();
+      require(pages > 0, "successful writeback needs dirty pages");
+      dirty->writeback(dirty->estimated_writeback_bytes());
+      const auto written = dirty->heap_io_counters().since(io);
+      require(dirty->dirty_pages() == 0 && written.page_writes == pages &&
+                  written.flush_bytes == uint64_t(pages) * 4096,
+              "writeback did not drain/account dirty pages");
+      require(dirty->contains(first + base), "writeback lost publication");
+      dirty->insert(first + base + 1, row(base + 1));
+      dirty->writeback(dirty->estimated_writeback_bytes());
+      require(dirty->contains(first + base + 1), "session could not continue after writeback");
     }
     // Preflight and existing private-file refusals do not alter owned/source
     // files.
@@ -1029,15 +769,10 @@ namespace {
                 empty.logical_fetch_stages == 0 &&
                 empty.backend_batch_calls == 0,
             "empty mutable live set fabricated results/I/O");
-    const auto empty_checkpoint = (root / "empty checkpoint").string();
-    index->checkpoint(empty_checkpoint);
-    auto empty_reopened = MutableIndex<T>::reopen(
-        empty_checkpoint, (root / "empty reopened.heap").string(), {2});
-    require(empty_reopened->size() == 0 &&
-                empty_reopened->retained_heap_records() == rows &&
-                empty_reopened->query(query, config).hits.empty(),
-            "empty checkpoint lost tombstones/retained records");
-    rejects([&] { empty_reopened->insert(first + base, row(base)); });
+    index->writeback(index->estimated_writeback_bytes());
+    require(index->size() == 0 && index->retained_heap_records() == rows &&
+                index->query(query, config).hits.empty(), "empty writeback changed tombstones");
+    rejects([&] { index->insert(first + base, row(base)); });
     index.reset();
     limited.reset();
     for (size_t i = 0; i < index_component_suffixes.size(); ++i)
@@ -1069,10 +804,11 @@ int main(int argc, char** argv) {
         std::filesystem::path(argv[1]) /
         std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count());
+    writeback_batches(root / "batches");
     exercise<float>(root / "float", DataType::Float);
     exercise<int8_t>(root / "int8", DataType::Int8);
     exercise<uint8_t>(root / "uint8", DataType::UInt8);
-    std::cout << "Mutable native IVF heap/insert/delete/query/checkpoint "
+    std::cout << "Mutable native IVF heap/insert/delete/query/writeback "
                  "fixtures passed (no CLI/production qualification)\n";
     return 0;
   } catch (const diskann::ANNException& error) {
