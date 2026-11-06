@@ -30,6 +30,8 @@ int main(int argc, char** argv) {
                              "--full_data_file",
                              "--insert_ids_file",
                              "--delete_ids_file",
+                             "--round_schedule",
+                             "--round_results_dir",
                              "--memory_budget_gb",
                              "--buffer_frames",
                              "--result_file",
@@ -95,8 +97,10 @@ int main(int argc, char** argv) {
                    "queries run until updates finish.\n"
                    "  Requires at least 2 pool workers; query ratio/count/seed "
                    "overrides are not used.\n"
-                   "One quiescent round per call; GT/results apply only to the "
-                   "post-round query pass.\n";
+                    "  [--round_schedule FILE --round_results_dir NEW_DIRECTORY]\n"
+                    "Schedule: one pair of quoted insert/delete ID paths per line.\n"
+                    "One persistent session/pool; GT/results apply only to the "
+                    "final stable query pass. No mixed checkpoint export.\n";
       std::cout << "Query-only overrides among persisted modes (assignments "
                    "stay frozen):\n"
                    "  [--router_mode "
@@ -122,7 +126,8 @@ int main(int argc, char** argv) {
          "--checkpoint_prefix", "--scheduler", "--pool_threads",
          "--query_ratio", "--query_count", "--scheduler_seed", "--router_mode",
          "--router_rerank_factor", "--router_breadth", "--insert_threads",
-         "--insert_input_policy", "--warmup_queries"},
+          "--insert_input_policy", "--warmup_queries", "--round_schedule",
+          "--round_results_dir"},
         "execution-only setting");
     const auto     type = parse_data_type(args.get("--data_type", "float"));
     const uint32_t dim = args.u32("--dim");

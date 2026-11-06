@@ -25,6 +25,7 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <unordered_map>
 #include <sys/resource.h>
 
 namespace ivf_cli {
@@ -449,65 +450,104 @@ namespace ivf_cli {
       UpdateStats s;
       s.source_before_s = source_before_s;
       s.bytes = resident_bytes;
-      for (auto key : {"--insert_ids_file", "--delete_ids_file"})
-        add(s.bytes, std::filesystem::file_size(args.require(key)), 16);
-      check(s.bytes <= budget, "CLI mixed ID parsing exceeds allowance");
-      const auto inserts =
-          load_counted_ids(args.require("--insert_ids_file"), m.source_rows);
-      const auto deletes =
-          load_counted_ids(args.require("--delete_ids_file"), m.source_rows);
-      plan.inserts = inserts.size();
-      plan.deletes = deletes.size();
-      // Validate bounds BEFORE calling the legacy count helper's
-      // multiplication.
-      check(plan.inserts + plan.deletes <= UINT64_MAX / 99,
-            "Mixed query-count overflow");
-      if (!plan.update_driven) {
-        const auto ratio = args.u32("--query_ratio", 80);
-        check(ratio > 0 && ratio < 100, "Mixed query_ratio must be in [1,99]");
-        plan.queries = args.integer("--query_count",
-                                    ann_bench::mixed_update_query_count(
-                                        inserts.size(), deletes.size(), ratio));
+      struct Round { std::vector<uint32_t> inserts, deletes; };
+      std::vector<std::pair<std::string, std::string>> paths;
+      if (args.has("--round_schedule")) {
+        args.reject_present({"--insert_ids_file", "--delete_ids_file"},
+                            "schedule owns mixed round inputs");
+        const auto schedule_bytes = std::filesystem::file_size(args.require("--round_schedule"));
+        check(schedule_bytes <= (8ull << 20), "Mixed schedule too large");
+        add(s.bytes, schedule_bytes, 3);  // retained path strings and parsing scratch
+        check(s.bytes <= budget, "Mixed schedule exceeds workspace allowance");
+        std::ifstream schedule(args.require("--round_schedule"));
+        std::string line;
+        while (std::getline(schedule, line)) {
+          std::istringstream row(line);
+          std::string insert, erase, extra;
+          check(bool(row >> std::quoted(insert) >> std::quoted(erase)) &&
+                    !(row >> extra) && !insert.empty() && !erase.empty(),
+                "Malformed mixed schedule row");
+          paths.emplace_back(insert, erase);
+          check(paths.size() <= 4096, "Too many mixed rounds");
+        }
+        check(schedule.eof() && !paths.empty(), "Empty/unreadable mixed schedule");
+      } else paths.emplace_back(args.require("--insert_ids_file"),
+                                args.require("--delete_ids_file"));
+      const auto round_dir = args.get("--round_results_dir");
+      if (!round_dir.empty())
+        check(!std::filesystem::exists(std::filesystem::symlink_status(round_dir)),
+              "Mixed round output directory exists");
+      for (const auto& [insert, erase] : paths) {
+        add(s.bytes, std::filesystem::file_size(insert), 16);
+        add(s.bytes, std::filesystem::file_size(erase), 16);
       }
-      plan.validate();
-      auto sorted = deletes;
-      std::sort(sorted.begin(), sorted.end());
-      for (auto id : inserts)
-        check(id >= m.first_id && id < m.heap.id_capacity &&
-                  !index.contains(id) &&
-                  !std::binary_search(sorted.begin(), sorted.end(), id),
-              "Invalid/live/overlapping mixed insert ID");
-      for (auto id : deletes)
-        check(id >= m.first_id && id < m.heap.id_capacity && index.contains(id),
-              "Mixed deletion must refer to a live ID");
+      check(s.bytes <= budget, "CLI mixed ID parsing exceeds allowance");
+      std::vector<Round> rounds;
+      std::vector<MixedPlan> plans;
+      uint64_t max_inserts = 0, total_queries = 0, total_inserts = 0, total_deletes = 0;
+      std::unordered_map<uint32_t, bool> live;
+      {
+        // Simulate all mutation boundaries before touching the index. The map
+        // contains touched IDs only; retain it for final stable-state checks.
+        std::vector<T> row(m.training.dim);
+        std::ifstream input(source, std::ios::binary);
+        for (const auto& [insert, erase] : paths) {
+          rounds.push_back({load_counted_ids(insert, m.source_rows),
+                            load_counted_ids(erase, m.source_rows)});
+          const auto& r = rounds.back();
+          auto p = plan;
+          p.inserts = r.inserts.size(); p.deletes = r.deletes.size();
+          check(p.inserts + p.deletes <= UINT64_MAX / 99, "Mixed query-count overflow");
+          if (!p.update_driven) {
+            const auto ratio = args.u32("--query_ratio", 80);
+            check(ratio > 0 && ratio < 100, "Mixed query_ratio must be in [1,99]");
+            p.queries = args.integer("--query_count", ann_bench::mixed_update_query_count(
+                p.inserts, p.deletes, ratio));
+          }
+          p.validate();
+          auto sorted_inserts = r.inserts;
+          std::sort(sorted_inserts.begin(), sorted_inserts.end());
+          auto state = [&](uint32_t id) -> bool& {
+            check(id >= m.first_id && id < m.heap.id_capacity, "Mixed ID out of capacity");
+            return live.try_emplace(id, index.contains(id)).first->second;
+          };
+          // Insert IDs cannot overlap deletes in this round, even if order
+          // would make a serial simulation accept them.
+          for (auto id : r.inserts) {
+            check(!live.contains(id) && !state(id), "Invalid/live/reused mixed insert ID");
+            state(id) = true;
+            input.seekg(8 + uint64_t(id) * m.training.dim * sizeof(T));
+            input.read(reinterpret_cast<char*>(row.data()), row.size() * sizeof(T));
+            check(bool(input), "Mixed source row read failed");
+            for (auto v : row) check(std::isfinite(double(v)), "Nonfinite mixed insert coordinate");
+          }
+          for (auto id : r.deletes) {
+            check(!std::binary_search(sorted_inserts.begin(), sorted_inserts.end(), id) && state(id),
+                  "Mixed deletion must refer to a live nonoverlapping ID");
+            state(id) = false;
+          }
+          max_inserts = std::max(max_inserts, p.inserts);
+          total_inserts += p.inserts; total_deletes += p.deletes;
+          add(total_queries, p.queries);
+          plans.push_back(p);
+        }
+      }
       const auto initial_live = index.size();
       const auto retained_before = index.estimated_retained_bytes();
       const auto query_bytes = index.estimated_query_bytes(config),
                  mutation_bytes = index.estimated_mutation_bytes();
-      add(s.bytes, plan.inserts * m.training.dim, sizeof(T));
-      add(s.bytes, plan.latency_capacity(), 2 * sizeof(double));
+      add(s.bytes, max_inserts * m.training.dim, sizeof(T));
+      add(s.bytes, plan.update_driven ? MixedPlan::latency_sample_limit : total_queries,
+          2 * sizeof(double));
       uint64_t worker_bytes = 8ull * 1024 * 1024;
       add(worker_bytes, query_bytes);
       add(worker_bytes, mutation_bytes);
       add(s.bytes, plan.pool_threads, worker_bytes);
-      add(s.bytes, index.estimated_checkpoint_bytes());
       add(s.bytes, 1024 * 1024);
       check(s.bytes <= budget, "CLI composed mixed workload exceeds allowance");
       s.input_validation_s = input_validation.finish();
-      DriverProgress staging("coordinate_staging", plan.inserts, "staged_rows");
-      std::vector<T> coordinates(size_t(plan.inserts) * m.training.dim);
-      std::ifstream  input(source, std::ios::binary);
-      for (size_t i = 0; i < inserts.size(); ++i) {
-        input.seekg(8 + uint64_t(inserts[i]) * m.training.dim * sizeof(T));
-        input.read(
-            reinterpret_cast<char*>(coordinates.data() + i * m.training.dim),
-            size_t(m.training.dim) * sizeof(T));
-        check(bool(input), "Mixed source row read failed");
-        staging.observe(i + 1);
-      }
-      for (auto v : coordinates)
-        check(std::isfinite(double(v)), "Nonfinite mixed insert coordinate");
-      s.coordinate_validation_s = staging.finish();
+      // Reuse one largest-round buffer, never stage the entire schedule.
+      std::vector<T> coordinates(size_t(max_inserts) * m.training.dim);
       const auto query_rows = queries.size() / m.training.dim;
       check(query_rows != 0, "Mixed queries require a nonempty source");
       std::atomic<uint64_t> missing{0};
@@ -520,34 +560,67 @@ namespace ivf_cli {
           [&](std::ostream& out) {
             heap_progress(out, index.heap_io_counters().since(io_before));
           });
-      mixed = run_mixed_round(
-          plan, {[&](uint64_t i) {
-                   index.insert(
-                       inserts[size_t(i)],
-                       {coordinates.data() + size_t(i) * m.training.dim,
-                        m.training.dim},
-                       {mutation_bytes, false});
-                 },
-                 [&](uint64_t i) {
-                   if (!index.erase(deletes[size_t(i)]))
-                     ++missing;
-                 },
-                 [&](uint64_t i) {
-                   (void) index.query(
-                       queries.subspan(size_t(i % query_rows) * m.training.dim,
-                                       m.training.dim),
-                       config, {query_bytes, false, routing});
-                 }});
+      if (!round_dir.empty()) std::filesystem::create_directory(round_dir);
+      uint64_t completed_inserts = 0, completed_deletes = 0;
+      mixed = run_mixed_rounds(
+          plans, {[&](size_t r, uint64_t i) {
+                    index.insert(
+                        rounds[r].inserts[size_t(i)],
+                         {coordinates.data() + size_t(i) * m.training.dim,
+                          m.training.dim},
+                         {mutation_bytes, false});
+                   },
+                  [&](size_t r, uint64_t i) {
+                    if (!index.erase(rounds[r].deletes[size_t(i)]))
+                       ++missing;
+                   },
+                  [&](size_t, uint64_t i) {
+                     (void) index.query(
+                         queries.subspan(size_t(i % query_rows) * m.training.dim,
+                                         m.training.dim),
+                         config, {query_bytes, false, routing});
+                  }},
+          [&](size_t r) {
+            const auto begin = Clock::now();
+            check(index.estimated_retained_bytes() - retained_before <= budget - s.bytes,
+                  "CLI inter-round growth exceeds allowance");
+            std::ifstream input(source, std::ios::binary);
+            for (size_t i = 0; i < rounds[r].inserts.size(); ++i) {
+              input.seekg(8 + uint64_t(rounds[r].inserts[i]) * m.training.dim * sizeof(T));
+              input.read(reinterpret_cast<char*>(coordinates.data() + i * m.training.dim),
+                         size_t(m.training.dim) * sizeof(T));
+              check(bool(input), "Mixed staging read failed");
+            }
+            s.coordinate_validation_s += seconds(begin);
+          },
+          [&](size_t r, const MixedRoundStats& stats) {
+            completed_inserts += stats.completed[0];
+            completed_deletes += stats.completed[1];
+            std::ostringstream out;
+            out << std::setprecision(12) << "{\"version\":3,\"round\":" << r
+                << ",\"insert_count\":" << stats.completed[0]
+                << ",\"delete_count\":" << stats.completed[1]
+                << ",\"live_count\":" << uint64_t(initial_live) + completed_inserts - completed_deletes
+                << ",\"concurrent_query_count\":" << stats.completed[2]
+                << ",\"overlapping_query_count\":" << stats.overlapping_queries
+                << ",\"mixed_wall_s\":" << stats.wall_s
+                << ",\"recall_available\":false,\"query_attribution\":\"completion_round\"}";
+            if (!round_dir.empty()) {
+              const auto path = std::filesystem::path(round_dir) / ("round_" + std::to_string(r) + ".json");
+              claim_artifact(path.string());
+              std::ofstream file(path); file << out.str() << '\n'; file.close();
+              check(bool(file), "Mixed round record write failed");
+            }
+            std::cout << out.str() << std::endl;
+          });
       mixed.runtime_threads_before_launch = runtime_threads;
       s.foreground_io = index.heap_io_counters().since(io_before);
       foreground.finish();
       check(missing == 0 && index.size() == uint64_t(initial_live) +
-                                                plan.inserts - plan.deletes,
+                                                 total_inserts - total_deletes,
             "Mixed round count/live set mismatch");
-      for (auto id : inserts)
-        check(index.contains(id), "Completed mixed insert missing at barrier");
-      for (auto id : deletes)
-        check(!index.contains(id), "Completed mixed delete live at barrier");
+      for (const auto& [id, expected] : live)
+        check(index.contains(id) == expected, "Mixed final ID liveness mismatch");
       DriverProgress source_after("source_identity_after");
       check(artifact_digest(source) == m.sources[0],
             "Mixed source changed during execution");
@@ -560,7 +633,6 @@ namespace ivf_cli {
       add(s.bytes, index.estimated_retained_bytes() - retained_before);
       check(s.bytes <= budget,
             "CLI post-growth mixed workload exceeds allowance");
-      checkpoint_update(args, index, s);
       return s;
     }
     void validate_driver_paths(const Arguments& args, bool updating) {
@@ -573,7 +645,7 @@ namespace ivf_cli {
         paths.push_back(args.require("--private_heap_path"));
         paths.push_back(args.require("--private_heap_path") + ".pq.bin");
       }
-      if (updating) {
+      if (updating && args.require("--workload") != "mixed") {
         const auto prefix = args.require("--checkpoint_prefix");
         paths.push_back(prefix + ".manifest");
         for (auto suffix : mutable_component_suffixes)
@@ -583,7 +655,7 @@ namespace ivf_cli {
         args.require("--private_heap_path");
       } else
         args.reject_present({"--checkpoint_prefix"},
-                            "not used by search-only execution");
+                             "not used by mixed or search-only execution");
       std::vector<std::filesystem::path> normalized;
       for (const auto& path : paths) {
         check(!std::filesystem::exists(std::filesystem::symlink_status(path)),
@@ -889,7 +961,7 @@ namespace ivf_cli {
       }
       emit("delete_qps",
            bufann_bench::safe_div(s.deleted + s.missing, s.delete_s));
-      emit("checkpoint_time_s", s.checkpoint_s);
+      if (!mixed) emit("checkpoint_time_s", s.checkpoint_s);
       emit("source_identity_before_time_s", s.source_before_s);
       emit("update_input_validation_time_s", s.input_validation_s);
       emit("coordinate_validation_or_staging_time_s",
@@ -902,25 +974,29 @@ namespace ivf_cli {
       emit("foreground_heap_read_wait_ns", s.foreground_io.read_wait_ns);
       emit("foreground_heap_eviction_write_ns",
            s.foreground_io.eviction_write_ns);
-      emit("checkpoint_heap_page_writes", s.checkpoint_io.page_writes);
-      emit("checkpoint_heap_flush_bytes", s.checkpoint_io.flush_bytes);
+      if (!mixed) {
+        emit("checkpoint_heap_page_writes", s.checkpoint_io.page_writes);
+        emit("checkpoint_heap_flush_bytes", s.checkpoint_io.flush_bytes);
+      }
       emit("heap_io_counter_scope", mixed
                                         ? "backend_pool_phase_deltas_includes_"
                                           "concurrent_queries_not_device_io"
                                         : "backend_pool_phase_deltas_excludes_"
                                           "source_reads_not_device_io");
-      emit("checkpoint_heap_io_scope",
-           "pool_flush_only_excludes_checkpoint_file_copy_hash_metadata");
-      emit("mutation_completion_policy",
-           "joined_publications_then_quiescent_verified_checkpoint");
-      emit("checkpoint_completion_scope",
-           "flush_copy_hash_metadata_not_wal_or_crash_durability");
+      emit("mutation_completion_policy", mixed ? "joined_visible_publications_no_checkpoint"
+           : "joined_publications_then_quiescent_verified_checkpoint");
+      if (!mixed) {
+        emit("checkpoint_heap_io_scope",
+             "pool_flush_only_excludes_checkpoint_file_copy_hash_metadata");
+        emit("checkpoint_completion_scope",
+             "flush_copy_hash_metadata_not_wal_or_crash_durability");
+        emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
+      }
       emit("driver_progress_policy",
            "phase_boundaries_completed_counts_time_and_count_limited_no_"
            "heartbeat_thread");
       emit("driver_progress_timing_scope",
            "periodic_reporting_inside_foreground_boundary_reporting_outside");
-      emit("checkpoint_prefix", args.require("--checkpoint_prefix"));
       emit("live_count", index.size());
       emit("retained_heap_records", index.retained_heap_records());
       emit("estimated_update_workspace_bytes", s.bytes);
@@ -935,6 +1011,16 @@ namespace ivf_cli {
              "foreground_loops_excludes_open_validation_hash_checkpoint_and_"
              "post_update_query");
       } else {
+        emit("mixed_protocol_version", 3);
+        emit("mixed_round_count", mixed->rounds);
+        emit("native_driver_process_count", 1);
+        emit("mutable_session_count", 1);
+        emit("worker_pool_launch_count", 1);
+        emit("round_transition_policy", "ordered_mutations_continuous_query_workers_no_checkpoint");
+        emit("round_query_attribution", "completion_round");
+        emit("intermediate_recall_available", false);
+        emit("mixed_coordinate_policy", "largest_round_buffer_reused_queries_continue_during_staging");
+        emit("mixed_staging_time_scope", "all_round_staging_diagnostic_initial_excluded_later_subset_of_mixed_wall");
         const auto fixed = args.get("--scheduler", "weighted") == "fixed_8_8";
         const auto driven =
             args.get("--scheduler", "weighted") == "update_driven";
@@ -992,23 +1078,21 @@ namespace ivf_cli {
                ann_bench::WeightedUpdatePool::kDefaultSeed);
         }
         emit("mutation_timing_scope",
-             "full_mixed_foreground_wall_includes_launch_join_excludes_setup_"
-             "checkpoint_post_round_query");
+             "continuous_elapsed_includes_launch_join_transitions_and_later_round_staging_excludes_initial_staging_and_final_scoring");
         emit("concurrent_recall_policy",
              "not_scored_weakly_consistent_queries");
         emit("overlap_scope",
              "admitted_operation_intervals_including_monitor_native_lock_io_"
              "and_retirement_not_cpu_simultaneity");
-        emit("post_round_barrier",
-             "all_foreground_workers_joined_checkpoint_validated_before_"
-             "scoring");
+        emit("final_scoring_barrier", "all_foreground_workers_joined_same_session_no_checkpoint");
         emit("backend_bg_flush_workers", 0);
         emit("openmp_threads", 1);
         emit("mkl_threads", 1);
         emit("runtime_threads_before_mixed_launch",
              mixed->runtime_threads_before_launch);
       }
-      emit("publication", "manifest_last_nonatomic_no_fsync");
+      emit("publication", mixed ? "online_visibility_no_durable_commit_or_checkpoint"
+                                : "manifest_last_nonatomic_no_fsync");
       const auto& m = index.origin_manifest();
       emit("base_count", m.training.base_count);
       emit("source_rows", m.source_rows);
@@ -1142,6 +1226,22 @@ namespace ivf_cli {
       loading.finish();
       UpdateStats updates;
       MixedStats  mixed;
+      uint32_t warmup_completed = 0;
+      double   warmup_time_s = 0;
+      auto warmup = [&] {
+        if (!warmup_requested) return;
+        DriverProgress warming("base_centroid_warmup", warmup_requested,
+                               "completed_warmup_queries");
+        const auto begin = Clock::now();
+        warmup_completed = run_centroid_warmup<T>(
+            index->router().centroids(), dim, warmup_requested,
+            [&](std::span<const T> vector) {
+              (void) index->query(vector, config, {query_bytes, false, routing});
+            }, [&](uint64_t completed) { warming.observe(completed); });
+        warmup_time_s = seconds(begin);
+        warming.finish();
+      };
+      if (is_mixed) warmup();  // once, before the continuous workload
       if constexpr (std::is_same_v<Index, MutableIndex<T>>) {
         if (updating) {
           updates = is_mixed ? mixed_index(args, *index, budget, bytes,
@@ -1158,23 +1258,7 @@ namespace ivf_cli {
                 "CLI post-update search exceeds workspace allowance");
         }
       }
-      uint32_t warmup_completed = 0;
-      double   warmup_time_s = 0;
-      if (warmup_requested) {
-        DriverProgress warming("base_centroid_warmup", warmup_requested,
-                               "completed_warmup_queries");
-        const auto     warmup_start = Clock::now();
-        warmup_completed = run_centroid_warmup<T>(
-            index->router().centroids(), dim, warmup_requested,
-            [&index, &config, &routing,
-             query_bytes](std::span<const T> vector) {
-              (void) index->query(vector, config,
-                                  {query_bytes, false, routing});
-            },
-            [&](uint64_t completed) { warming.observe(completed); });
-        warmup_time_s = seconds(warmup_start);
-        warming.finish();
-      }
+      if (!is_mixed) warmup();
       std::vector<uint32_t>    ids(result_count, UINT32_MAX);
       std::vector<float>       distances(result_count,
                                          std::numeric_limits<float>::infinity());
@@ -1364,7 +1448,9 @@ namespace ivf_cli {
       emit("warmup_cache_scope",
            "same_index_object_buffer_pool_router_no_query_worker_tls_"
            "continuity_claim_no_os_cache_control");
-      if constexpr (std::is_same_v<Index, MutableIndex<T>>)
+      if (is_mixed)
+        emit("query_cache_process_policy", "same_process_live_mutable_session_no_checkpoint_no_reopen");
+      else if constexpr (std::is_same_v<Index, MutableIndex<T>>)
         emit(
             "query_cache_process_policy",
             warmup_requested
@@ -1420,8 +1506,9 @@ namespace ivf_cli {
         parse_insert_input_policy(args.require("--insert_input_policy"));
       }
       if (!mixed)
-        args.reject_present({"--scheduler", "--pool_threads", "--query_ratio",
-                             "--query_count", "--scheduler_seed"},
+         args.reject_present({"--scheduler", "--pool_threads", "--query_ratio",
+                              "--query_count", "--scheduler_seed", "--round_schedule",
+                              "--round_results_dir"},
                             "mixed-only setting");
       else {
         omp_set_num_threads(1);

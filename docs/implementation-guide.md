@@ -407,7 +407,7 @@ Thus the model chooses a **routing-plus-scan estimate**, not a proven end-to-end
 
 Build, training, open, query, growth, checkpoint, and calibration have explicit preflight size/work checks with overflow protection. Estimates include relevant persistent structures, scratch, temporary replacement buffers, and conservative thread-stack allowances. They are **admission estimates, not hard process-RSS caps**.
 
-Training normally permits at most one billion assignment searches: `S × (max_reps + 1)`. Exact training additionally limits that quantity times nlist. PCA covariance/solver/validation and refinement have separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. For example, 90M rows with ten mean-update passes require 990M assignments; fifteen passes require 1.44B and fail the default guard. Raising a PCA/routing limit does not raise that training-search limit.
+Training normally permits at most three billion assignment searches: `S × (max_reps + 1)`. Main recipes fix fifteen mean-update passes plus final assignment: 90M rows require 1.44B assignments, while 100M require 1.60B. Exact training still separately limits distance evaluations (default 1B). PCA covariance/solver/validation and refinement retain separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. Raising a PCA/routing limit does not raise the training-search limit.
 
 Numeric domains are deliberately separate:
 
@@ -442,7 +442,7 @@ OpenMP/MKL concurrency is constrained before mixed execution to avoid hidden ove
 
 ### Concurrent query timing is separate from recall scoring
 
-Mixed foreground queries run against weakly consistent changing state and are not scored against a fictitious fixed GT. After updates join and checkpointing completes, a separate final query pass measures recall against the actual final live population. **Post-round query QPS is not concurrent foreground QPS.** Mixed rounds are chained through checkpoints and summarized using counts/times and relative round-result paths, not pooled percentiles.
+Mixed foreground queries run against weakly consistent changing state and are not scored against a fictitious fixed GT. All mixed rounds now share one process, mutable session and worker pool, with ordered mutation rounds and continuous queries. Only after the entire workload joins does a final query pass measure recall against the actual final live population on that same index. **Final-pass query QPS is not concurrent foreground QPS.** No mixed checkpoints, reopen cycles, intermediate scoring or per-round warmups occur. Version-3 round records attribute queries by completion, not admission; queries can cross boundaries. One largest-round coordinate buffer is reused, with later-round staging included in continuous elapsed time while query workers remain active. Sequential checkpoint APIs remain for the subsequent removal phase.
 
 Overlap means admitted operation intervals overlap, including waits; it does not prove simultaneous CPU execution. Update-driven query volume is unbounded in advance, so percentile storage uses a seeded reservoir capped at 65,536 samples, while means use all queries. Very short update rounds may admit no queries or show no overlap.
 

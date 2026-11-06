@@ -20,6 +20,7 @@ case "$mode" in
     *) error "unknown recipe: $mode" ;;
 esac
 [[ "$DATASET" == sift100m ]] || error "$mode requires DATASET=sift100m"
+[[ "${IVF_MAX_REPS:-15}" == 15 ]] || error "main recipes require IVF_MAX_REPS=15"
 
 schedule() {
     local nlist probe breadth effective
@@ -67,7 +68,7 @@ root="$EVAL_TEMPFILES"
 unset INSERT_POINTS DELETE_POINTS QUERY_POINTS UPDATE_QUERY_BATCH QUERY_RATIO INSERT_CAP DELETE_CAP
 unset IVF_RUN_TAG IVF_COST_MODEL_REPORT IVF_SCHEDULER_SEED
 export DATASET DATA_BIN QUERY_BIN EVAL_CACHED
-export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS="${IVF_MAX_REPS:-15}"
+export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS=15
 export IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0 IVF_BUILD_THREADS=20
 export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
 export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined IVF_BUILD_ROUTER_RERANK_FACTOR=3
@@ -98,6 +99,8 @@ if [[ "$mode" == sift100m-refine ]]; then
     [[ -f "$GT_BIN_KCACHED" ]] || error "missing previous GT binary"
     for nlist in 100000 200000 300000; do
         [[ -f "$IVF_GRID_PREVIOUS_ROOT/nlist-$nlist/$DATASET/IVF/query/prepared.json" ]] || error "missing previous nlist=$nlist preparation"
+        python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["settings"]; assert str(s["max_reps"]) == "15" and str(s["nlist"]) == sys.argv[2], "previous base requires matching nlist and 15-pass training; choose a matching wide run"' \
+            "$IVF_GRID_PREVIOUS_ROOT/nlist-$nlist/$DATASET/IVF/query/prepared.json" "$nlist"
     done
     generate_gt=0
 fi
@@ -119,6 +122,7 @@ for name in DATASET DATA_BIN QUERY_BIN EVAL_TEMPFILES EVAL_CACHED GT_ARTIFACT_DI
     QUERY_THREADS NTHREADS OMP_NUM_THREADS OMP_THREAD_LIMIT MKL_NUM_THREADS UPDATE_PERCENT UPDATE_BATCH ${!IVF_@}; do
     printf '%s=%q\n' "$name" "${!name-}"
 done > "$root/settings.env"
+printf 'TRAINING_ASSIGNMENT_SEARCH_LIMIT=3000000000\n' >> "$root/settings.env"
 
 run_script() {
     local label="$1" script="$2"

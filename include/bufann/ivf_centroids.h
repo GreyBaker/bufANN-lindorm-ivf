@@ -3,14 +3,25 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include "bufann/ivf_config.h"
 
 namespace diskann::ivf {
+  inline constexpr uint64_t default_assignment_search_limit = 3000000000ull;
+  // Shared admission arithmetic, testable without allocating a training set.
+  inline uint64_t training_assignment_searches(
+      uint64_t count, uint64_t passes,
+      uint64_t limit = default_assignment_search_limit) {
+    if (passes == UINT64_MAX || count > UINT64_MAX / (passes + 1) ||
+        count * (passes + 1) > limit)
+      throw std::invalid_argument("Centroid assignment exceeds declared search count limit");
+    return count * (passes + 1);
+  }
   struct TrainerLimits {
     uint32_t block_rows = 256;
     uint64_t max_distance_evaluations = 1000000000;
-    uint64_t max_assignment_searches = 1000000000;
+    uint64_t max_assignment_searches = default_assignment_search_limit;
   };
 
   struct TrainingPass {
@@ -37,6 +48,7 @@ namespace diskann::ivf {
     uint64_t estimated_bytes =
         0;  // Workspace + conservative thread-stack allowance.
     uint64_t assignment_searches = 0;
+    uint64_t assignment_search_limit = default_assignment_search_limit;
     uint64_t assignment_index_builds = 0;
     uint64_t assignment_index_refreshes = 0, reinserted_centroids = 0;
     uint64_t seeded_searches = 0, seed_fallbacks = 0;

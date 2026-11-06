@@ -142,7 +142,7 @@ change source-row IDs, mutation volumes, ANN candidate budgets or final queries.
 |---|---|---|---|
 | `IVF_INSERT_THREADS=1..256` | `--insert_threads N` | `1` | Sequential `insert_only`/`search_after_update`; effective workers are capped by insert count |
 | `IVF_INSERT_INPUT_POLICY=streaming\|staged` | `--insert_input_policy POLICY` | `streaming` | Sequential insertion only; mixed input staging is separate and unchanged |
-| `IVF_WARMUP_QUERIES=0..100000` | `--warmup_queries N` | `0` | Query-producing calls; in mixed runs only the post-checkpoint final query pass |
+| `IVF_WARMUP_QUERIES=0..100000` | `--warmup_queries N` | `0` | Query-producing calls; once before the continuous workload in mixed runs |
 
 Native options require `--validate_inputs 0`. Insertion options are rejected for
 query-only, delete-only and mixed native calls; warmup is rejected for mutation-only
@@ -170,7 +170,8 @@ calls. The shell harnesses ignore insertion settings outside sequential insertio
   dtypes round halves away from zero and clamp to their range. No final queries or
   GT select the inputs. Every requested warmup executes, even when centroid IDs
   repeat. Warmup is serial on the caller, on the same index object as timed queries,
-  after mutation/checkpoint when applicable. Its results are discarded, never
+   after mutation/checkpoint for sequential workloads, but before all mixed rounds.
+   Its results are discarded, never
   scored/exported or counted in final query statistics or mixed foreground counts.
   It has its own `warmup_time_s`, outside `query_time_s` but inside driver workflow
   wall time. New query workers do not inherit caller TLS; this is not an OS-cache,
@@ -223,7 +224,7 @@ The native CLI retains its legacy `weighted` default; the shell runner selects
 a quota. Its latency mean covers all queries; p99 uses a seeded reservoir of at
 most 65,536 completion-order samples, labeled in the result. Actual query counts
 and overlaps may be zero for very short batches. Already-admitted queries join
-before checkpointing and scoring.
+before final stable-state scoring. Mixed execution does not export checkpoints.
 
 CLI/harness training defaults are `IVF_TRAINER_MODE=ann-reuse-seeded`,
 `IVF_INIT=random_partition`, `IVF_TRAINING_BREADTH=64`, `IVF_SAMPLE_RATE=1`,
@@ -662,11 +663,10 @@ For a **query-only grid over nlist, nprobe and router breadth**, use the
 **instead of this step** after completing steps 1–3. Both recipes use the checked-in
 `experiment.sh` runner; this README is the only experiment document required.
 
-**Training limit:** the commands below explicitly use **10 passes on all 90M
-base rows**, plus final assignment: 990M searches, below the native 1B guard.
-The script defaults to 15 passes, preserving the chosen training default; on
-SIFT100M that needs 1.44B searches and fails the current guard. Set
-`IVF_MAX_REPS=10` as shown; no guard is disabled or bypassed.
+**Training limit:** every main recipe uses **15 passes on all 90M base rows**,
+plus final assignment: **1.44B searches**, admitted by the separate native
+**3B assignment-search guard**. Conflicting `IVF_MAX_REPS` overrides are rejected
+by the main runner; individual workload/native interfaces remain configurable.
 This guard applies to **LV+ as well as the other trainers**. These are fixed pass
 caps, not convergence-based stopping or paper-mandated iteration counts. Full
 training can be expensive; LV+ does not reduce the number of sampled rows here.
@@ -676,14 +676,14 @@ PCA covariance calculation counts `200000 * 128 * 129 / 2 = 1651200000`
 operations, already above the inherited 1B routing-work default. The recipe
 declares a finite 3B allowance for covariance plus solver/validation headroom.
 It applies to training PCA and optimized final-router work; it does **not**
-raise the separate 1B training-assignment cap or guarantee that every graph
+replace the separate 3B training-assignment cap or guarantee that every graph
 operation fits. Keep guards enabled and retain any subsequent work-limit failure.
 
 ```bash
 export EVAL_TEMPFILES="$HOME/project/ann-eval/run01"  # must not exist
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=10
+export IVF_MAX_REPS=15
 export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
 unset IVF_GT_FILE
 bash benchmark/IVF/experiment.sh workloads --dry-run
@@ -703,7 +703,7 @@ The existing prepare/run scripts perform input, cache and native-result validati
 
 | Recipe setting | Value |
 |---|---|
-| Training | Full-base LV+, 20 workers, seed 0; `IVF_MAX_REPS=10` in these commands |
+| Training | Full-base LV+, 20 workers, seed 0; 15 passes plus final assignment |
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
 | Workload search | nlist 200K, nprobe 64, router breadth 128, Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
@@ -711,7 +711,7 @@ The existing prepare/run scripts perform input, cache and native-result validati
 | Sequential insertion | 8 workers, staged inputs; override with `IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming` |
 | Warmup | 0 for workloads; 64 for grids, unless explicitly overridden |
 
-Resources, pass count and execution-policy exports above remain overridable.
+Resources and execution-policy exports above remain overridable; main recipes fix 15 passes.
 Other training/search settings are fixed; use the individual workload scripts for
 other experiments. `IVF_TIMEOUT_S` defaults to 86400 seconds **per script or GT
 command**, using GNU `timeout`. There are no total/per-index deadline managers.
@@ -788,7 +788,9 @@ the two foreground rates as an isolated worker speedup. Keep preparation and
 checkpoint costs alongside mutation throughput.
 
 `IVF_WARMUP_QUERIES=64`, if explicitly selected, runs 64 serial frozen-centroid
-queries on the same index object before each timed final pass. It uses neither
+queries on the same index object before the timed final pass for sequential/query
+runs. In mixed runs it instead executes once before the continuous workload.
+It uses neither
 final queries nor GT, discards results and reports separate warmup time. It does
 not count toward the 10,000 scored queries or mixed foreground queries, and does
 not transfer an application cache between the mutation and query processes.
@@ -798,8 +800,14 @@ for native options, failure behavior and matched-policy examples.
 
 These settings run **10 rounds**, each inserting/deleting 1M rows.
 There is **no required query ratio or total query quota**.
-IVF's `update_driven` mode replays the query pool until all mutations complete,
-joins admitted queries, then scores all 10,000 queries after each round. Record
+IVF's `update_driven` mode replays the query pool until all mutations complete
+across all rounds, joins admitted queries, then scores all 10,000 queries once.
+One native process, mutable session and worker pool span the entire workload.
+Mutation rounds stay ordered; query workers can cross boundaries. Coordinates
+use one reusable largest-round staging buffer; initial staging is outside
+`mixed_wall_s`, later-round staging is included while queries continue. There is
+no checkpoint, reopen, worker restart, intermediate warmup or per-round recall.
+Record
 the actual query count and overlap. This workload does not require reproducing
 the external SPFresh tester's scheduler or scoring cadence.
 
@@ -813,10 +821,13 @@ input/worker/warmup policy and separate process wall costs; `result.json` retain
 the native scored-query metrics unchanged. Mutation completion costs live in
 `mutation_result.json`. The driver writes these metrics directly; no duplicate
 native/extracted JSON files are produced. Mixed runs retain
-`rounds/round_<r>/result.json` and a version-2 `summary.json` with relative
-`round_results` paths and aggregate counts/times, not embedded round records or a
-duplicate root `result.json`. Their final-pass `query_qps` is not concurrent
-foreground QPS. Keep failed logs and
+`rounds/round_<r>.json` accounting records (no intermediate recall), one native
+root `result.json`, final `neighbors.bin`, one private heap, `round_schedule.txt`,
+`run.log`, and a version-3 `summary.json`. Query attribution to rounds is by
+completion, including queries crossing a boundary. `mixed_wall_s` is the single
+continuous interval, not summed worker time. Root final-pass `query_qps` is not
+concurrent foreground QPS. No mutable checkpoint is created by mixed execution;
+sequential checkpoint APIs remain pending the next implementation phase. Keep failed logs and
 owned heaps; a failed mutation session must not be checkpointed or reused.
 
 For three query repetitions at the same frozen settings:
@@ -879,7 +890,7 @@ source rows**, exactly as in the ordinary SIFT100M quickstart; this does not
 silently switch to a 100M-live index. PQ64 and checked GT are reused across
 indexes, but centroids and routers are trained independently at each nlist.
 
-Fixed settings are full-base LV+ training with a 10-pass cap, PCA-refined query/assignment
+Fixed settings are full-base LV+ training with 15 passes, PCA-refined query/assignment
 routing, PCA variance 0.95, both rerank factors 3, requested router breadth 128,
 eight query workers, and 64 serial centroid warmup queries per pass. Effective
 query traversal breadth is `max(128, min(nlist, 3*nprobe))`, so high probes also
@@ -905,7 +916,7 @@ export DATASET=sift100m
 export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-wide-grid-01"  # must not exist
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=10
+export IVF_MAX_REPS=15
 export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
 unset IVF_GT_FILE
 bash benchmark/IVF/experiment.sh sift100m-wide --dry-run
@@ -932,7 +943,7 @@ export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-refine-grid-01"  # fresh
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
 # Keep the SAME DATA_BIN, QUERY_BIN, IVF_PQ_PREFIX and trained-base settings.
 export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=10
+export IVF_MAX_REPS=15
 export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
 unset IVF_GT_FILE
 bash benchmark/IVF/experiment.sh sift100m-refine --dry-run

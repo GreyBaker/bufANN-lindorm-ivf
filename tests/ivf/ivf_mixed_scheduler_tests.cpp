@@ -2,6 +2,7 @@
 #include <barrier>
 #include <iostream>
 #include <stdexcept>
+#include <set>
 
 using namespace ivf_cli;
 void require(bool ok) {
@@ -182,7 +183,7 @@ int main() {
     }
     for (auto plan :
          {MixedPlan{false, 0, 1, 1, 1}, MixedPlan{true, 8, 1, 1, 1},
-          MixedPlan{false, 4, 0, 1, 1}, MixedPlan{false, 4, UINT64_MAX, 1, 1},
+           MixedPlan{false, 4, 0, 0, 1}, MixedPlan{false, 4, UINT64_MAX, 1, 1},
           MixedPlan{false, 4, 1, 1, 0}}) {
       bool refused = false;
       try {
@@ -193,6 +194,75 @@ int main() {
       require(refused);
     }
     require(ann_bench::mixed_update_query_count(8, 8, 80) == 64);
+    // Unequal/one-sided rounds retain the same worker pool and exact quotas.
+    for (bool fixed_mode : {false, true}) {
+      std::vector<MixedPlan> plans{{fixed_mode, 16, 17, 3, 23},
+                                   {fixed_mode, 16, 0, 5, 7},
+                                   {fixed_mode, 16, 4, 0, 9}};
+      std::array<std::atomic<uint64_t>, 3> counts{};
+      std::atomic<uint32_t> prepared{0};
+      std::vector<MixedRoundStats> records;
+      auto stats = run_mixed_rounds(plans,
+          {[&](size_t r, uint64_t) { require(prepared >= r + 1); ++counts[0]; },
+           [&](size_t r, uint64_t) { require(prepared >= r + 1); ++counts[1]; },
+           [&](size_t, uint64_t) { ++counts[2]; }},
+          [&](size_t r) {
+            require(counts[0] == (r ? 17u : 0u));
+            require(counts[1] == (r == 2 ? 8u : r ? 3u : 0u));
+            ++prepared;
+          }, [&](size_t r, const MixedRoundStats& record) {
+            require(records.size() == r); records.push_back(record);
+          });
+      require(stats.rounds == 3 && stats.completed == std::array<uint64_t, 3>{21, 8, 39});
+      require(counts[0] == 21 && counts[1] == 8 && counts[2] == 39);
+      uint64_t queries = 0;
+      for (const auto& record : records) queries += record.completed[2];
+      require(queries == stats.completed[2] && records.size() == 3);
+    }
+    // A query admitted in round 0 finishes during round 1. A barrier-based
+    // implementation deadlocks here. Mutation callbacks reuse one thread.
+    {
+      MixedPlan p{false, 2, 1, 1, 0}; p.update_driven = true;
+      std::mutex mutex;
+      std::condition_variable changed;
+      bool query_entered = false, next_round = false;
+      std::set<std::thread::id> mutation_threads;
+      std::vector<MixedRoundStats> records;
+      auto stats = run_mixed_rounds({p, p},
+          {[&](size_t r, uint64_t) {
+             std::unique_lock lock(mutex);
+             mutation_threads.insert(std::this_thread::get_id());
+             if (!r) changed.wait(lock, [&] { return query_entered; });
+             else { next_round = true; changed.notify_all(); }
+           }, [](size_t, uint64_t) {},
+           [&](size_t, uint64_t i) {
+             if (!i) {
+               std::unique_lock lock(mutex);
+               query_entered = true; changed.notify_all();
+               changed.wait(lock, [&] { return next_round; });
+             }
+           }}, [](size_t) {},
+          [&](size_t, const MixedRoundStats& record) { records.push_back(record); });
+      require(mutation_threads.size() == 1 && records.size() == 2 &&
+              records[0].completed[2] == 0 && records[1].completed[2] >= 1 &&
+              stats.completed[0] == 2 && stats.completed[1] == 2);
+    }
+    // Later-round staging/callback failures retain completed records and join.
+    for (bool staging_failure : {false, true}) {
+      MixedPlan p{false, 2, 2, 2, 0}; p.update_driven = true;
+      uint32_t completed = 0;
+      bool refused = false;
+      try {
+        run_mixed_rounds({p, p},
+            {[&](size_t r, uint64_t) {
+               if (r && !staging_failure) throw std::runtime_error("later mutation");
+             }, [](size_t, uint64_t) {}, [](size_t, uint64_t) {}},
+            [&](size_t r) {
+              if (r && staging_failure) throw std::runtime_error("later staging");
+            }, [&](size_t, const MixedRoundStats&) { ++completed; });
+      } catch (const std::runtime_error&) { refused = true; }
+      require(refused && completed == 1);
+    }
     std::cout << "Mixed update-driven/weighted/fixed allocation, bounded "
                  "latency storage, dense dispatch, overlap and "
                  "joined failure fixtures passed\n";

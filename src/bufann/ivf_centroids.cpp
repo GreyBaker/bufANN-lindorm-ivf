@@ -96,9 +96,9 @@ namespace diskann::ivf {
     result.dim = config.dim;
     result.nlist = config.nlist;
     result.approximate_assignment = factory != nullptr;
-    result.assignment_searches = mul(count, uint64_t(config.max_reps) + 1);
-    check(result.assignment_searches <= limits.max_assignment_searches,
-          "Centroid assignment exceeds declared search count limit");
+    result.assignment_search_limit = limits.max_assignment_searches;
+    result.assignment_searches = training_assignment_searches(
+        count, config.max_reps, limits.max_assignment_searches);
     if (!factory) {
       result.distance_evaluations =
           mul(result.assignment_searches, config.nlist);

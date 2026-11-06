@@ -16,7 +16,7 @@ namespace diskann::ivf {
     uint64_t memory_budget_bytes = 1024ull * 1024 * 1024;
     bool     exact_assignment =
         false;  // Small-fixture oracle, not the production default.
-    uint64_t max_assignment_searches = 1000000000;
+    uint64_t max_assignment_searches = default_assignment_search_limit;
     uint64_t max_exact_distance_evaluations = 1000000000;
     // Standalone callers remain serial. Native builds use BuildConfig's worker
     // budget. A single sequential reader feeds bounded, joined routing waves.

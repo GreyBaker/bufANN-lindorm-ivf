@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded mixed-round preparation/reopen orchestration; no production acceptance."""
+"""One persistent native mixed session; final stable-state recall only."""
 import argparse
 import copy
 import json
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from common import (
     command_log, counted_range_identity, digest, header, is_query_record,
     query_truth_shapes, read_json, require, require_absent, write_json,
@@ -82,6 +83,7 @@ def prepare(args):
 
 
 def run(args):
+    workflow_start = time.monotonic()
     w = args.work_dir.resolve()
     base = read_json(w / "prepared.json")
     resources = runtime_resources(base["settings"]["page_size"])
@@ -102,7 +104,8 @@ def run(args):
     base_components = component_digests(w / "index", args.dataset)
     output = args.output_dir.resolve()
     require(output == w or w in output.parents, "mixed outputs must stay under prepared work")
-    for name in ("rounds", "result.json", "summary.json", "nlist_selection.json"):
+    for name in ("rounds", "result.json", "summary.json", "nlist_selection.json",
+                 "round_schedule.txt", "private.heap", "private.heap.pq.bin", "neighbors.bin", "run.log"):
         dest = output / name
         require_absent(dest, f"mixed output exists: {dest}")
     scheduler = os.environ.get("IVF_SCHEDULER", "update_driven")
@@ -123,77 +126,63 @@ def run(args):
         )
     output.mkdir(parents=True, exist_ok=True)
     write_json(output / "nlist_selection.json", selection)
-    (output / "rounds").mkdir()
+    def quoted(path):
+        text = str(path)
+        require(not any(c in text for c in "\n\r\0"), "invalid schedule path")
+        return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+    schedule = output / "round_schedule.txt"
+    schedule.write_text("".join(
+        f'{quoted(w / f"ids/round_{r}_insert.bin")} {quoted(w / f"ids/round_{r}_delete.bin")}\n'
+        for r in range(args.rounds)), encoding="utf-8")
+    command = driver_open_command(args, base["settings"]["nlist"], prefix) + [
+        "--index_format", "immutable", "--workload", "mixed",
+        "--scheduler", scheduler, "--pool_threads", threads,
+        "--full_data_file", str(w / "data/full.bin"),
+        "--query_file", str(w / "data/query.bin"),
+        "--round_schedule", str(schedule), "--round_results_dir", str(output / "rounds"),
+        "--gt_file", str(w / f"groundtruth/rounds/round_{args.rounds - 1}_gt{args.recall_at}.bin"),
+        "--recall_at", str(args.recall_at),
+    ] + query_search_flags() + [
+        "--private_heap_path", str(output / "private.heap"),
+        "--buffer_frames", resources["buffer_frames"],
+        "--memory_budget_gb", resources["memory_budget_gb"],
+        "--result_file", str(output / "result.json"),
+        "--search_result_file", str(output / "neighbors.bin"),
+    ]
+    if scheduler != "update_driven":
+        command += ["--query_ratio", os.environ.get("QUERY_RATIO", "80"),
+                    "--scheduler_seed", os.environ.get("IVF_SCHEDULER_SEED", str(0xA5A5A5A5))]
+    if args.query_count is not None:
+        command += ["--query_count", str(args.query_count)]  # finite quota per round
+    command += query_policy_flags(query_warmups)
+    process_start = time.monotonic()
+    command_log(command, output / "run.log")
+    process_wall_s = time.monotonic() - process_start
+    record = read_json(output / "result.json")
+    require(record["explicit_warmup_query_count"] == int(query_warmups),
+            "native mixed warmup completion count mismatch")
+    require(is_query_record(record, "mixed") and record["mixed_protocol_version"] == 3
+            and record["mixed_round_count"] == args.rounds
+            and record["insert_count"] == args.insert_count
+            and record["delete_count"] == args.delete_count
+            and record["live_count"] == args.base_count + args.insert_count - args.delete_count
+            and "recall" in record,
+            "mixed execution count/live-set/scoring mismatch")
     round_results = []
-    totals = {"mixed_wall_s": 0.0, "concurrent_query_count": 0, "overlapping_query_count": 0}
+    totals = {"concurrent_query_count": 0, "overlapping_query_count": 0}
     for r in range(args.rounds):
-        dest = output / f"rounds/round_{r}"
-        dest.mkdir()
-        (dest / "checkpoint").mkdir()
-        saved = dest / "checkpoint" / args.dataset
-        command = driver_open_command(args, base["settings"]["nlist"], prefix) + [
-            "--index_format",
-            "mutable" if r else "immutable",
-            "--workload",
-            "mixed",
-            "--scheduler",
-            scheduler,
-            "--pool_threads",
-            threads,
-            "--full_data_file",
-            str(w / "data/full.bin"),
-            "--query_file",
-            str(w / "data/query.bin"),
-            "--insert_ids_file",
-            str(w / f"ids/round_{r}_insert.bin"),
-            "--delete_ids_file",
-            str(w / f"ids/round_{r}_delete.bin"),
-            "--gt_file",
-            str(w / f"groundtruth/rounds/round_{r}_gt{args.recall_at}.bin"),
-            "--recall_at",
-            str(args.recall_at),
-        ] + query_search_flags() + [
-            "--private_heap_path",
-            str(dest / "private.heap"),
-            "--checkpoint_prefix",
-            str(saved),
-            "--buffer_frames",
-            resources["buffer_frames"],
-            "--memory_budget_gb",
-            resources["memory_budget_gb"],
-            "--result_file",
-            str(dest / "result.json"),
-            "--search_result_file",
-            str(dest / "neighbors.bin"),
-        ]
-        if scheduler != "update_driven":
-            command += [
-                "--query_ratio",
-                os.environ.get("QUERY_RATIO", "80"),
-                "--scheduler_seed",
-                os.environ.get("IVF_SCHEDULER_SEED", str(0xA5A5A5A5)),
-            ]
-        if args.query_count is not None:
-            command += ["--query_count", str(args.query_count)]
-        command += query_policy_flags(query_warmups)
-        command_log(command, dest / "run.log")
-        record = read_json(dest / "result.json")
-        require(record["explicit_warmup_query_count"] == int(query_warmups),
-                "native mixed final-pass warmup completion count mismatch")
-        require(
-            is_query_record(record, "mixed")
-            and record["insert_count"] == args.insert_cap
-            and record["delete_count"] == args.delete_cap
-            and "recall" in record
-            and (scheduler != "update_driven" or record["scheduler"] == "update_driven")
-            and record["live_count"]
-            == args.base_count + (r + 1) * (args.insert_cap - args.delete_cap),
-            "mixed round execution count/live-set/scoring mismatch",
-        )
-        round_results.append((dest / "result.json").relative_to(output).as_posix())
+        path = f"rounds/round_{r}.json"
+        part = read_json(output / path)
+        require(part["version"] == 3 and part["round"] == r
+                and part["insert_count"] == args.insert_cap
+                and part["delete_count"] == args.delete_cap
+                and part["recall_available"] is False,
+                "mixed round accounting mismatch")
+        round_results.append(path)
         for key in totals:
-            totals[key] += record[key]
-        prefix = saved
+            totals[key] += part[key]
+    require(all(totals[key] == record[key] for key in totals), "mixed query accounting mismatch")
     require(
         component_digests(w / "index", args.dataset) == base_components
         and prepared == identity(args),
@@ -202,12 +191,16 @@ def run(args):
     write_json(
         output / "summary.json",
         {
-            "version": 2,
+            "version": 3,
             "production_qualified": False,
             "round_results": round_results,
             "final_recall": record["recall"],
+            "mixed_wall_s": record["mixed_wall_s"],
+            "native_driver_process_count": 1,
+            "native_process_wall_s": process_wall_s,
+            "harness_workflow_wall_s": time.monotonic() - workflow_start,
             **totals,
-            "scope": "separate_process_rounds_checkpoint_reopen_and_post_barrier_scoring_excluded_from_foreground_time",
+            "scope": "one_process_one_session_persistent_workers_final_scoring_only_no_checkpoints",
         },
     )
 

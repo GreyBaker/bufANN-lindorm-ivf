@@ -235,6 +235,16 @@ namespace {
 }  // namespace
 int main(int argc, char** argv) {
   try {
+    using namespace diskann::ivf;
+    require(training_assignment_searches(90000000, 15) == 1440000000ull &&
+                training_assignment_searches(100000000, 15) == 1600000000ull &&
+                training_assignment_searches(187500000, 15) == 3000000000ull,
+            "15-pass assignment admission arithmetic");
+    rejects([] { training_assignment_searches(187500001, 15); });
+    rejects([] { training_assignment_searches(UINT64_MAX, 15); });
+    rejects([] { training_assignment_searches(1, UINT64_MAX); });
+    require(TrainerLimits{}.max_distance_evaluations == 1000000000,
+            "Exact distance guard must remain separate");
     require(argc == 2, "expected fixture directory");
     const auto root =
         std::filesystem::path(argv[1]) /
@@ -244,6 +254,14 @@ int main(int argc, char** argv) {
     exercise<float>(root / "float.bin", diskann::ivf::DataType::Float);
     exercise<int8_t>(root / "int8.bin", diskann::ivf::DataType::Int8);
     exercise<uint8_t>(root / "uint8.bin", diskann::ivf::DataType::UInt8);
+    BuildConfig full_passes;
+    full_passes.dim = 13; full_passes.base_count = 120;
+    full_passes.nlist = 4; full_passes.build_threads = 1;
+    const auto trained = train_centroids((root / "float.bin").string(), full_passes);
+    require(trained.passes.size() == 16 && trained.objective_history.size() == 15 &&
+                trained.assignment_searches == uint64_t(full_passes.training_count()) * 16 &&
+                trained.passes.back().mean_seconds == 0,
+            "Uniform 15 updates plus final assignment");
     std::cout << "IVF exact centroid trainer tests passed\n";
     return 0;
   } catch (const std::exception& error) {

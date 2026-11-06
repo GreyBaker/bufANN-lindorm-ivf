@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""All-dtype update-driven/weighted/fixed CLI + two-round prepare/run/GT parity."""
+"""All-dtype persistent mixed schedules, final GT parity, and failure boundaries."""
 import argparse
 import hashlib
 import json
@@ -30,7 +30,7 @@ def main():
     args = parser.parse_args()
     args.scratch.mkdir(parents=True, exist_ok=True)
     repo = Path(__file__).resolve().parents[2]
-    with tempfile.TemporaryDirectory(prefix="mixed_", dir=args.scratch) as tmp:
+    with tempfile.TemporaryDirectory(prefix="mixed session ", dir=args.scratch) as tmp:
         root = Path(tmp)
         profiles = root / "profiles"
         profiles.mkdir()
@@ -138,67 +138,45 @@ def main():
                 run(execute, env)
                 output = work / "runs" / scheduler
                 summary = json.loads((output / "summary.json").read_text())
-                assert summary["version"] == 2 and "round_records" not in summary
-                assert summary["round_results"] == [f"rounds/round_{r}/result.json" for r in range(2)]
-                assert not (output / "result.json").exists()
+                assert summary["version"] == 3 and summary["native_driver_process_count"] == 1
+                assert summary["round_results"] == [f"rounds/round_{r}.json" for r in range(2)]
+                record = json.loads((output / "result.json").read_text())
+                assert record["native_driver_process_count"] == record["mutable_session_count"] == 1
+                assert record["worker_pool_launch_count"] == 1 and record["mixed_round_count"] == 2
+                assert record["explicit_warmup_query_count"] == warmups
+                assert record["query_count"] == len(queries) and record["recall"] == 100
+                assert record["insert_count"] == record["delete_count"] == 16
+                assert record["live_count"] == 48 and record["foreground_workers"] == 16
+                assert record["concurrent_recall_policy"] == "not_scored_weakly_consistent_queries"
+                assert "checkpoint_prefix" not in record and "checkpoint_time_s" not in record
+                assert not list(output.rglob("*.manifest"))
+                assert len(list(output.rglob("private.heap"))) == 1
                 assert (
                     not summary["production_qualified"]
                     and summary["concurrent_query_count"] == 128
                     and summary["final_recall"] == 100
                 )
                 for r in range(2):
-                    dest = output / f"rounds/round_{r}"
-                    record = json.loads((dest / "result.json").read_text())
-                    assert not (dest / "native_result.json").exists()
-                    assert not (dest / "extract.log").exists()
-                    assert record["explicit_warmup_query_count"] == warmups
-                    assert record["query_count"] == len(queries)
-                    assert "no_reopen" in record["query_cache_process_policy"]
+                    part = json.loads((output / f"rounds/round_{r}.json").read_text())
                     assert (
-                        record["insert_count"] == record["delete_count"] == 8
-                        and record["live_count"] == 48
+                        part["insert_count"] == part["delete_count"] == 8
+                        and part["live_count"] == 48
                     )
-                    assert (
-                        record["recall"] == 100
-                        and record["concurrent_query_count"] == 64
-                        and record["foreground_workers"] == 16
-                    )
-                    assert (
-                        record["concurrent_recall_policy"] == "not_scored_weakly_consistent_queries"
-                    )
+                    assert part["recall_available"] is False and "recall" not in part
                     if scheduler == "fixed_8_8":
                         assert record["mutation_workers"] == record["concurrent_query_workers"] == 8
-                        assert record["overlapping_query_count"] > 0, record
-                    deleted = range(32, 32 + (r + 1) * 8)
-                    live = [i for i in range(48 + (r + 1) * 8) if i not in deleted]
-                    expected = [
-                        sorted(
-                            [(i, sum((a - b) ** 2 for a, b in zip(q, rows[i]))) for i in live],
-                            key=lambda p: (p[1], p[0]),
-                        )[:4]
-                        for q in queries
-                    ]
-                    actual = list(
-                        struct.iter_unpack("<If", (dest / "neighbors.bin").read_bytes()[8:])
-                    )
-                    assert actual == [p for row in expected for p in row], (actual, expected)
-                    scored = subprocess.run(
-                        [
-                            "python3",
-                            str(repo / "benchmark/SPFresh/utils.py"),
-                            "tie-aware-recall",
-                            "--truth",
-                            str(work / f"groundtruth/rounds/round_{r}_gt4.bin"),
-                            "--result",
-                            str(dest / "neighbors.bin"),
-                            "--recall-at",
-                            "4",
-                        ],
-                        text=True,
-                        capture_output=True,
-                    )
-                    assert scored.returncode == 0 and "1.000000" in scored.stdout, scored.stderr
-                    assert (dest / "checkpoint" / (dataset + ".heap.state")).is_file()
+                live = list(range(32)) + list(range(48, 64))
+                expected = [sorted(
+                    [(i, sum((a - b) ** 2 for a, b in zip(q, rows[i]))) for i in live],
+                    key=lambda p: (p[1], p[0]))[:4] for q in queries]
+                actual = list(struct.iter_unpack("<If", (output / "neighbors.bin").read_bytes()[8:]))
+                assert actual == [p for row in expected for p in row], (actual, expected)
+                scored = subprocess.run([
+                    "python3", str(repo / "benchmark/SPFresh/utils.py"), "tie-aware-recall",
+                    "--truth", str(work / "groundtruth/rounds/round_1_gt4.bin"),
+                    "--result", str(output / "neighbors.bin"), "--recall-at", "4"],
+                    text=True, capture_output=True)
+                assert scored.returncode == 0 and "1.000000" in scored.stdout, scored.stderr
                 assert all(digest(p) == value for p, value in initial.items())
                 run(execute, env, False)  # Cannot overwrite evidence.
             # Default shell path is update-driven, with no hidden ratio/count.
@@ -218,25 +196,23 @@ def main():
             output = work / "runs/update_driven"
             summary = json.loads((output / "summary.json").read_text())
             assert summary["final_recall"] == 100 and not summary["production_qualified"]
+            record = json.loads((output / "result.json").read_text())
+            assert record["scheduler"] == "update_driven"
+            assert record["insert_count"] == record["delete_count"] == 16
+            assert record["recall"] == 100 and record["live_count"] == 48
+            assert record["mutation_workers"] == record["concurrent_query_workers"] == 2
+            assert "query_ratio" not in record and "scheduler_seed" not in record
+            assert record["concurrent_query_count_policy"] == "until_all_mutations_complete_join_admitted_queries"
+            assert record["concurrent_query_latency_sample_count"] == min(
+                record["concurrent_query_count"], record["concurrent_query_latency_sample_limit"])
             for r in range(2):
-                dest = output / f"rounds/round_{r}"
-                record = json.loads((dest / "result.json").read_text())
-                assert record["scheduler"] == "update_driven"
-                assert record["insert_count"] == record["delete_count"] == 8
-                assert record["recall"] == 100 and record["live_count"] == 48
-                assert record["mutation_workers"] == record["concurrent_query_workers"] == 2
-                assert "query_ratio" not in record and "scheduler_seed" not in record
-                assert (
-                    record["concurrent_query_count_policy"]
-                    == "until_all_mutations_complete_join_admitted_queries"
-                )
-                assert record["concurrent_query_latency_sample_count"] == min(
-                    record["concurrent_query_count"],
-                    record["concurrent_query_latency_sample_limit"],
-                )
-                log = (dest / "run.log").read_text()
-                assert "--query_ratio" not in log and "--query_count" not in log
-                assert "--scheduler_seed" not in log
+                part = json.loads((output / f"rounds/round_{r}.json").read_text())
+                assert part["insert_count"] == part["delete_count"] == 8
+                assert part["recall_available"] is False and part["live_count"] == 48
+            log = (output / "run.log").read_text()
+            assert "--query_ratio" not in log and "--query_count" not in log
+            assert "--scheduler_seed" not in log and "--checkpoint_prefix" not in log
+            assert log.count("phase=open_private_copy_verify state=start") <= 1
             assert summary["concurrent_query_count"] == sum(
                 json.loads((output / path).read_text())["concurrent_query_count"]
                 for path in summary["round_results"]
@@ -304,7 +280,56 @@ def main():
                 "4",
                 "--rerank_factor",
                 "32",
+                "--gt_file", str(work / "groundtruth/rounds/round_1_gt4.bin"),
             ]
+            # Native schedules also support unequal and one-sided rounds,
+            # independently of the shell profile's equal-cap protocol.
+            schedule_dir = root / (dtype + " unequal schedule")
+            schedule_dir.mkdir()
+            schedule = schedule_dir / "schedule.txt"
+            pairs = []
+            for r, (inserts, deletes) in enumerate((([48, 49, 50], [40]), ([], [41, 42]))):
+                pair = []
+                for name, values in (("insert", inserts), ("delete", deletes)):
+                    path = schedule_dir / f"{r} {name}.bin"
+                    path.write_bytes(struct.pack("<I", len(values)) + b"".join(struct.pack("<I", v) for v in values))
+                    pair.append(path)
+                pairs.append(pair)
+            schedule.write_text("".join(f'"{i}" "{d}"\n' for i, d in pairs))
+            schedule_base = base[:base.index("--insert_ids_file")] + base[base.index("--nprobe"):]
+            live = [i for i in range(51) if i not in (40, 41, 42)]
+            expected = [sorted([(i, sum((a - b) ** 2 for a, b in zip(q, rows[i]))) for i in live],
+                               key=lambda p: (p[1], p[0]))[:4] for q in queries]
+            final_truth = schedule_dir / "final.gt"
+            write_truth(final_truth, expected)
+            schedule_base[schedule_base.index("--gt_file") + 1] = str(final_truth)
+            native_command = schedule_base + [
+                "--scheduler", "update_driven", "--pool_threads", "4",
+                "--round_schedule", str(schedule), "--round_results_dir", str(schedule_dir / "rounds"),
+                "--private_heap_path", str(schedule_dir / "session.heap"),
+                "--result_file", str(schedule_dir / "result.json"),
+                "--search_result_file", str(schedule_dir / "neighbors.bin")]
+            p = subprocess.run(native_command, text=True, capture_output=True, timeout=90)
+            assert p.returncode == 0, (p.stdout, p.stderr)
+            record = json.loads((schedule_dir / "result.json").read_text())
+            assert record["insert_count"] == record["delete_count"] == 3 and record["live_count"] == 48
+            assert record["recall"] == 100
+            assert list(struct.iter_unpack("<If", (schedule_dir / "neighbors.bin").read_bytes()[8:])) == [v for row in expected for v in row]
+            # Bad later-round IDs and malformed schedules fail before mutation.
+            bad_ids = schedule_dir / "bad deletes.bin"
+            bad_ids.write_bytes(struct.pack("<II", 1, 63))
+            for n, text in enumerate((f'"{pairs[0][0]}" "{pairs[0][1]}"\n"{pairs[1][0]}" "{bad_ids}"\n',
+                                      '"unterminated\n', '', f'"{pairs[0][0]}" "{pairs[0][1]}" extra\n')):
+                bad = schedule_dir / f"bad{n}.txt"
+                bad.write_text(text)
+                result = schedule_dir / f"bad{n}.json"
+                bad_rounds = schedule_dir / f"bad{n}-rounds"
+                p = subprocess.run(schedule_base + [
+                    "--scheduler", "update_driven", "--pool_threads", "2",
+                    "--round_schedule", str(bad), "--round_results_dir", str(bad_rounds),
+                    "--private_heap_path", str(schedule_dir / f"bad{n}.heap"),
+                    "--result_file", str(result)], text=True, capture_output=True, timeout=90)
+                assert p.returncode != 0 and not result.exists() and not bad_rounds.exists(), (p.stdout, p.stderr)
             for n, extra in enumerate(
                 (
                     ["--query_ratio", "100"],
@@ -325,7 +350,7 @@ def main():
                 )
                 p = subprocess.run(
                     base
-                    + ["--private_heap_path", str(private), "--checkpoint_prefix", str(checkpoint)]
+                    + ["--private_heap_path", str(private)]
                     + extra,
                     text=True,
                     capture_output=True,
@@ -338,7 +363,7 @@ def main():
                 ), (p.stdout, p.stderr)
                 assert not any(line.startswith('{"baseline":') for line in p.stdout.splitlines())
     print(
-        "All-dtype update-driven/weighted/fixed rounds, checkpoint/GT/reopen/script/oracle fixtures passed"
+        "All-dtype persistent update-driven/weighted/fixed schedules and final GT/oracle fixtures passed"
     )
 
 

@@ -420,7 +420,14 @@ class SharedOrchestrationTests(unittest.TestCase):
                 "insert_count": 1, "delete_count": 1, "live_count": 3,
                 "mixed_wall_s": 0.25, "concurrent_query_count": 5, "overlapping_query_count": 3,
                 "native_only_field": "must survive without a Python rewrite",
+                "mixed_protocol_version": 3, "mixed_round_count": 1,
             }
+            if workload == "mixed":
+                rounds = Path(command[command.index("--round_results_dir") + 1])
+                rounds.mkdir()
+                common.write_json(rounds / "round_0.json", dict(
+                    version=3, round=0, insert_count=1, delete_count=1,
+                    concurrent_query_count=5, overlapping_query_count=3, recall_available=False))
             raw = ("  " + json.dumps(record, separators=(",", ":")) + "\n\n").encode()
             with result.open("xb") as out:
                 out.write(raw)
@@ -452,6 +459,26 @@ class SharedOrchestrationTests(unittest.TestCase):
             mixed.run(args)
             with self.assertRaisesRegex(ValueError, "mixed output exists"):
                 mixed.run(args)
+            # A native failure after completed round accounting must not cause
+            # the harness to erase that evidence or publish a success summary.
+            failed_out = work / "mixed-failed"
+            args.output_dir = failed_out
+
+            def fail_later(command, log):
+                Path(log).write_text("later native round failed\n")
+                rounds = failed_out / "rounds"
+                rounds.mkdir()
+                common.write_json(rounds / "round_0.json", {"completed": True})
+                (failed_out / "private.heap").write_bytes(b"partial owned session")
+                raise ValueError("later round failed")
+
+            with patch.object(mixed, "command_log", side_effect=fail_later):
+                with self.assertRaisesRegex(ValueError, "later round failed"):
+                    mixed.run(args)
+            self.assertTrue((failed_out / "rounds/round_0.json").is_file())
+            self.assertEqual((failed_out / "private.heap").read_bytes(), b"partial owned session")
+            self.assertFalse((failed_out / "result.json").exists())
+            self.assertFalse((failed_out / "summary.json").exists())
         self.assertEqual(len(commands), 2)
         opening = [
             "fake-driver", "--validate_inputs", "0", "--data_type", "float", "--metric", "l2",
@@ -468,16 +495,15 @@ class SharedOrchestrationTests(unittest.TestCase):
             "--result_file", str(query_out / "result.json"),
             "--search_result_file", str(query_out / "neighbors.bin"),
         ] + ["--private_heap_path", str(query_out / "query.heap")] + policy)
-        round_out = work / "mixed-run/rounds/round_0"
+        round_out = work / "mixed-run"
         self.assertEqual(commands[1], opening + [
             "--index_format", "immutable", "--workload", "mixed", "--scheduler", "weighted",
             "--pool_threads", "8", "--full_data_file", str(data), "--query_file", str(query),
-            "--insert_ids_file", str(work / "ids/round_0_insert.bin"),
-            "--delete_ids_file", str(work / "ids/round_0_delete.bin"),
+            "--round_schedule", str(round_out / "round_schedule.txt"),
+            "--round_results_dir", str(round_out / "rounds"),
             "--gt_file", str(truth), "--recall_at", "1",
         ] + search + [
             "--private_heap_path", str(round_out / "private.heap"),
-            "--checkpoint_prefix", str(round_out / "checkpoint/tiny"),
             "--buffer_frames", "64", "--memory_budget_gb", "3",
             "--result_file", str(round_out / "result.json"),
             "--search_result_file", str(round_out / "neighbors.bin"),

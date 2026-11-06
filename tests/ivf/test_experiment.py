@@ -114,8 +114,9 @@ bash() { command python3 "$FIXTURE_NATIVE" "$1"; }
         for nlist in (100000, 200000, 300000):
             work = previous / f"nlist-{nlist}/sift100m/IVF/query"
             work.mkdir(parents=True)
-            (work / "prepared.json").write_text("unchanged preparation")
-        result = self.invoke("sift100m-refine", IVF_GRID_PREVIOUS_ROOT=str(previous), IVF_MAX_REPS="10")
+            (work / "prepared.json").write_text(json.dumps(dict(settings=dict(max_reps="15", nlist=str(nlist)))))
+        before = {p: p.read_bytes() for p in previous.rglob("prepared.json")}
+        result = self.invoke("sift100m-refine", IVF_GRID_PREVIOUS_ROOT=str(previous))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([c['nlist'] for c in self.calls() if c['script']=='query_prepare'], ['400000'])
         self.assertTrue(all(c['routing_limit']=='5000000000' for c in self.calls() if c['nlist']=='400000'))
@@ -123,7 +124,7 @@ bash() { command python3 "$FIXTURE_NATIVE" "$1"; }
         with (self.root / "output/results.csv").open() as results:
             self.assertEqual(len(list(csv.DictReader(results))), 80)
         for path in previous.glob('nlist-*/sift100m/IVF/query/prepared.json'):
-            self.assertEqual(path.read_text(), 'unchanged preparation')
+            self.assertEqual(path.read_bytes(), before[path])
 
     def test_gt_failure_stops_work_and_existing_roots_are_not_overwritten(self):
         result = self.invoke("workloads", FIXTURE_GT_STATUS="3")
@@ -135,13 +136,27 @@ bash() { command python3 "$FIXTURE_NATIVE" "$1"; }
         self.assertNotEqual(self.invoke("workloads").returncode, 0)
         self.assertEqual(marker.read_text(), "retain failed evidence")
 
-    def test_workloads_are_independent_pairs_and_respect_pass_override(self):
-        result = self.invoke("workloads", IVF_MAX_REPS="10", IVF_GENERATE_GT="0")
+    def test_workloads_are_independent_pairs_and_use_15_passes(self):
+        result = self.invoke("workloads", IVF_MAX_REPS="15", IVF_GENERATE_GT="0")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual([c['script'] for c in self.calls()],
                          [w+s for w in ('query','insert','delete','update') for s in ('_prepare','')])
-        self.assertTrue(all(c['max_reps']=='10' for c in self.calls()))
+        self.assertTrue(all(c['max_reps']=='15' for c in self.calls()))
         self.assertNotIn('--generate', (self.root / 'gt.args').read_text())
+
+    def test_conflicting_passes_and_old_preparations_are_rejected(self):
+        for mode in ("workloads", "sift100m-wide", "sift100m-refine"):
+            self.assertNotEqual(self.invoke(mode, "--dry-run", IVF_MAX_REPS="10").returncode, 0)
+        previous = self.root / "previous"
+        previous.mkdir()
+        (previous / "selected_gt.txt").write_text(str(self.root / "truth.bin"))
+        work = previous / "nlist-100000/sift100m/IVF/query"
+        work.mkdir(parents=True)
+        (work / "prepared.json").write_text(json.dumps(dict(settings=dict(max_reps="10", nlist="100000"))))
+        result = self.invoke("sift100m-refine", IVF_GRID_PREVIOUS_ROOT=str(previous))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "output").exists())
+        self.assertEqual(self.calls(), [])
 
     def test_query_failure_preserves_private_heaps(self):
         result = self.invoke("sift100m-wide", FIXTURE_FAIL_QUERY="1")

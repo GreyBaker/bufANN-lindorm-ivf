@@ -1,6 +1,6 @@
 # Late implementation plan
 
-Status: planned; implementation and validation boxes below are intentionally unchecked.
+Status: phases 1 and 2 implemented and validated. Phases 3 and 4 remain unstarted.
 
 Beware that this document may require modification. 
 
@@ -23,8 +23,8 @@ Do not mark full-scale experiments complete on the strength of synthetic tests.
 
 | Phase | Implementation | Validation | Evidence / revision |
 |---|---|---|---|
-| 1. Training and guards | Pending | Pending | |
-| 2. Persistent mixed execution | Pending | Pending | |
+| 1. Training and guards | Complete | Passed | 3B allowance; fixed 15-pass recipes; evidence below |
+| 2. Persistent mixed execution | Complete | Passed | One process/session/pool; version-3 accounting; evidence below |
 | 3. Writeback-only mutable sessions | Pending | Pending | |
 | 4. FAISS HNSW migration | Pending | Pending | |
 
@@ -74,23 +74,23 @@ separately accounted for.
 
 ### Implementation tasks
 
-- [ ] Trace assignment allowances through `TrainerLimits`, `ListBuildOptions`,
+- [x] Trace assignment allowances through `TrainerLimits`, `ListBuildOptions`,
   native build/training entry points, cost-model callers, and recipe settings.
-- [ ] Set the relevant assignment-search defaults to **2,000,000,000**, using
+- [x] Set the relevant assignment-search defaults to **3,000,000,000**, using
   checked 64-bit arithmetic. Keep actual work estimates in diagnostics.
-- [ ] Preserve rejection above the declared allowance; do not disable admission
+- [x] Preserve rejection above the declared allowance; do not disable admission
   or automatically raise limits until every requested job passes.
-- [ ] Keep exact-distance, PCA, graph-refinement, and routing-work allowances
+- [x] Keep exact-distance, PCA, graph-refinement, and routing-work allowances
   separate. Do not replace all occurrences of `1000000000` indiscriminately.
-- [ ] Make main recipes select 15 explicitly and reject conflicting pass overrides
+- [x] Make main recipes select 15 explicitly and reject conflicting pass overrides
   rather than silently running a differently trained main experiment.
-- [ ] Remove README exports of `IVF_MAX_REPS=10` and explanations recommending
+- [x] Remove README exports of `IVF_MAX_REPS=10` and explanations recommending
   the old workaround. Keep individual native/test interfaces configurable.
-- [ ] Record the fixed pass policy and assignment allowance in existing settings
+- [x] Record the fixed pass policy and assignment allowance in existing settings
   and native diagnostics; avoid a second experiment-plan format.
-- [ ] Ensure reuse checks distinguish 10-pass and 15-pass preparations. Check the
+- [x] Ensure reuse checks distinguish 10-pass and 15-pass preparations. Check the
   required provenance fields directly; do not restore a generic validation layer.
-- [ ] Require matching 15-pass wide-grid bases for refinement reuse. Do not
+- [x] Require matching 15-pass wide-grid bases for refinement reuse. Do not
   silently retrain or mutate a previous experiment's prepared bases.
 
 Primary locations: `include/bufann/ivf_centroids.h`,
@@ -100,21 +100,36 @@ and `benchmark/IVF/README.md`.
 
 ### Validation and completion gate
 
-- [ ] Test admission arithmetic for 1.44B and 1.60B searches without actually
+- [x] Test admission arithmetic for 1.44B and 1.60B searches without actually
   executing billions of searches; test the limit boundary and overflow rejection.
-- [ ] Verify unrelated exact-distance and routing limits still reject excess work.
-- [ ] Verify a small 15-pass run emits 15 mean updates plus final assignment.
-- [ ] Verify every main recipe selects 15; keep tiny configurable test fixtures.
-- [ ] Verify incompatible prepared training provenance is rejected before reuse.
-- [ ] Run affected native training, preparation, recipe, and orchestration tests.
+- [x] Verify unrelated exact-distance and routing limits still reject excess work.
+- [x] Verify a small 15-pass run emits 15 mean updates plus final assignment.
+- [x] Verify every main recipe selects 15; keep tiny configurable test fixtures.
+- [x] Verify incompatible prepared training provenance is rejected before reuse.
+- [x] Run affected native training, preparation, recipe, and orchestration tests.
 
 Evidence / commands:
 
-<!-- Fill in executed commands, results, and retained evidence paths. -->
+2026-11-05, Linux/WSL. Build directory:
+`/mnt/c/Users/GBaker/AppData/Local/Temp/opencode/ivf-layout-build-01`.
+
+- `cmake --build <build-dir> -j4`: passed (existing warnings include WSL clock skew).
+- `ctest --test-dir <build-dir> -R '^ivf_(centroid_training|mixed_scheduler)$' --output-on-failure`: 2/2 passed.
+- The broader 12-test run passed centroid/ANN training, posting lists, cost-model
+  CLI, preparation guards, recipe-adjacent orchestration, query harness, sequential
+  CLI/parallel insertion, and mixed execution. CTest logs are under
+  `<build-dir>/Testing/Temporary/`.
+- `python3 -B tests/ivf/test_experiment.py --scratch <approved-temp>`:
+  7 tests passed, including conflicting-pass and old-preparation refusal.
+- `python3 -B tests/ivf/test_orchestration.py --scratch <approved-temp>`:
+  22 tests passed.
+- Bash syntax: 73 benchmark scripts and 26 README Bash blocks passed.
 
 Notes / remaining issues:
 
-<!-- Fill in limitations or deviations before marking the phase complete. -->
+The 3B limit follows the user's edited plan. Admission boundaries are checked
+without billion-operation runs. No full-scale SIFT100M training or experiments
+were launched. Exact-distance and PCA/routing guards remain independent.
 
 ## 2. Persistent mixed execution
 
@@ -132,43 +147,43 @@ global workload stop or a thread-pool teardown.
 
 ### Implementation tasks
 
-- [ ] Replace Python checkpoint chaining with one driver invocation and a simple
+- [x] Replace Python checkpoint chaining with one driver invocation and a simple
   ordered schedule of existing per-round insert/delete input paths and counts.
   Use a narrowly scoped schedule representation, not a generic job framework.
-- [ ] Prevalidate schedule structure, ID ranges/counts, paths, and required final
+- [x] Prevalidate schedule structure, ID ranges/counts, paths, and required final
   GT before mutating. Keep trusted input identity checks outside foreground time.
-- [ ] Refactor the native scheduler so index ownership and worker lifetimes span
+- [x] Refactor the native scheduler so index ownership and worker lifetimes span
   rounds. Preserve the existing scheduler, allocation, and operation mix policies.
-- [ ] Preserve operation dependencies at transitions. Do not admit a later-round
+- [x] Preserve operation dependencies at transitions. Do not admit a later-round
   mutation early merely to keep threads busy.
-- [ ] Keep the query stream/cursor and cache state continuous; do not perform
+- [x] Keep the query stream/cursor and cache state continuous; do not perform
   repeated per-round warmup, complete-file hashing, or base copying.
-- [ ] Remove mixed-path checkpoint prefixes, per-round private heaps, and reopen
+- [x] Remove mixed-path checkpoint prefixes, per-round private heaps, and reopen
   setup. Retain round output directories only for metrics/evidence that exist.
-- [ ] Emit completed-round records without joining/restarting every worker. Define
+- [x] Emit completed-round records without joining/restarting every worker. Define
   query attribution by an explicit event, such as query completion; allow queries
   to cross round boundaries without double counting or making snapshot claims.
-- [ ] Score final recall only after all updates finish and queries are drained,
+- [x] Score final recall only after all updates finish and queries are drained,
   against final-live-set GT, using the same mutable index. Never use one static GT
   to claim recall for arbitrary concurrent queries over changing live sets.
-- [ ] Stop producing mandatory per-round recall/neighbor files. Update consumers
+- [x] Stop producing mandatory per-round recall/neighbor files. Update consumers
   to distinguish unavailable intermediate recall from zero recall.
-- [ ] Preserve failures and completed-round evidence; do not publish a successful
+- [x] Preserve failures and completed-round evidence; do not publish a successful
   aggregate result when a later round fails. No checkpoint-resume behavior.
 
 ### Timing and resource accounting
 
-- [ ] Report one active-workload elapsed interval covering continuous execution
+- [x] Report one active-workload elapsed interval covering continuous execution
   and round transitions, alongside per-round mutation counts and intervals.
-- [ ] Use summed foreground worker busy time only under an explicitly different
+- [x] Use summed foreground worker busy time only under an explicitly different
   metric name; it is not elapsed workload time or a throughput denominator.
-- [ ] Report setup, warmup, final stable scoring, and total workflow time
+- [x] Report setup, warmup, final stable scoring, and total workflow time
   separately. Do not reconstruct total elapsed time by summing overlapping spans.
-- [ ] Report total queries and distinguish update-overlap queries from any query
+- [x] Report total queries and distinguish update-overlap queries from any query
   tail. Do not inflate concurrent throughput using post-update scoring queries.
-- [ ] Keep bounded ID/input staging, result buffering, and thread budgets. Do not
+- [x] Keep bounded ID/input staging, result buffering, and thread budgets. Do not
   load or duplicate every round's coordinates solely to implement persistence.
-- [ ] Version changed result/protocol semantics and update tests/CSV consumers.
+- [x] Version changed result/protocol semantics and update tests/CSV consumers.
   Historical files remain untouched; no misleading old metric labels.
 
 Primary locations: `tests/ivf_cli_execution.cpp`, native mixed scheduler/worker
@@ -176,24 +191,70 @@ helpers, `benchmark/IVF/mixed.py`, and mixed execution/orchestration tests.
 
 ### Validation and completion gate
 
-- [ ] Assert one native process, one mutable fork, no inter-round checkpoint or
+- [x] Assert one native process, one mutable fork, no inter-round checkpoint or
   reopen, and persistent worker infrastructure.
-- [ ] Compare cumulative state with a deterministic reference for uneven rounds,
+- [x] Compare cumulative state with a deterministic reference for uneven rounds,
   unequal insert/delete counts, and supported zero-count cases.
-- [ ] Verify next-round mutation ordering while queries remain active across a
+- [x] Verify next-round mutation ordering while queries remain active across a
   transition. Check final liveness and no duplicate/missing accounting.
-- [ ] Validate final recall and returned distances on small exact-GT fixtures.
-- [ ] Exercise a later-round failure, output collision, and malformed schedule;
+- [x] Validate final recall and returned distances on small exact-GT fixtures.
+- [x] Exercise a later-round failure, output collision, and malformed schedule;
   confirm fail-fast behavior and retained earlier evidence.
-- [ ] Run native mixed, Python mixed, shared orchestration, and recipe tests.
+- [x] Run native mixed, Python mixed, shared orchestration, and recipe tests.
 
 Evidence / commands:
 
-<!-- Fill in executed commands, results, and retained evidence paths. -->
+2026-11-05, same Linux/WSL build directory as phase 1.
+
+- Updated `ivf_mixed_execution` passed real float/int8/uint8 prepare/run paths,
+  weighted/fixed/update-driven schedules, same-session final ID/distance/GT
+  checks, unequal/one-sided native rounds, paths containing spaces, malformed
+  schedules, changed IDs, low-budget and no-overwrite refusals.
+- The scheduler's cross-boundary fixture deliberately holds a query from round 0
+  until a round-1 mutation executes. It verifies persistent mutation-thread
+  identity and completion-round query attribution without sleeps.
+- Later-round preparation and mutation exceptions are tested in the native
+  scheduler; Python harness failure tests verify retained completed-round and
+  private-heap evidence with no overall success result/summary.
+- Standalone scheduler AddressSanitizer/UndefinedBehaviorSanitizer passed with
+  leak detection and halt-on-error enabled. Binary:
+  `<approved-temp>/ivf-persistent-scheduler-asan`.
+- Standalone scheduler ThreadSanitizer passed 10/10 repetitions using
+  `setarch x86_64 -R env TSAN_OPTIONS=halt_on_error=1
+  <approved-temp>/ivf-persistent-scheduler-tsan`. An initial invocation without
+  disabling ASLR failed at sanitizer startup with an unexpected-memory-mapping
+  error, before test execution; it is not counted as a test pass.
+- Full `ctest --test-dir <build-dir> -R '^ivf_' -j2 --output-on-failure`
+  completed in 491.95 seconds: **58 passed, 1 skipped, 0 failed**. This includes
+  the final native mixed/scheduler, training, script/orchestration, sequential
+  updates, warmup, query composition, mutable-session, heap/I/O, cost-model,
+  routing and dependency/build-contract suites.
+- The skipped CTest entry is `ivf_gt_depth`: the configured `/usr/bin/python3`
+  lacks NumPy. No exact-scan depth qualification is claimed. GT coverage and
+  management tests, plus the small final-live-set ID/distance/recall oracles in
+  mixed execution, passed independently.
+- Final CTest evidence: `<build-dir>/Testing/Temporary/LastTest.log` and
+  `<build-dir>/Testing/Temporary/CTestCostData.txt`. The standalone sanitizer
+  commands/results above are separate, scoped scheduler checks, not full native
+  sanitizer qualification.
+- `git diff --check` passed. No full-scale SIFT100M run, commit, or push was made.
 
 Notes / remaining issues:
 
-<!-- Fill in limitations or deviations before marking the phase complete. -->
+Main shell profiles retain equal-cap rounds; unequal and one-sided schedules
+are covered at the native interface. Fully empty mutation rounds remain invalid.
+One largest-round coordinate buffer is reused. Later-round staging and accounting
+are included in continuous elapsed time, while initial staging is excluded.
+Query counts are attributed by completion; finite-quota workers may wait when a
+round's quota is exhausted, but are never restarted. Full-scale throughput,
+hard-RSS bounds and production qualification are not claimed. The shared
+checkpoint API and sequential mutation checkpoints remain for phase 3; no new
+final writeback or FAISS migration has been implemented.
+
+An extra failure test initially assumed the tiny list would grow. It instead
+correctly hit preflight admission because that list already had spare capacity.
+The test's invalid assumption was removed; later-failure coverage uses the
+deterministic scheduler/harness cases above, without weakening admission guards.
 
 ## 3. Remove mutable checkpoints; retain writeback-only capabilities
 

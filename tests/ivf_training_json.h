@@ -37,6 +37,7 @@ namespace ivf_cli {
     emit("training_time_s", stats.elapsed_seconds);
     emit("training_estimated_bytes", stats.estimated_bytes);
     emit("training_assignment_searches", stats.assignment_searches);
+    emit("training_assignment_search_limit", stats.assignment_search_limit);
     emit("training_graph_builds", stats.assignment_index_builds);
     emit("training_graph_refreshes", stats.assignment_index_refreshes);
     emit("training_reinserted_centroids", stats.reinserted_centroids);
