@@ -1,6 +1,7 @@
 # Late implementation plan
 
-Status: phases 1–3 implemented and validated. Phase 4 remains unstarted.
+Status: phases 1–4 implemented and validated on bounded fixtures. Full-scale
+SIFT100M performance/quality and cross-system comparisons remain unqualified.
 
 Beware that this document may require modification. 
 
@@ -26,7 +27,7 @@ Do not mark full-scale experiments complete on the strength of synthetic tests.
 | 1. Training and guards | Complete | Passed | 3B allowance; fixed 15-pass recipes; evidence below |
 | 2. Persistent mixed execution | Complete | Passed | One process/session/pool; version-3 accounting; evidence below |
 | 3. Writeback-only mutable sessions | Complete | Passed | Bounded writeback; same-session scoring; 59 passed / 1 skipped; evidence below |
-| 4. FAISS HNSW migration | Pending | Pending | |
+| 4. FAISS HNSW migration | Complete | Passed (bounded fixtures) | FAISS 1.9.0; native 60 passed / 1 skipped; isolated, sanitizers and before/after evidence below |
 
 ## End-state contract and boundaries
 
@@ -387,7 +388,8 @@ included. Workflow time includes writeback.
 
 No WAL, `fsync`, updated metadata export, resume, durable acknowledgment or updated
 index restartability is provided. No existing artifact migration/deletion, full-scale
-experiment, commit or push was performed. Phase 4 remains unstarted. Historical
+experiment, commit or push was performed. At that phase-3 checkpoint, phase 4 had
+not started. Historical
 phase-1/2 checkpoint notes and older S05/S06 sanitizer results describe their
 milestones, not current mutable persistence or phase-3 sanitizer qualification.
 
@@ -405,49 +407,49 @@ Substituting a constructor or renaming a mode does not implement the migration.
 
 ### Dependency and capability preparation
 
-- [ ] Pin a specific CPU FAISS version/source identity and record its license and
+- [x] Pin a specific CPU FAISS version/source identity and record its license and
   provenance. Keep optional routing dependencies out of dependency-light targets.
-- [ ] Integrate target-scoped CMake linkage and support the documented native and
+- [x] Integrate target-scoped CMake linkage and support the documented native and
   isolated-test builds. Disable unneeded GPU/Python components.
-- [ ] Resolve BLAS LP64/ILP64 compatibility and OpenMP runtime selection with the
+- [x] Resolve BLAS LP64/ILP64 compatibility and OpenMP runtime selection with the
   existing MKL build. Avoid linking conflicting runtimes or oversubscribing workers.
-- [ ] Map required operations against the pinned FAISS interfaces. Prefer public
+- [x] Map required operations against the pinned FAISS interfaces. Prefer public
   APIs; identify and document any necessary narrow extension before porting.
-- [ ] Freeze pre-migration small-fixture quality/performance evidence after phase 3,
+- [x] Freeze pre-migration small-fixture quality/performance evidence after phase 3,
   so graph-backend effects are not confused with lifecycle/persistence changes.
 
 ### Vanilla and optimized graph migration
 
-- [ ] Implement vanilla centroid search with FAISS HNSW, preserving centroid IDs,
+- [x] Implement vanilla centroid search with FAISS HNSW, preserving centroid IDs,
   metric conventions, configured breadths, and deterministic final tie handling.
-- [ ] Separate raw vanilla-search measurements from wrapper oversampling and
+- [x] Separate raw vanilla-search measurements from wrapper oversampling and
   exact reranking costs. Do not label an augmented path as raw FAISS timing.
-- [ ] Port optimized full-coordinate construction and projected-distance traversal.
+- [x] Port optimized full-coordinate construction and projected-distance traversal.
   The PCA path must search the full-coordinate graph using projected distances,
   then rerank full centroids; building a different graph in PCA space is not an
   equivalent substitution.
-- [ ] Port bottom-layer refinement and connectivity diagnostics/isolated-node repair.
-- [ ] Port training centroid refresh, graph reuse, neighbor-seeded reinsertion,
+- [x] Port bottom-layer refinement and connectivity diagnostics/isolated-node repair.
+- [x] Port training centroid refresh, graph reuse, neighbor-seeded reinsertion,
   and previous-assignment entry-point seeding. Retain LV/LV+ distinctions.
-- [ ] Keep all graph mutation in quiescent construction/training phases. Frozen
+- [x] Keep all graph mutation in quiescent construction/training phases. Frozen
   runtime graphs must support concurrent queries and insertion routing safely.
-- [ ] Use per-call search settings/scratch rather than racing shared `efSearch`
+- [x] Use per-call search settings/scratch rather than racing shared `efSearch`
   setters. Test different concurrent query and assignment breadths.
-- [ ] Update memory/work estimates and diagnostics for FAISS structures. Avoid
+- [x] Update memory/work estimates and diagnostics for FAISS structures. Avoid
   unsafe global statistics as per-query counters; explicitly mark unavailable
   measurements rather than inventing values.
 
 ### Artifacts and integration
 
-- [ ] Implement immutable prepared-router save/load with explicit FAISS and
+- [x] Implement immutable prepared-router save/load with explicit FAISS and
   optimized-variant identities, including projection/configuration provenance.
-- [ ] Update mode names, defaults, native CLI help, recipes, cost-model callers,
+- [x] Update mode names, defaults, native CLI help, recipes, cost-model callers,
   cache/prepared identities, tests, and documentation consistently.
-- [ ] Reject hnswlib-produced bundles as incompatible with new FAISS runs. Preserve
+- [x] Reject hnswlib-produced bundles as incompatible with new FAISS runs. Preserve
   old artifacts and require fresh matching 15-pass preparations for new results.
-- [ ] Remove IVF's stock and patched hnswlib dependencies only after all required
+- [x] Remove IVF's stock and patched hnswlib dependencies only after all required
   paths migrate. Leave unrelated baseline dependencies and historical evidence alone.
-- [ ] Update notices and clearly distinguish upstream FAISS from local extensions.
+- [x] Update notices and clearly distinguish upstream FAISS from local extensions.
 
 Primary locations: `cmake/IVF.cmake`, dependency CMake integration,
 `include/bufann/ivf_router.h`, graph adapter interfaces,
@@ -456,50 +458,273 @@ factories, router artifacts, settings, tests, and dependency documentation.
 
 ### Validation and completion gate
 
-- [ ] Test centroid ID mapping, distance calculations, ties, serialization, and
+- [x] Test centroid ID mapping, distance calculations, ties, serialization, and
   malformed/incompatible artifacts using small fixtures.
-- [ ] Test overlapping query/insertion routing with different per-call parameters;
+- [x] Test overlapping query/insertion routing with different per-call parameters;
   run applicable race/sanitizer checks on build, training, and frozen search.
-- [ ] Verify PCA traversal/rerank behavior, graph reuse, seeded assignment,
+- [x] Verify PCA traversal/rerank behavior, graph reuse, seeded assignment,
   refinement, and connectivity diagnostics individually.
-- [ ] Compare clustering objective, recall, build time, query time, and memory
+- [x] Compare clustering objective, recall, build time, query time, and memory
   against recorded pre-migration evidence. Do not require identical ANN neighbors
   or promise speedups; investigate material quality regressions.
-- [ ] Run all affected native and Python suites and verify the documented build
+- [x] Run all affected native and Python suites and verify the documented build
   from a clean build directory with the pinned dependency.
-- [ ] Confirm main recipes no longer execute any hnswlib path and do not silently
+- [x] Confirm main recipes no longer execute any hnswlib path and do not silently
   downgrade LV/LV+ or PCA-refined modes to vanilla HNSW.
 
 Evidence / commands:
 
-<!-- Fill in executed commands, results, and retained evidence paths. -->
+Pinned CPU dependency: **FAISS v1.9.0**, archive SHA-256
+`f6721f1a479b0bdd8547e5bb0dbfa872643e7ea37686c6bf6fc99fb933b3fe4f`, MIT.
+`dependencies/faiss/README.md` maps construction, local-context search, projected
+distance computers, previous-ID seeding, full-coordinate refresh/reinsertion,
+refinement and checked serialization to public FAISS primitives. Upstream source
+is unmodified; no narrow upstream patch was necessary. The local adapter is
+explicitly identified as `faiss-1.9.0-ivf1`, separate from vanilla
+`faiss-1.9.0-cpu1`. Historical adapter filenames and HNSW artifact suffixes are
+retained, not historical hnswlib execution or binary content.
+
+Before migration, preserved three repetitions of each 15-pass
+`ann-rebuild`/`ann-reuse`/`ann-reuse-seeded`/`lv`/`lv-plus` control on one seeded
+2048-row, 16D, 64-centroid float fixture, plus all six final-router modes on the
+existing 768-centroid/40-query fixture. Evidence:
+`C:\Users\GBaker\AppData\Local\Temp\opencode\ivf-phase4-before-01\evidence.json`;
+source SHA-256 `7af94b6360b5c00e0db8fc6b41c28f7fbedd599ab9d2d747050693f9543dc9d0`.
+The retained script is `...\opencode\phase4_evidence.py`; it uses existing native
+diagnostics, explicit work limits, fixed seeds and `OMP_NUM_THREADS=MKL_NUM_THREADS=1`.
+These are bounded synthetic observations, not full-scale performance evidence.
+
+Native clean build (fresh directory; checksum-pinned download, no source override):
+
+```bash
+BUILD=/mnt/c/Users/GBaker/AppData/Local/Temp/opencode/ivf-phase4-native-01
+cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Release \
+  -DIVF_BUILD_ROUTING=ON -DIVF_BUILD_CONTRACT_TESTS=ON \
+  -DMKL_ROOT=/usr -DMKL_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu \
+  -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
+cmake --build "$BUILD" -j4
+ctest --test-dir "$BUILD" -R '^ivf_' -j2 --output-on-failure \
+  --output-log "$BUILD/phase4-complete-native.log"
+```
+
+The IVF driver link/runtime inspection contains **MKL ILP64 + sequential MKL +
+GNU OpenMP**, not LP64 MKL, Intel-threaded MKL or iomp5. Baseline targets retain
+their original link policy. Isolated routing uses generic LP64 BLAS/LAPACK instead.
+`ivf_faiss_contracts` passes an actual BLAS-path distance oracle, per-call adapter
+parity against upstream `IndexHNSW::search`, and eight concurrent readers with
+different breadths/counts and unchanged global FAISS counters. Frozen vanilla
+routing deliberately avoids the high-level wrapper's shared statistics.
+
+An initial nearest-old-neighbor reinsertion attempt marked the existing node
+visited to exclude it. Tiny bridge/refresh and training candidate-count fixtures
+caught lost reachability. It now permits traversal through that node and uses a
+FAISS ID selector to exclude it only from returned candidates. Both failing
+fixtures pass without weakening their assertions. The rebuilt trainer retains
+breadth-sized double rescoring independently of vanilla query mode.
+
+Scale correction: every search/refreshed-node traversal now exclusively leases a
+thread-private, exact-size FAISS epoch table instead of allocating/zeroing nlist
+bytes per call. Upstream normal-return epoch advancement is preserved; seeded,
+layer-search and exception exits advance in the lease. Tests cover repeated
+rollovers, stable allocation, reentrant leases, graph-size changes and eight
+concurrent mixed seeded/unseeded readers. The one nlist-byte cache per caller is
+included in existing worker allowances, persists on idle threads, and is released
+on size change/thread exit. These are workload allowances, not a global cap over
+unbounded external/nested callers. Upstream's periodic rollover clear remains.
+
+The four initial optimized query-composition failures were stale descriptor
+fixture assumptions (35 tokens instead of the new 36, with optimized identity).
+The fixture now checks versions 3/4 and both producer IDs, then corrupts the
+centroid count with a fresh manifest digest; corruption rejection is retained.
+All eight affected routing/training/composition tests pass after those fixes
+(`phase4-scratch-targeted.log`, 24.37 seconds).
+
+An unrestricted isolated BLAS oracle caught another integration issue that the
+earlier `OMP_THREAD_LIMIT=1` sanitizer configuration masked: this host's generic
+`libblas.so`/`liblapack.so` alternatives resolve to `libmkl_rt.so`, whose dispatcher
+loads Intel OpenMP beside GNU OpenMP. Isolated CMake now prefers installed
+reference-library subdirectories/runtime paths and rejects resolved MKL aliases.
+The BLAS contract also inspects loaded libraries **after** a real BLAS call,
+catching runtime dispatchers that `ldd` alone cannot expose. Earlier sanitizer
+passes do not qualify this corrected link selection; final reruns follow below.
+
+Corrected reference-library validation: isolated suites excluding their separate
+clean-build check pass **30 tests, 1 optional NumPy skip** in **43.64 seconds**
+(`ivf-phase4-isolated-01/phase4-reference-isolated.log`). The unrestricted BLAS
+oracle passes without a thread limit. Runtime links resolve reference
+`blas/libblas.so.3` and `lapack/liblapack.so.3` plus GNU OpenMP, not MKL dispatch.
+ASan/UBSan with leak detection passes **4/4** in **9.44 seconds**
+(`ivf-phase4-asan-01/phase4-reference-asan-v2.log`); TSan passes **10 repetitions
+each across four suites** in **107.80 seconds**
+(`ivf-phase4-tsan-01/phase4-reference-tsan.log`). Both instrument upstream FAISS,
+the adapter and training; `OMP_THREAD_LIMIT=1` limits upstream teams, not the
+eight independent `std::thread` readers. TSan uses `setarch x86_64 -R` and
+`TSAN_OPTIONS=halt_on_error=1`. These are executed-configuration checks, not
+full-system or unrestricted-scale race qualification.
+
+Fresh no-Python configuration also caught a CMake discovery edge: FindLAPACK
+invokes FindBLAS again. Explicit reference paths must be cached, not merely
+normal variables, so both passes resolve the same libraries. The corrected fresh
+configuration passes in `ivf-phase4-clean-reference-01`.
+Final clean-build and full-suite reruns follow below.
+
+Final-source sanitizer reruns pass after the nonallocating single-seed shrink:
+ASan/UBSan **4/4**, **10.67 seconds** (`phase4-complete-asan.log`); TSan
+**10 repetitions each across four suites**, **110.65 seconds**
+(`phase4-complete-tsan.log`), under the same instrumented-build/environment policy
+above. Isolated full regression passes **31 tests, 1 optional NumPy skip**,
+**151.06 seconds**, including a fresh routing build with Python discovery
+disabled (`phase4-complete-isolated.log`). A final-source rebuild and all 31
+non-clean-build entries pass again (**30 passed, 1 skip**, **42.32 seconds**,
+`phase4-final-source-isolated.log`).
+
+Final native full regression: **60 passed, 1 optional NumPy skip, 0 failed**,
+**361.49 seconds** (`ivf-phase4-native-01/phase4-complete-native.log`). This includes
+the fresh no-Python routing build, all optimized query/mutable-session modes,
+ANN training/diagnostics, parallel assignment/insertion, cost-model and shell
+harness checks, continuous mixed execution, same-session writeback/scoring, and
+storage/fault regressions. No incomplete or timed-out suite is counted as a pass.
+
+### Preserved before/after measurements
+
+After all background build/test work finished, ran the same evidence script
+against the final native binaries into the fresh directory
+`C:\Users\GBaker\AppData\Local\Temp\opencode\ivf-phase4-after-01`.
+Its `evidence.json` retains all runs and matches the before fixture's SHA-256.
+`phase4_compare.py` in the same parent `opencode` directory writes `comparison.json`
+without changing or relabeling the old evidence. Reproduction:
+
+```bash
+ROOT=/mnt/c/Users/GBaker/AppData/Local/Temp/opencode
+# Choose a new, absent output directory for each repeat.
+python3 "$ROOT/phase4_evidence.py" --build "$ROOT/ivf-phase4-native-01" \
+  --output "$ROOT/ivf-phase4-after-02"
+python3 "$ROOT/phase4_compare.py" \
+  --before "$ROOT/ivf-phase4-before-01/evidence.json" \
+  --after "$ROOT/ivf-phase4-after-02/evidence.json" \
+  --output "$ROOT/ivf-phase4-after-02/comparison.json"
+```
+
+Training medians of three runs, **before → FAISS** (seconds; setup includes
+construction/refresh/refinement/PCA where configured, not just upstream add):
+
+| Mode | Total training s | Graph setup s | Exact evaluation SSE, unchanged |
+|---|---:|---:|---:|
+| ann-rebuild | 0.184 → 0.206 | 0.0147 → 0.0091 | 25774.6174 |
+| ann-reuse | 0.170 → 0.191 | 0.0131 → 0.0200 | 25774.6174 |
+| ann-reuse-seeded | 0.176 → 0.192 | 0.0143 → 0.0203 | 25774.6174 |
+| lv | 0.169 → 0.143 | 0.0152 → 0.0223 | 25655.1830 |
+| lv-plus | 0.176 → 0.142 | 0.0173 → 0.0228 | 25655.1830 |
+
+Final assigned SSE also matches: 25774.6174 for the three full-coordinate controls,
+25662.1665 for LV/LV+. Exact-evaluation assignment agreement remains **1.0** and
+**0.99462890625**, respectively; no empty sample clusters occur. All optimized
+training runs report zero final unreachable centroids on this fixture. Agreement
+and evaluation use the declared training reservoir, not a held-out quality set.
+
+Median estimated training bytes: rebuild **12,825,144 → 12,825,144**;
+reuse/seeded **12,857,976 → 12,890,744**; LV/LV+
+**12,964,472 → 12,997,240**. Median process-lifetime peak RSS is
+**18.94 → 18.89 MiB** in all five controls, including evaluation/export and
+runtime/allocator effects. These are conservative estimates and tiny-process RSS,
+not evidence of production memory savings.
+
+Routing end-to-end mean microseconds at nprobe=10, one 40-query sweep per mode:
+
+| Before mode → new mode | Before → FAISS μs | Recall before/after |
+|---|---:|---:|
+| exact → exact | 10.17 → 9.94 | 1.0 |
+| hnswlib → faiss | 33.65 → 34.04 | 1.0 (candidate policies differ) |
+| patched-full → faiss-full | 35.23 → 47.15 | 1.0 |
+| refined → refined | 33.85 → 43.73 | 1.0 |
+| pca → pca | 33.10 → 34.95 | 1.0 |
+| pca-refined → pca-refined | 31.29 → 30.63 | 1.0 |
+
+Across nprobe 1/4/10/32, all recalls match the before records: 1.0 except refined
+and PCA-refined at 32, both **0.999219**. Full/refined oversampling is slower here;
+at nprobe=10 its counted distance work changes only 753.05 → 760.375 and
+704.6 → 701.3, respectively, so extra distances alone do not explain that cost.
+The end-to-end values include FAISS result/context and local adapter work; these
+observations do not attribute the difference to one kernel or establish a scale
+speedup/regression. Vanilla's old breadth-sized oversampling differs from the
+new nprobe-sized outputs and is **not a matched raw-search timing control**.
+Raw vanilla `graph_us` is separately scoped to the upstream call, including its
+own epoch advancement but excluding local context setup and result conversion.
+
+There is no material quality regression on these bounded fixtures. Mixed timing
+results are retained rather than optimized away or presented as production claims.
 
 Notes / remaining issues:
 
-<!-- Fill in limitations or deviations before marking the phase complete. -->
+`faiss` now returns the requested candidate count with per-call efSearch, while
+`faiss-full`/`refined` explicitly oversample by breadth and PCA modes retain the
+declared rerank factor. Compare equivalent policies when interpreting old versus
+new timings: the former vanilla wrapper oversampled, so its total time is not a
+raw-FAISS timing control. Graph topology, refresh and numerical kernels can change
+ANN neighbors/objectives; no bitwise equivalence or speedup is promised.
+
+Mutable lifecycle/writeback, source-row IDs, 15-pass/3B guards, SIFT100M grids,
+PCA variance 0.95 and main rerank factors 3 are unchanged. Old dependencies and
+mode names are removed rather than retained as fallback aliases. Old artifacts,
+caches and evidence are preserved; FAISS/15-pass preparations must be fresh.
 
 ## Final integration and experiment release gate
 
-- [ ] Review diffs for unrelated changes and preservation of existing user work.
-- [ ] Run the full relevant regression set and record completed commands/results;
+- [x] Review diffs for unrelated changes and preservation of existing user work.
+- [x] Run the full relevant regression set and record completed commands/results;
   disclose timeouts and rerun incomplete suites rather than treating them as passes.
-- [ ] Check Bash scripts and README shell blocks, recipe schedules, output nesting,
+- [x] Check Bash scripts and README shell blocks, recipe schedules, output nesting,
   GT preflight, no-overwrite behavior, and successful query-private-heap cleanup.
-- [ ] Verify no new SIFT10M support, nlist 1M entries, WAL subsystem, generalized
+- [x] Verify no new SIFT10M support, nlist 1M entries, WAL subsystem, generalized
   orchestrator, or silent artifact compatibility path was introduced.
-- [ ] Run small end-to-end query, insert, delete, and multi-round mixed experiments
+- [x] Run small end-to-end query, insert, delete, and multi-round mixed experiments
   with final recall and independent operation/live-set checks.
-- [ ] Record final timing boundaries, warmup policy, writeback policy, FAISS version,
+- [x] Record final timing boundaries, warmup policy, writeback policy, FAISS version,
   15-pass training policy, and remaining departures from Lindorm.
-- [ ] Use fresh output roots and matching FAISS/15-pass bases for SIFT100M results.
+- [x] Use fresh output roots and matching FAISS/15-pass bases for SIFT100M results.
   Do not automatically launch expensive full-scale runs merely to close this plan.
-- [ ] Keep README as the execution guide; update this checklist with implementation
+- [x] Keep README as the execution guide; update this checklist with implementation
   evidence and explicitly list any unfinished full-scale qualification.
 
 Final evidence / commands:
 
-<!-- Fill in completed integration checks and separately authorized experiments. -->
+The full native and isolated suites and sanitizer results above close the bounded
+implementation gate. `test_cli_execution.py` independently verifies float/int8/
+uint8 source-ID results, query/insert/delete/live counts and **100% fixture recall**
+for sequential and combined sessions. `test_mixed.py` verifies two-round persistent
+execution with one worker-pool launch, a **48-row final live set**, independent
+full-coordinate neighbors/tie-aware recall (**100%**), all three scheduler modes,
+unequal/one-sided rounds and malformed later-round refusal before mutation.
+Intermediate weakly consistent queries are deliberately not recall-scored.
+
+`phase4_validate.py` passes Python compileall, **73 Bash scripts / 26 README Bash
+blocks**, and native/isolated/sanitizer runtime-link checks; evidence is
+`ivf-phase4-native-01/phase4-final-syntax-runtime.json`. `git diff --check` passes.
+Recipe tests preserve 73/80 query grids, original output nesting, shared GT/PQ,
+no-overwrite/refusal behavior and successful query-private-heap cleanup. Diffs
+are scoped to IVF integration/dependency/docs/tests, not unrelated baseline
+algorithm changes. Historical ignored milestone documents/artifacts remain
+unchanged; historical mode names remain only as incompatible evidence/rejection
+fixtures, not fallback execution paths.
+
+The fresh-output/FAISS/15-pass checkbox is a **verified preparation/reuse policy**,
+not a claim that SIFT100M experiments ran. No full-scale run, artifact migration,
+commit or push was performed. The benchmark README remains the execution guide.
 
 Remaining limitations:
 
-<!-- Fill in final scope exclusions and any unexecuted full-scale validation. -->
+Full-scale SIFT100M training, recall, throughput, memory, skew/drift behavior and
+matched BufANN/SPFresh comparisons still require separately authorized runs with
+fresh FAISS/15-pass preparations. The 50K historical resource smoke and these tiny
+fixtures do not qualify 128D/high-nlist production scale. Timings above are not
+paper speedups; instrumentation, graph algorithms and candidate policies differ.
+
+Final graphs/PCA/PQ remain frozen during mutation. Writeback drains pages without
+WAL, fsync/durable acknowledgment, updated metadata export, crash recovery or
+restartability. Foreground work excludes separately measured final writeback and
+stable-state scoring; workflow time includes them. Sequential warmup follows
+writeback, mixed warmup precedes all rounds, and rounds do not checkpoint/reopen.
+This is a local Lindorm-inspired ANN-mechanism comparison, not a reproduction of
+its distributed storage/maintenance system. SPFresh can pay asynchronous WAL and
+maintenance costs absent here; disclose those asymmetries and actual baseline
+timing boundaries rather than claiming equal durable-ingestion semantics.

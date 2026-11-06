@@ -9,7 +9,7 @@ The most consequential departures are:
 1. **Local execution and storage:** no LDMaster/LDServer cluster, LindormTable, LindormDFS, region migration, replicated storage, or network candidate aggregation.
 2. **Global, non-residual PQ8 with a scalar scanner:** not the paper's evaluated four-bit SIMD scanning configuration; RaBitQ is absent.
 3. **Explicit interpretations of underspecified training details:** fixed iteration counts, deterministic sampling/reduction, initial-only refinement, and PCA refitting between assignments.
-4. **A controlled HNSW implementation and ablation suite:** checksum-pinned stock hnswlib plus a separately maintained modified variant, rather than the paper's Faiss comparison.
+4. **FAISS HNSW and explicit local optimizations:** checksum-pinned, unmodified CPU FAISS 1.9.0 supplies vanilla construction/traversal; a separate local adapter implements projected traversal, refresh/reinsertion and refinement through its public graph primitives.
 5. **In-process publication safety and page writeback, not WAL-backed commits:** update visibility is carefully ordered, but updated sessions cannot be exported/reopened and there is no crash recovery or durable transaction protocol.
 6. **Engineering beyond description:** bounded buffer-pin admission, page-local allocation, failure poisoning, artifact identity checks, resource guards, and explicit measurement contracts.
 
@@ -152,17 +152,17 @@ The final router returns list IDs. Base assignment and insertion request one cen
 | Router | Traversal | Final centroid ranking |
 |---|---|---|
 | `exact` | Enumerate all centroids | Original-coordinate double L2. |
-| `hnswlib` | Stock HNSW, full-coordinate float kernels | Double-rescore returned candidates. |
-| `patched-full` | Modified HNSW, full coordinates | Double-rescore candidates. |
-| `refined` | Modified graph after bottom-layer refinement | Double-rescore candidates. |
-| `pca` | Modified graph, projected centroid coordinates | Original-coordinate double rerank. |
+| `faiss` | Unmodified FAISS HNSW, full-coordinate float kernels, nprobe returned candidates | Double-rescore those nprobe outputs separately. |
+| `faiss-full` | Same FAISS topology/kernels with explicit breadth-sized candidate oversampling | Double-rescore candidates. |
+| `refined` | FAISS graph after local bottom-layer refinement | Double-rescore candidates. |
+| `pca` | Full-coordinate FAISS graph, projected centroid traversal coordinates | Original-coordinate double rerank. |
 | `pca-refined` | Refined graph, projected coordinates | Original-coordinate double rerank. |
 
 Selecting LV+ training **does not enable or select** PCA/refined final routing. Optimized final artifacts must be enabled during build; query mode can then be overridden independently of the persisted base/insertion mode. This separation supports useful ablations but also permits a configuration substantially less optimized than the paper's full pipeline.
 
 ### Per-call breadth instead of mutating shared HNSW settings
 
-Shared graphs retain `ef = 1`. For stock HNSW, the requested candidate count is `min(nlist, max(requested_count, breadth))`; upstream's `max(ef, k)` behavior supplies effective breadth without concurrent `setEf` calls. Full-coordinate modified modes use similar oversampling and double rescoring. Projected modes request:
+Every search owns `SearchParametersHNSW`, distance computer and result handler, and exclusively leases a thread-private epoch visited table. No shared `efSearch` setter is used. Vanilla `faiss` returns exactly the requested candidate count, with independent efSearch; `faiss-full`/`refined` explicitly request `min(nlist, max(requested_count, breadth))` candidates before double rescoring. The rebuilt training control separately retains breadth-sized rescoring. Projected modes request:
 
 ```text
 C = min(nlist, ceil(requested_count × router_rerank_factor))
@@ -171,13 +171,15 @@ effective breadth ≥ C
 
 They traverse in projected space, rerank those C centroids in original space, and retain the requested number. Ordering is distance then list ID. Requesting all centroids takes exact enumeration rather than depending on graph connectivity.
 
-This per-call design is important for overlapping queries and insertions with different breadths. It also means the `hnswlib` mode is an unmodified **dependency**, but the surrounding router adds candidate oversampling and double rescoring; it is not simply raw upstream `searchKnn(query, nprobe)` timing.
+This design permits overlapping query/insertion breadths. Vanilla's `graph_us` measures the unmodified FAISS HNSW search kernel with local context, excluding context setup, output materialization, double rescoring and final sorting. Optimized `graph_us` includes adapter context/results work. End-to-end router/query time includes all wrapper work and must not be called raw FAISS timing. Optimized distance counters are local; vanilla counters are marked unavailable without reading/resetting FAISS globals.
+
+Each calling thread retains one exact-size nlist-byte visited cache until its next graph-size change or thread exit; per-worker estimates include it. Reentrant calls receive temporary independent tables. Epoch advancement avoids allocation/clearing on each assignment or refreshed centroid, with the upstream periodic rollover clear. Workload estimates are not a global cap across arbitrary external or nested callers, and idle caller threads may retain their last table.
 
 ### PCA implementation choices
 
 PCA fits the centroid population, not database vectors. The implementation computes a centered double covariance matrix, solves it with a cyclic double Jacobi eigensolver capped at 64 sweeps, and retains the smallest leading-eigenvalue prefix meeting the variance target. Projection uses double accumulation and float output, with no whitening. Eigenvector signs and repeated-eigenvalue bases are canonicalized; zero variance uses the full-dimensional identity basis. Load validation checks the projection against the source centroids.
 
-The graph topology is built in full-coordinate space and then searched using a separate projected coordinate array. **The implementation does not eliminate full-coordinate centroid storage.** With optimized modes enabled it retains a stock graph, a modified unrefined graph, a separately constructed/refined graph, full centroids, and PCA data. That is valuable for comparisons but costs more memory than a production representation retaining only the chosen graph. PCA here reduces traversal-coordinate traffic, not necessarily the total router memory footprint.
+The graph topology is built in full-coordinate space and then searched using a separate projected coordinate array. **The implementation does not eliminate full-coordinate centroid storage.** With optimized modes enabled it retains a vanilla graph, an optimized unrefined graph, a separately constructed/refined graph, full centroids, and PCA data. That is valuable for comparisons but costs more memory than a production representation retaining only the chosen graph. PCA here reduces traversal-coordinate traffic, not necessarily the total router memory footprint.
 
 Keeping 95% variance is not a 95% recall guarantee, and projection overhead can outweigh reduced-distance cost when dimensional reduction is small.
 
@@ -191,18 +193,15 @@ The implementation makes one reinsertion pass over nodes with zero indegree in t
 
 ## 6. HNSW dependency and comparison architecture
 
-The paper evaluates against Faiss HNSW. This repository instead uses:
+Both vanilla and optimized paths now use checksum-pinned **FAISS 1.9.0 HNSW**, not a single-layer NSW substitute. Upstream source remains unmodified. The local adapter supplies projected distance computers, seeded bottom-layer search, full-coordinate refresh/reinsertion and frozen refinement using public FAISS traversal/pruning and adjacency structures. These local update/refinement choices are not an upstream FAISS update API or a claim of identical old hnswlib trajectories.
 
-* a checksum-pinned, fetched, **unmodified hnswlib v0.8.0** comparison;
-* a checked-in modified variant under `dependencies/hnswlib/include/ivf_patched/`, isolated in namespace `ivf_hnswlib`.
+Native IVF links sequential MKL ILP64 (`FINTEGER=int64_t`) and GNU OpenMP, without the baseline target's Intel-threaded MKL/iomp5 interface. Dependency-isolated routing uses generic LP64 BLAS/LAPACK (`FINTEGER=int`) and GNU OpenMP. Unrelated baseline targets remain unchanged. Construction uses serial upstream batch add with a restored calling-task OpenMP thread setting; runtime search never mutates shared breadth.
 
-Modified headers are authoritative source, not generated patches. They add per-call projected traversal coordinates and counters, caller-provided entries, seeded bottom-layer search, quiescent coordinate replacement/reinsertion, and validated bottom-edge replacement. They retain upstream queues, stopping rules, visited pools, pruning, and SIMD distance kernels rather than introducing a new graph-search algorithm. Local lookahead/empty-neighbor safety fixes are also retained.
+The FAISS high-level search wrapper updates global statistics; independent frozen calls instead use unmodified low-level `HNSW::search` with local contexts. `ivf_faiss_contracts` checks parity with the high-level upstream path, unchanged global counters during concurrent calls, independent breadths, and a BLAS-backed numerical oracle.
 
-Artifacts accept the producer identity `hnswlib-0.8.0-stock1`; older producer labels are deliberately rejected rather than relabeled. This records dependency identity separately from binary framing versions. The label identifies the stock comparison, not a claim that optimized graphs are unmodified.
+Index producers must be `faiss-1.9.0-cpu1`; optimized router descriptors additionally bind `faiss-1.9.0-ivf1`. Router descriptor versions 3/4 wrap checked `IVFFAIS1` graph framing. Allocation lengths, levels, offsets, edge identities/levels and centroid bytes are checked before graph use; unchecked upstream `read_index` is not used. The generic `.hnsw`/`.patched.hnsw`/`.refined.hnsw` component suffixes remain, but contain FAISS representations. Previous hnswlib code/dependencies and runtime modes are removed. Historical artifacts remain incompatible evidence, not candidates for relabeling. Fresh FAISS/15-pass preparations are required, including refinement-grid reuse.
 
-There is a qualification caveat: pristine upstream retains known SIMD-prefetch safety issues. Sanitizer configurations default to disabling manual HNSW vectorization for both variants. Scalar sanitizer results therefore do not qualify the SIMD path, and old safety-corrected comparison measurements cannot be relabeled as new stock measurements.
-
-**Sources:** [`dependencies/hnswlib/README.md`](../dependencies/hnswlib/README.md), [`cmake/Hnswlib.cmake`](../cmake/Hnswlib.cmake), modified [`hnswalg.h`](../dependencies/hnswlib/include/ivf_patched/hnswalg.h).
+**Sources:** [`dependencies/faiss/README.md`](../dependencies/faiss/README.md), [`cmake/Faiss.cmake`](../cmake/Faiss.cmake), [`ivf_faiss.cpp`](../src/bufann/ivf_faiss.cpp), [`ivf_patched_graph.cpp`](../src/bufann/ivf_patched_graph.cpp).
 
 ## 7. Quantization, candidate selection, and complete query execution
 
@@ -474,7 +473,7 @@ Queries report routing, LUT preparation, scan/selection, fetch, and exact-rerank
 | Native CLI/harness training | `ann-reuse-seeded`, `random_partition`; examples explicitly select LV+. |
 | Training | sample rate 1, 15 mean-update passes, breadth 64. |
 | LV training | centroid rerank factor 3, initial refinement breadth 128, 95% PCA variance. |
-| Final router | stock `hnswlib`; optimized modes disabled unless requested. |
+| Final router | vanilla `faiss`; optimized modes disabled unless requested. |
 | HNSW | degree 16, construction breadth 200, query breadth 128, insertion breadth 64. |
 | Native/library search | nprobe 1, k=10, vector rerank factor 2, one query thread. |
 | Heap/runtime | 4096-byte pages, 64 buffer frames; common small-run memory allowance 1 GiB. |

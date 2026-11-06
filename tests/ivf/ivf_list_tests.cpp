@@ -183,7 +183,7 @@ namespace {
     // Every router shares immutable centroids/graphs while workers write only
     // disjoint labels. Persisted list ordering and checksums must be identical.
     for (auto mode :
-         {RouterMode::Hnswlib, RouterMode::Exact, RouterMode::PatchedFull,
+         {RouterMode::Faiss, RouterMode::Exact, RouterMode::FaissFull,
           RouterMode::Refined, RouterMode::PCA, RouterMode::PCARefined}) {
       RouterOptions routing;
       routing.native_modes = true;

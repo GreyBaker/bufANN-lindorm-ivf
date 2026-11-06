@@ -12,7 +12,7 @@ from common import (
     command_log, counted_range_identity, digest, header, is_query_record,
     query_truth_shapes, read_json, require, require_absent, write_json,
 )
-from harness import component_digests, driver_open_command, prepare as prepare_base
+from harness import ROUTER_BACKEND_ID, component_digests, driver_open_command, prepare as prepare_base
 from settings import (
     prepared_selection, profile, query_policy_flags, query_router_flags, query_search_flags,
     runtime_resources, warmup_queries,
@@ -92,6 +92,8 @@ def run(args):
     prepared = read_json(path, max_bytes=8 << 20)
     require(prepared == identity(args), "mixed layout/source/IDs/GT changed since prepare")
     selection = prepared_selection(base)
+    require(base.get("router_backend") == ROUTER_BACKEND_ID,
+            "prepared router backend is incompatible; prepare a fresh FAISS base")
     require(
         base["profile"] == profile(args) and digest(base["query"]) == base["query_identity"],
         "mixed query/profile changed",

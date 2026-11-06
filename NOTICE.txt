@@ -6,11 +6,11 @@ the NSG attribution below.
 
 Optional IVF centroid-router dependency
 ---------------------------------------
-The IVF router uses a locally modified, vendored version of hnswlib v0.8.0 and
-an externally fetched, unmodified v0.8.0 comparison implementation, from
-https://github.com/nmslib/hnswlib, under the Apache License 2.0.
-See dependencies/hnswlib/README.md for provenance, modifications and build configuration,
-and dependencies/hnswlib/LICENSE for the complete upstream license. This optional
+The IVF router uses externally fetched, unmodified CPU FAISS v1.9.0 from
+https://github.com/facebookresearch/faiss, under the MIT license. Local optimized
+adapters are separate from upstream FAISS sources.
+See dependencies/faiss/README.md for provenance, API extensions and build configuration,
+and dependencies/faiss/LICENSE for the complete upstream license. This optional
 dependency does not change the licenses of existing BufANN/DiskANN sources.
 
 NSG attribution

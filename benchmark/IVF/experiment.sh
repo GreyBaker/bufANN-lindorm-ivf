@@ -99,7 +99,7 @@ if [[ "$mode" == sift100m-refine ]]; then
     [[ -f "$GT_BIN_KCACHED" ]] || error "missing previous GT binary"
     for nlist in 100000 200000 300000; do
         [[ -f "$IVF_GRID_PREVIOUS_ROOT/nlist-$nlist/$DATASET/IVF/query/prepared.json" ]] || error "missing previous nlist=$nlist preparation"
-        python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["settings"]; assert str(s["max_reps"]) == "15" and str(s["nlist"]) == sys.argv[2], "previous base requires matching nlist and 15-pass training; choose a matching wide run"' \
+        python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); s=p["settings"]; assert str(s["max_reps"]) == "15" and str(s["nlist"]) == sys.argv[2] and p.get("router_backend") == "faiss-1.9.0-cpu1", "previous base requires matching nlist, 15-pass training and FAISS backend; choose a matching wide run"' \
             "$IVF_GRID_PREVIOUS_ROOT/nlist-$nlist/$DATASET/IVF/query/prepared.json" "$nlist"
     done
     generate_gt=0

@@ -14,6 +14,8 @@ option(IVF_BUILD_CONTRACT_TESTS
        "Build IVF contract, training, routing, storage, and integration tests" ON)
 include(${CMAKE_CURRENT_SOURCE_DIR}/tools.cmake)
 
+# Apply the runtime policy again below after all native test targets exist.
+
 if(IVF_BUILD_CONTRACT_TESTS)
     enable_testing()
     add_executable(ivf_artifact_tests ivf_artifact_tests.cpp)
@@ -69,8 +71,12 @@ if(IVF_BUILD_CONTRACT_TESTS)
     target_link_libraries(ivf_cost_model_tests PRIVATE ivf_cost_model_core)
     add_test(NAME ivf_cost_model_core COMMAND ivf_cost_model_tests)
     if(TARGET ivf_router)
+        add_executable(ivf_faiss_tests ivf_faiss_tests.cpp)
+        target_link_libraries(ivf_faiss_tests PRIVATE ivf_router ivf_faiss_cpu Threads::Threads)
+        add_test(NAME ivf_faiss_contracts COMMAND ivf_faiss_tests)
+        set_tests_properties(ivf_faiss_contracts PROPERTIES TIMEOUT 60)
         add_executable(ivf_ann_training_tests ivf_ann_training_tests.cpp)
-        target_link_libraries(ivf_ann_training_tests PRIVATE ivf_router ivf_hnswlib_headers
+        target_link_libraries(ivf_ann_training_tests PRIVATE ivf_router ivf_faiss_cpu
                                                              Threads::Threads)
         add_test(NAME ivf_ann_training COMMAND ivf_ann_training_tests
                                                "${CMAKE_CURRENT_BINARY_DIR}/ann_training_fixtures")
@@ -189,8 +195,8 @@ if(IVF_BUILD_CONTRACT_TESTS)
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_gt_management.py")
     set_tests_properties(ivf_gt_management PROPERTIES TIMEOUT 120)
     set(IVF_DEPENDENCY_TEST_SOURCE_ARGS)
-    if(TARGET ivf_hnswlib_headers)
-        get_target_property(IVF_DEPENDENCY_TEST_SOURCE ivf_hnswlib_headers IVF_UPSTREAM_SOURCE_DIR)
+    if(TARGET ivf_faiss_cpu)
+        get_target_property(IVF_DEPENDENCY_TEST_SOURCE ivf_faiss_cpu IVF_UPSTREAM_SOURCE_DIR)
         list(APPEND IVF_DEPENDENCY_TEST_SOURCE_ARGS --source "${IVF_DEPENDENCY_TEST_SOURCE}")
     endif()
     add_test(
@@ -199,13 +205,13 @@ if(IVF_BUILD_CONTRACT_TESTS)
             ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_cmake_routing.py" --cmake
             "${CMAKE_COMMAND}" --repo "${IVF_ROOT}" --scratch
             "${CMAKE_CURRENT_BINARY_DIR}/cmake_routing_fixtures" ${IVF_DEPENDENCY_TEST_SOURCE_ARGS})
-    set_tests_properties(ivf_cmake_routing_no_python PROPERTIES TIMEOUT 120)
+    set_tests_properties(ivf_cmake_routing_no_python PROPERTIES TIMEOUT 660)
     # OFF checks the local variant without fetching; ON verifies stock upstream.
     add_test(
-        NAME ivf_hnswlib_dependency
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_hnswlib_dependency.py"
-                --dependency "${IVF_ROOT}/dependencies/hnswlib" ${IVF_DEPENDENCY_TEST_SOURCE_ARGS})
-    set_tests_properties(ivf_hnswlib_dependency PROPERTIES TIMEOUT 30)
+        NAME ivf_faiss_dependency
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_faiss_dependency.py"
+                --repo "${IVF_ROOT}" ${IVF_DEPENDENCY_TEST_SOURCE_ARGS})
+    set_tests_properties(ivf_faiss_dependency PROPERTIES TIMEOUT 30)
     if(TARGET ivf_router_diagnostics)
         add_test(
             NAME ivf_patched_router_diagnostics
@@ -311,7 +317,7 @@ if(IVF_BUILD_CONTRACT_TESTS)
                 ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_execution.py" --build
                 $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver> --scratch
                 "${CMAKE_CURRENT_BINARY_DIR}/execution_fixtures")
-        foreach(mode patched-full refined pca pca-refined)
+        foreach(mode faiss-full refined pca pca-refined)
             string(REPLACE "-" "_" label "${mode}")
             add_test(NAME ivf_${label}_query_composition
                      COMMAND ivf_search_tests
@@ -328,5 +334,13 @@ if(IVF_BUILD_CONTRACT_TESTS)
         COMMAND
             ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.py" --build
             $<TARGET_FILE:ivf_build> --driver $<TARGET_FILE:ivf_driver> --contracts
-            $<TARGET_FILE:ivf_contract_tests> --scratch "${CMAKE_CURRENT_BINARY_DIR}/cli_fixtures")
+             $<TARGET_FILE:ivf_contract_tests> --scratch "${CMAKE_CURRENT_BINARY_DIR}/cli_fixtures")
+endif()
+if(COMMAND ivf_native_link_policy)
+    get_property(ivf_local_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS ivf_local_targets)
+        if(target MATCHES "^ivf_")
+            ivf_native_link_policy(${target})
+        endif()
+    endforeach()
 endif()

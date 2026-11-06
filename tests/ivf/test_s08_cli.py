@@ -107,7 +107,7 @@ def main():
                 "--buffer_frames",
                 "4",
             ]
-            for mode in ("exact", "hnswlib", "patched-full", "refined", "pca", "pca-refined"):
+            for mode in ("exact", "faiss", "faiss-full", "refined", "pca", "pca-refined"):
                 metrics = run(
                     command
                     + [
@@ -123,12 +123,14 @@ def main():
                     metrics["router_mode"] == mode
                     and metrics["assignment_router_mode"] == "pca-refined"
                 )
-                assert metrics["router_distance_counted_queries"] == (0 if mode == "hnswlib" else 2)
+                assert metrics["router_distance_counted_queries"] == (0 if mode == "faiss" else 2)
                 assert metrics["logical_fetch_stages"] == 2
             for extra in (
                 ["--router_mode", "unknown"],
                 ["--router_rerank_factor", "0.5"],
                 ["--router_breadth", "0"],
+                ["--router_mode", "hnswlib"],
+                ["--router_mode", "patched-full"],
             ):
                 run(command + extra, False)
             ids = root / (dtype + ".ids")

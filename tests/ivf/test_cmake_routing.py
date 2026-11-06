@@ -7,7 +7,7 @@ import tempfile
 
 
 def run(command):
-    result = subprocess.run(command, text=True, capture_output=True, timeout=90)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=600)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
 
@@ -24,9 +24,6 @@ def main():
         root = Path(temporary)
         # OFF suites must not fetch upstream merely to exercise configure wiring.
         # ON suites pass the existing pinned source and also compile the router.
-        source = args.source or root / "configure_only_upstream"
-        if not args.source:
-            (source / "hnswlib").mkdir(parents=True)
         tree = root / "build"
         run(
             [
@@ -35,16 +32,15 @@ def main():
                 str(args.repo / "tests/ivf"),
                 "-B",
                 str(tree),
-                "-DIVF_BUILD_ROUTING=ON",
+                "-DIVF_BUILD_ROUTING=" + ("ON" if args.source else "OFF"),
                 "-DIVF_BUILD_CONTRACT_TESTS=OFF",
                 "-DCMAKE_DISABLE_FIND_PACKAGE_Python3=TRUE",
-                "-DFETCHCONTENT_SOURCE_DIR_IVF_HNSWLIB=" + str(source),
-            ]
+            ] + (["-DFETCHCONTENT_SOURCE_DIR_IVF_FAISS=" + str(args.source)] if args.source else [])
         )
         if args.source:
             run([args.cmake, "--build", str(tree), "--target", "ivf_router", "-j2"])
         if any(tree.rglob("ivf-hnswlib")):
-            raise RuntimeError("routing dependency generated headers")
+            raise RuntimeError("retired IVF hnswlib dependency remains")
         cache = (tree / "CMakeCache.txt").read_text()
         if "Python3_EXECUTABLE:" in cache:
             raise RuntimeError("routing dependency discovered Python")

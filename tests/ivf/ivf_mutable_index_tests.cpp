@@ -19,7 +19,7 @@
 
 namespace {
   using namespace diskann::ivf;
-  RouterMode         fixture_mode = RouterMode::Hnswlib;
+  RouterMode         fixture_mode = RouterMode::Faiss;
   constexpr uint32_t dim = 13, chunks = 3, rows = 64, base = 24, first = 5,
                      capacity = 96;
   void require(bool ok, const char* text) {
@@ -245,7 +245,7 @@ namespace {
     training.max_reps = 2;
     training.build_threads = 2;
     RouterOptions routing;
-    routing.native_modes = fixture_mode != RouterMode::Hnswlib;
+    routing.native_modes = fixture_mode != RouterMode::Faiss;
     routing.mode = fixture_mode;
     NativeIndex<T>::build(prefix, vectors, pq_path, codes_path, training,
                           {dim, capacity, 4096, 2}, routing, first);

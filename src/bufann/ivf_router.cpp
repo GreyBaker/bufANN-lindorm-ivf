@@ -6,7 +6,7 @@
 #include "bufann/ivf_pca.h"
 #include "ivf_centroids_internal.h"
 
-#include <hnswlib/hnswlib.h>  // Pinned, unmodified upstream comparison.
+#include "ivf_faiss_internal.h"
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -46,8 +46,9 @@ namespace diskann::ivf {
     }
     uint64_t estimate(uint32_t dim, uint32_t count,
                       const RouterOptions& options) {
-      // Two centroid copies; level-0 links, a generous upper-level allowance,
-      // maps/locks/allocator overhead; fixed label locks and one visited table.
+       // External centroids + FAISS Flat storage, levels/offsets/adjacency,
+       // construction locks, one caller-thread cached visited table and
+       // allocator allowance. Additional workers admit their own scratch.
       const uint64_t per_node =
           uint64_t(dim) * 8 + uint64_t(options.degree) * 16 + 256;
       const uint64_t fixed = 4ull * 1024 * 1024;
@@ -57,7 +58,7 @@ namespace diskann::ivf {
       if (options.native_modes) {
         CentroidPCA::preflight_work(dim, count, options.native_work_limit);
         const auto graph =
-            result + uint64_t(count) * (uint64_t(options.degree) * 16 + 256);
+            result + uint64_t(count) * (uint64_t(options.degree) * 32 + 512);
         const auto pca = CentroidPCA::estimate_bytes(dim, count);
         check(graph <= (UINT64_MAX - result) / 2,
               "Patched router estimate overflow");
@@ -69,7 +70,7 @@ namespace diskann::ivf {
     }
     void validate(uint32_t dim, size_t cells, const RouterOptions& options) {
       check(
-          dim > 0 && cells > 0 && cells % dim == 0 && cells / dim <= INT32_MAX,
+          dim > 0 && dim <= INT32_MAX && cells > 0 && cells % dim == 0 && cells / dim <= INT32_MAX,
           "Invalid centroid router shape");
       check(
           options.degree >= 2 && options.degree <= 64 &&
@@ -79,7 +80,7 @@ namespace diskann::ivf {
               options.insert_breadth > 0 && options.insert_breadth <= INT32_MAX,
           "Invalid HNSW settings");
       check(options.mode != RouterMode::Default &&
-                (options.native_modes || options.mode == RouterMode::Hnswlib) &&
+                (options.native_modes || options.mode == RouterMode::Faiss) &&
                 !options.refine_reverse_edges && options.refine_breadth > 0 &&
                 options.refine_breadth <= INT32_MAX &&
                 options.native_work_limit > 0 &&
@@ -106,119 +107,26 @@ namespace diskann::ivf {
                  ? a.squared_distance < b.squared_distance
                  : a.list_id < b.list_id;
     }
-    template<typename T>
-    T read_pod(std::istream& input) {
-      T value{};
-      input.read(reinterpret_cast<char*>(&value), sizeof(value));
-      check(bool(input), "Truncated HNSW artifact");
-      return value;
-    }
-    template<typename T>
-    T packed(const char* bytes) {
-      T value;
-      std::memcpy(&value, bytes, sizeof(value));
-      return value;
-    }
-
-    // Check native v0.8.0 framing/identity/edges BEFORE its legacy loader
-    // allocates or follows graph offsets. Sequential labels are guaranteed by
-    // serial build.
+    // Bounded local framing validates FAISS adjacency before following edges.
     void validate_graph(const std::string& path, uint32_t dim,
                         std::span<const float> centroids,
                         const RouterOptions&   options) {
-      std::ifstream  input(path, std::ios::binary);
-      const size_t   count = centroids.size() / dim;
-      const size_t   base_links = 4 + 8 * options.degree;
-      const size_t   upper_links = 4 + 4 * options.degree;
-      const size_t   stride = base_links + size_t(dim) * 4 + 8;
-      const size_t   offset = read_pod<size_t>(input);
-      const size_t   capacity = read_pod<size_t>(input);
-      const size_t   stored_count = read_pod<size_t>(input);
-      const size_t   stored_stride = read_pod<size_t>(input);
-      const size_t   label_offset = read_pod<size_t>(input);
-      const size_t   data_offset = read_pod<size_t>(input);
-      const int      max_level = read_pod<int>(input);
-      const uint32_t entry = read_pod<uint32_t>(input);
-      const size_t   max_m = read_pod<size_t>(input);
-      const size_t   max_m0 = read_pod<size_t>(input);
-      const size_t   m = read_pod<size_t>(input);
-      const double   mult = read_pod<double>(input);
-      const size_t   ef = read_pod<size_t>(input);
-      check(offset == 0 && capacity == count && stored_count == count &&
-                stored_stride == stride &&
-                label_offset == base_links + size_t(dim) * 4 &&
-                data_offset == base_links && max_level >= 0 &&
-                max_level <= 64 && entry < count && max_m == options.degree &&
-                max_m0 == 2 * options.degree && m == options.degree &&
-                mult == 1.0 / std::log(double(options.degree)) &&
-                ef == options.construction_breadth,
-            "Incompatible HNSW artifact header");
-      auto validate_links = [&](const char* bytes, size_t maximum, int level,
-                                const std::vector<uint32_t>* levels) {
-        const uint32_t header = packed<uint32_t>(bytes);
-        check(header <= maximum, "Invalid/deleted HNSW neighbor list");
-        for (uint32_t j = 0; j < header; ++j) {
-          const uint32_t target = packed<uint32_t>(bytes + 4 + size_t(j) * 4);
-          check(target < count &&
-                    (!levels || (*levels)[target] >= uint32_t(level)),
-                "Invalid HNSW neighbor ID/level");
-        }
-      };
-      std::vector<char> buffer(stride);
-      for (size_t id = 0; id < count; ++id) {
-        input.read(buffer.data(), buffer.size());
-        check(
-            bool(input) &&
-                packed<uint64_t>(buffer.data() + label_offset) == id &&
-                std::memcmp(buffer.data() + base_links,
-                            centroids.data() + id * dim, size_t(dim) * 4) == 0,
-            "HNSW centroid/label mismatch");
-        validate_links(buffer.data(), 2 * options.degree, 0, nullptr);
-      }
-      std::vector<uint32_t>       levels(count);
-      std::vector<std::streampos> offsets(count);
-      const uint64_t              file_size = std::filesystem::file_size(path);
-      uint32_t                    observed_max = 0;
-      for (size_t id = 0; id < count; ++id) {
-        const uint32_t bytes = read_pod<uint32_t>(input);
-        check(bytes % upper_links == 0 &&
-                  bytes / upper_links <= uint32_t(max_level),
-              "Invalid HNSW upper-layer length");
-        levels[id] = static_cast<uint32_t>(bytes / upper_links);
-        observed_max = std::max(observed_max, levels[id]);
-        offsets[id] = input.tellg();
-        check(uint64_t(offsets[id]) <= file_size &&
-                  bytes <= file_size - uint64_t(offsets[id]),
-              "Truncated HNSW upper layer");
-        input.seekg(bytes, std::ios::cur);
-      }
-      check(uint64_t(input.tellg()) == file_size &&
-                observed_max == uint32_t(max_level) &&
-                levels[entry] == observed_max,
-            "Trailing/inconsistent HNSW layers");
-      buffer.resize(upper_links);
-      for (size_t id = 0; id < count; ++id) {
-        input.seekg(offsets[id]);
-        for (uint32_t level = 1; level <= levels[id]; ++level) {
-          input.read(buffer.data(), buffer.size());
-          check(bool(input), "Truncated HNSW links");
-          validate_links(buffer.data(), options.degree, int(level), &levels);
-        }
-      }
+      (void) faiss_detail::load(path, dim, centroids,
+          {options.degree, options.construction_breadth, options.seed,
+           options.memory_budget_bytes, options.native_work_limit});
     }
   }  // namespace
 
   struct CentroidRouter::Impl {
-    explicit Impl(uint32_t dim) : space(dim) {
+    explicit Impl(uint32_t) {
     }
-    hnswlib::L2Space space;  // Must outlive the index's distance parameters.
-    std::unique_ptr<hnswlib::HierarchicalNSW<float>> graph;
+    std::unique_ptr<faiss_detail::Index> graph;
     std::unique_ptr<PatchedCentroidGraph>            native, refined;
     std::unique_ptr<CentroidPCA>                     pca;
   };
   RouterMode parse_router_mode(const std::string& value) {
     for (auto mode :
-         {RouterMode::Hnswlib, RouterMode::Exact, RouterMode::PatchedFull,
+         {RouterMode::Faiss, RouterMode::Exact, RouterMode::FaissFull,
           RouterMode::Refined, RouterMode::PCA, RouterMode::PCARefined})
       if (value == router_mode_name(mode))
         return mode;
@@ -226,12 +134,12 @@ namespace diskann::ivf {
   }
   const char* router_mode_name(RouterMode mode) {
     switch (mode) {
-      case RouterMode::Hnswlib:
-        return "hnswlib";
+      case RouterMode::Faiss:
+        return "faiss";
       case RouterMode::Exact:
         return "exact";
-      case RouterMode::PatchedFull:
-        return "patched-full";
+      case RouterMode::FaissFull:
+        return "faiss-full";
       case RouterMode::Refined:
         return "refined";
       case RouterMode::PCA:
@@ -279,7 +187,7 @@ namespace diskann::ivf {
                                  const RouterOptions& options)
       : _dim(dim), _options(options) {
     static_assert(std::endian::native == std::endian::little &&
-                  sizeof(size_t) == 8 && sizeof(hnswlib::labeltype) == 8 &&
+                  sizeof(size_t) == 8 && sizeof(faiss::idx_t) == 8 &&
                   sizeof(int) == 4 && sizeof(float) == 4);
     validate(dim, centroids.size(), options);
     validate_values(centroids, dim);
@@ -303,14 +211,9 @@ namespace diskann::ivf {
       const RouterOptions& options) {
     auto router = std::unique_ptr<CentroidRouter>(
         new CentroidRouter(dim, centroids, options));
-    router->_impl->graph = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-        &router->_impl->space, router->nlist(), options.degree,
-        options.construction_breadth, options.seed);
-    for (uint32_t id = 0; id < router->nlist(); ++id)
-      router->_impl->graph->addPoint(
-          router->_centroids.data() + size_t(id) * dim, id);
-    router->_impl->graph->setEf(
-        1);  // Immutable. Per-operation breadth via candidate oversampling.
+    router->_impl->graph = faiss_detail::build(dim, centroids,
+        {options.degree, options.construction_breadth, options.seed,
+         options.memory_budget_bytes, options.native_work_limit});
     if (options.native_modes) {
       PatchedGraphOptions g{options.degree, options.construction_breadth,
                             options.seed, options.memory_budget_bytes,
@@ -343,14 +246,14 @@ namespace diskann::ivf {
       *stats = {};
     const auto mode =
         request.mode == RouterMode::Default ? _options.mode : request.mode;
-    check(mode >= RouterMode::Hnswlib && mode <= RouterMode::PCARefined,
+    check(mode >= RouterMode::Faiss && mode <= RouterMode::PCARefined,
           "Invalid centroid router mode");
     if (request.breadth)
       breadth = request.breadth;
     check(breadth > 0 && breadth <= INT32_MAX,
           "Invalid centroid router breadth");
     const bool native =
-        mode != RouterMode::Hnswlib && mode != RouterMode::Exact;
+        mode != RouterMode::Faiss && mode != RouterMode::Exact;
     check(!native || _options.native_modes,
           "Requested native router mode was not built");
     const double factor = request.rerank_factor == 0
@@ -384,7 +287,7 @@ namespace diskann::ivf {
         candidates = std::min(
             nlist(),
             std::max(count,
-                     breadth));  // Identical vanilla oversampling/rescoring.
+                     breadth));  // Explicit optimized oversampling/rescoring.
       std::vector<float> projected;
       auto               start = Clock::now();
       if (compressed)
@@ -414,24 +317,26 @@ namespace diskann::ivf {
         stats->distance_evaluations += found.size();
       }
     } else {
-      // Unmodified searchKnn uses max(ef_, k). Oversampling permits separate
-      // query/insert breadth without racing setEf or duplicating the graph.
-      auto candidates = _impl->graph->searchKnn(
-          query.data(), std::min(nlist(), std::max(count, breadth)));
+      // Unmodified FAISS HNSW::search with independent per-call efSearch.
+      // Return exactly count candidates; full-coordinate output rescoring is
+      // timed separately and is not labeled raw FAISS traversal time.
+      auto candidates = faiss_detail::search(*_impl->graph, query, count, breadth,
+          {}, {}, 0, nullptr, false, stats ? &stats->graph_us : nullptr);
       check(candidates.size() >= count,
-            "HNSW did not reach enough distinct centroids");
+              "HNSW did not reach enough distinct centroids");
       hits.reserve(candidates.size());
-      while (!candidates.empty()) {
-        const auto id = candidates.top().second;
+      const auto rerank = Clock::now();
+      for (auto candidate : candidates) {
+        const auto id = candidate.id;
         check(id < nlist(), "Invalid HNSW centroid label");
         hits.push_back(
             {static_cast<uint32_t>(id), distance(static_cast<uint32_t>(id))});
-        candidates.pop();
       }
+      if (stats) stats->centroid_rerank_us = us(rerank);
     }
     const auto sorting = Clock::now();
     std::partial_sort(hits.begin(), hits.begin() + count, hits.end(), nearer);
-    if (stats && native && !exact && mode != RouterMode::Exact &&
+    if (stats && !exact && mode != RouterMode::Exact &&
         count != nlist())
       stats->centroid_rerank_us += us(sorting);
     hits.resize(count);
@@ -470,7 +375,7 @@ namespace diskann::ivf {
                  _centroids.size() * sizeof(float));
     output.close();
     check(bool(output), "Centroid artifact write failed");
-    _impl->graph->saveIndex(graph);
+    faiss_detail::save(*_impl->graph, graph);
     validate_graph(graph, _dim, _centroids, _options);
     if (_options.native_modes) {
       claim_artifact(prefix + ".patched.hnsw");
@@ -488,7 +393,7 @@ namespace diskann::ivf {
     std::ofstream meta(descriptor, std::ios::binary);
     meta.imbue(std::locale::classic());
     meta << std::setprecision(17)
-         << (_options.native_modes ? "IVFROUTER2" : "IVFROUTER1") << ' '
+         << (_options.native_modes ? "IVFROUTER4" : "IVFROUTER3") << ' '
          << router_backend_id << ' ' << _dim << ' ' << nlist() << ' '
          << _options.degree << ' ' << _options.construction_breadth << ' '
          << _options.query_breadth << ' ' << _options.insert_breadth << ' '
@@ -497,7 +402,7 @@ namespace diskann::ivf {
          << std::filesystem::file_size(graph) << ' '
          << artifact_hash_file(graph) << '\n';
     if (_options.native_modes)
-      meta << router_mode_name(_options.mode) << ' ' << _options.refine_breadth
+      meta << optimized_router_backend_id << ' ' << router_mode_name(_options.mode) << ' ' << _options.refine_breadth
            << ' ' << _options.refine_reverse_edges << ' '
            << _options.pca_variance << ' ' << _options.router_rerank_factor
            << ' ' << _options.native_work_limit << '\n'
@@ -533,18 +438,18 @@ namespace diskann::ivf {
         options.construction_breadth >> options.query_breadth >>
         options.insert_breadth >> options.seed >> vector_bytes >> vector_hash >>
         graph_bytes >> graph_hash;
-    check(bool(meta) && (magic == "IVFROUTER1" || magic == "IVFROUTER2") &&
+    check(bool(meta) && (magic == "IVFROUTER3" || magic == "IVFROUTER4") &&
               count <= INT32_MAX,
           "Invalid router descriptor");
     check(backend == router_backend_id,
-          "Unsupported IVF router producer; rebuild with hnswlib-0.8.0-stock1");
+           "Unsupported IVF router producer; rebuild with faiss-1.9.0-cpu1");
     uint64_t native_bytes = 0, native_hash = 0, refined_bytes = 0,
              refined_hash = 0, pca_bytes = 0, pca_hash = 0;
     PatchedGraphDiagnostics base_stats{}, refined_stats{};
-    if (magic == "IVFROUTER2") {
-      std::string mode;
+    if (magic == "IVFROUTER4") {
+      std::string mode, optimized_backend;
       uint32_t    reverse = 0;
-      meta >> mode >> options.refine_breadth >> reverse >>
+      meta >> optimized_backend >> mode >> options.refine_breadth >> reverse >>
           options.pca_variance >> options.router_rerank_factor >>
           options.native_work_limit >> native_bytes >> native_hash >>
           refined_bytes >> refined_hash >> pca_bytes >> pca_hash;
@@ -560,6 +465,8 @@ namespace diskann::ivf {
           base_stats.refined_nodes == 0 && refined_stats.refined_nodes == count,
           "Graph ablation identities mismatch");
       check(bool(meta) && reverse <= 1, "Invalid native router descriptor");
+      check(optimized_backend == optimized_router_backend_id,
+            "Unsupported optimized FAISS router producer");
       options.native_modes = true;
       options.mode = parse_router_mode(mode);
       options.refine_reverse_edges = reverse != 0;
@@ -602,9 +509,9 @@ namespace diskann::ivf {
     // Release the validation table before loading the graph's vector copy;
     // the preflight estimate allows two copies, not three overlapping ones.
     std::vector<float>().swap(centroids);
-    router->_impl->graph = std::make_unique<hnswlib::HierarchicalNSW<float>>(
-        &router->_impl->space, graph, false, count);
-    router->_impl->graph->setEf(1);
+    router->_impl->graph = faiss_detail::load(graph, dim, router->_centroids,
+        {options.degree, options.construction_breadth, options.seed,
+         budget, options.native_work_limit});
     if (options.native_modes) {
       PatchedGraphOptions g{options.degree, options.construction_breadth,
                             options.seed, budget, options.native_work_limit};
@@ -653,7 +560,12 @@ namespace diskann::ivf {
       }
       uint32_t assign(std::span<const float> vector, uint32_t,
                       uint64_t&) const override {
-        return router->assign(vector);
+        // The rebuilt training control deliberately retains breadth-sized
+        // double rescoring. This is not the raw vanilla query comparison.
+        return router->search(vector, std::min(router->nlist(),
+                               router->options().insert_breadth), false, nullptr,
+                               {RouterMode::Faiss, 0, router->options().insert_breadth})
+            .front().list_id;
       }
       std::unique_ptr<CentroidRouter> router;
     };
@@ -812,14 +724,14 @@ namespace diskann::ivf {
       return train_centroids(path, config, limits);
     auto training_options = options;
     training_options.native_modes = false;
-    training_options.mode = RouterMode::Hnswlib;
+    training_options.mode = RouterMode::Faiss;
     training_options.insert_breadth = config.training_breadth;
     if (config.trainer_mode == TrainerMode::AnnRebuild)
       return train_centroids_hnsw(path, config, training_options, limits);
     uint64_t workspace = CentroidRouter::estimate_build_bytes(
         config.dim, config.nlist, training_options);
     const uint64_t snapshot =
-        uint64_t(config.nlist) * (uint64_t(options.degree) * 16 + 256);
+        uint64_t(config.nlist) * (uint64_t(options.degree) * 32 + 512);
     const uint64_t workers =
         std::min(config.training_count(), config.build_threads);
     const bool     optimized = trainer_optimized_search(config.trainer_mode);

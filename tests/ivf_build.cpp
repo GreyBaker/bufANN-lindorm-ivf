@@ -62,9 +62,9 @@ int main(int argc, char** argv) {
              "  [--insert_breadth N] [--router_seed N] [--result_file "
              "JSON_PATH]\n";
       std::cout << "Optimized routing: --optimized_modes 1 builds the patched "
-                   "hnswlib/PCA ablations.\n"
+                   "FAISS HNSW/PCA ablations.\n"
                    "  [--router_mode "
-                   "hnswlib|exact|patched-full|refined|pca|pca-refined]\n"
+                   "faiss|exact|faiss-full|refined|pca|pca-refined]\n"
                    "  --router_mode is the frozen base/insert assignment "
                    "default, not a query-only ablation.\n"
                    "  [--refine_ef N] [--pca_variance F]\n"

@@ -11,6 +11,8 @@ from pathlib import Path
 
 from common import digest, flags, require
 
+ROUTER_BACKEND_ID = "faiss-1.9.0-cpu1"
+
 
 BUILD_DEFAULTS = {
     "nlist": None,
@@ -53,7 +55,7 @@ CALIBRATION_DEFAULTS = {
     "trainer_mode": "ann-reuse-seeded",
     "init": "random_partition",
     "training_breadth": "64",
-    "router_mode": "hnswlib",
+    "router_mode": "faiss",
     "optimized_modes": "0",
     "router_degree": "16",
     "construction_breadth": "200",
@@ -358,7 +360,7 @@ def build_settings():
         if result["trainer_mode"] in ("lv", "lv-plus") or value is not None:
             result[key] = default if value is None else value
     # Query-only mode/factor overrides do not alter the build/cache identity.
-    result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "hnswlib")
+    result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "faiss")
     result["router_rerank_factor"] = os.environ.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
     if os.environ.get("IVF_COST_MODEL_REPORT"):
         chosen = read_cost_model_report(os.environ["IVF_COST_MODEL_REPORT"])["selected_nlist"]

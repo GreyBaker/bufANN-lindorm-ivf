@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
         double(budget - retained) / (1024.0 * 1024 * 1024);
     ivf_cli::read_training_settings(args, config);
     RouterOptions routing;
-    routing.mode = parse_router_mode(args.get("--router_mode", "hnswlib"));
+    routing.mode = parse_router_mode(args.get("--router_mode", "faiss"));
     const auto optimized = args.u32("--optimized_modes", 0);
     check(optimized <= 1, "optimized_modes must be 0 or 1");
     routing.native_modes = optimized;

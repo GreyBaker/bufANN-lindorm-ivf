@@ -9,7 +9,8 @@ endforeach()
 # Native execution requires the actual Linux heap backend and opt-in routing.
 if(TARGET ivf_index AND NOT MSVC)
     add_executable(ivf_cost_model "${IVF_ROOT}/tests/ivf_cost_model.cpp")
-    target_link_libraries(ivf_cost_model PRIVATE ivf_cost_model_core ivf_lists BufANN)
+    target_link_libraries(ivf_cost_model PRIVATE ivf_cost_model_core ivf_lists "$<TARGET_FILE:BufANN>")
+    add_dependencies(ivf_cost_model BufANN)
     set_target_properties(ivf_cost_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                     "${CMAKE_BINARY_DIR}/tests")
     add_library(ivf_cli_execution STATIC "${IVF_ROOT}/tests/ivf_cli_execution.cpp")

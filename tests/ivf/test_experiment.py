@@ -114,7 +114,7 @@ bash() { command python3 "$FIXTURE_NATIVE" "$1"; }
         for nlist in (100000, 200000, 300000):
             work = previous / f"nlist-{nlist}/sift100m/IVF/query"
             work.mkdir(parents=True)
-            (work / "prepared.json").write_text(json.dumps(dict(settings=dict(max_reps="15", nlist=str(nlist)))))
+            (work / "prepared.json").write_text(json.dumps(dict(settings=dict(max_reps="15", nlist=str(nlist)), router_backend="faiss-1.9.0-cpu1")))
         before = {p: p.read_bytes() for p in previous.rglob("prepared.json")}
         result = self.invoke("sift100m-refine", IVF_GRID_PREVIOUS_ROOT=str(previous))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

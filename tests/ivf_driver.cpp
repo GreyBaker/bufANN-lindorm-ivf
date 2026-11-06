@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
       std::cout << "Query-only overrides among persisted modes (assignments "
                    "stay frozen):\n"
                    "  [--router_mode "
-                   "hnswlib|exact|patched-full|refined|pca|pca-refined]\n"
+                   "faiss|exact|faiss-full|refined|pca|pca-refined]\n"
                    "  [--router_rerank_factor F] [--router_breadth N]\n";
       return 0;
     }

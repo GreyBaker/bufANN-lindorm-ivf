@@ -18,8 +18,9 @@ namespace diskann::ivf {
     uint32_t unreachable_before = 0, unreachable_after = 0, zero_indegree = 0;
     uint32_t reinserted_nodes = 0, refined_nodes = 0;
   };
-  // Thin ownership/measurement adapter for patched hnswlib, not a native graph.
-  // Refinement is serial/quiescent; query contexts are per-call and read-only.
+  // Local optimized adapter over unmodified FAISS HNSW storage, traversal and
+  // pruning. The historical class name does not mean upstream is patched.
+  // Refinement/refresh are quiescent; search contexts are per-call/read-only.
   class PatchedCentroidGraph {
    public:
     static std::unique_ptr<PatchedCentroidGraph> build(

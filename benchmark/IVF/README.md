@@ -26,14 +26,16 @@ bash benchmark/IVF/build.sh \
   -DINTEL_OMP_LIBRARY_DIR=/usr/lib/x86_64-linux-gnu
 ```
 
-The build uses installed MKL, Intel OpenMP and libaio, and writes the drivers and
+The native IVF build uses sequential MKL ILP64, compiler OpenMP and libaio, and writes the drivers and
 diagnostic tools to `$IVF_BUILD_DIR/tests/`. Make runtime libraries discoverable
 through the loader or `LD_LIBRARY_PATH`. `IVF_BUILD_JOBS` defaults to 4.
 Ubuntu packages install under `/usr`; an empty `/opt` is normal. Only use
 `/opt/intel/oneapi/...` paths if you separately installed Intel oneAPI, substituting
 its actual MKL/OpenMP directories rather than a presumed version.
-Routing fetches a pinned upstream comparison; the modified IVF headers are
-vendored. See the [dependency guide](../../dependencies/hnswlib/README.md).
+Routing fetches checksum-pinned **FAISS 1.9.0 CPU** sources, without GPU/Python
+components or upstream source patches. IVF links one GNU OpenMP runtime; unrelated
+baseline targets retain their original Intel-threaded MKL configuration.
+See the [dependency/API guide](../../dependencies/faiss/README.md).
 
 ## 2. Configure a dataset
 
@@ -132,8 +134,10 @@ they do not measure a new one. Source, settings and tool identities are checked.
 
 Existing paths, including failed runs, are not overwritten. Use a fresh
 `EVAL_TEMPFILES` root to prepare again or `IVF_RUN_TAG` to repeat from the same base.
-Keep inputs trusted and immutable. Only `hnswlib-0.8.0-stock1` bundles are accepted;
-rebuild older bundles rather than relabeling them.
+Keep inputs trusted and immutable. Only `faiss-1.9.0-cpu1` bundles are accepted,
+with `faiss-1.9.0-ivf1` optimized graphs when enabled. Prepare fresh matching
+FAISS/15-pass bases; former hnswlib bundles and mode names are rejected, never
+relabelled or deleted. Refinement-grid reuse checks both backend and training passes.
 
 ### Insertion workers, input staging and same-process warmup
 
@@ -239,6 +243,10 @@ router choices and centroid-count prediction before comparison with separately
 obtained baseline measurements.
 Functional tests and example settings do not establish production quality or
 paper speedups. Reserve final queries until calibration and tuning are frozen.
+Comparisons are ANN-mechanism studies, not matched durable-ingestion systems:
+SPFresh may pay asynchronous WAL and maintenance costs absent from this IVF path.
+Disclose those asymmetries and each baseline's actual timing/maintenance policy;
+IVF page writeback does not establish recovery or durable update acknowledgment.
 
 ## Ablation instructions
 
@@ -266,8 +274,8 @@ The operational examples and quickstart explicitly override the trainer to
 `lv-plus` while keeping `IVF_SAMPLE_RATE=1`: every initial-base row participates
 in training. Sampling examples below are optional ablations, not quickstart steps.
 
-`IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert router (default `hnswlib`);
-`IVF_ROUTER_MODE` overrides queries. `exact` enumerates centroids; `patched-full`,
+`IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert router (default `faiss`);
+`IVF_ROUTER_MODE` overrides queries. `exact` enumerates centroids; `faiss-full`,
 `refined`, `pca` and `pca-refined` require `IVF_OPTIMIZED_MODES=1` at preparation.
 Centroids, routers and final PCA stay frozen across updates. Centroid controls
 `IVF_ROUTER_BREADTH`/`IVF_ROUTER_RERANK_FACTOR` are distinct from full-vector
@@ -302,7 +310,7 @@ full-coordinate graphs, initial-only refinement and 95%-variance PCA refit at ea
 joined assignment boundary. **LV+ changes only previous-assignment seeding**;
 keep its other settings identical to LV. Training search settings are independent
 of final routing. Moving PCA/refinement schedules are interpretations; fixed pass
-caps and hnswlib substitution are not exact paper reproduction.
+caps and explicit local graph-refresh/refinement interpretations are not exact paper reproduction.
 
 Modes use the same deterministic base sample in separate processes. Inspect SSE,
 occupancy/recovery, connectivity, time, RSS and distance counts. SSE uses training
@@ -444,16 +452,20 @@ matched-recall baseline comparisons.
 Dependency-isolated functional checks:
 
 ```bash
+sudo apt-get install libblas-dev liblapack-dev
 cmake -S tests/ivf -B build/ivf-contracts -DCMAKE_BUILD_TYPE=Release \
   -DIVF_BUILD_ROUTING=ON
 cmake --build build/ivf-contracts -j4
 ctest --test-dir build/ivf-contracts --output-on-failure
 ```
 
+Isolated routing uses generic LP64 BLAS/LAPACK and compiler OpenMP, not native
+MKL ILP64. `ivf_faiss_contracts` exercises an actual BLAS-based FAISS distance
+calculation plus upstream-search parity and overlapping per-call breadths.
 Isolated drivers only validate inputs; workloads/calibration require the full Linux
 build. For full tests, enable `-DIVF_BUILD_CONTRACT_TESTS=ON`, build test executables
-and run CTest there. Scalar sanitizer results establish neither SIMD safety
-(upstream has known prefetch issues) nor full-system race safety. Sampling,
+and run CTest there. Sanitizer results qualify only the executed configuration,
+not unrestricted full-system race safety. Sampling,
 prediction accuracy and comparisons with external SPFresh results still need
 separate studies.
 

@@ -203,7 +203,7 @@ namespace {
     emit("distance_evaluations", total.distances);
     emit("distance_counted_queries", total.counted);
     emit("distance_scope",
-         "patched_graph_plus_full_centroid_rerank_exact_enumeration_hnswlib_"
+         "optimized_faiss_graph_plus_full_centroid_rerank_exact_enumeration_vanilla_faiss_"
          "unavailable");
     emit("query_bytes", query_identity.bytes);
     emit("query_hash_fnv1a", query_identity.hash);

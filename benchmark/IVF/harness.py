@@ -29,6 +29,7 @@ from common import (
     write_json,
 )
 from settings import (
+    ROUTER_BACKEND_ID,
     build_settings,
     nlist_selection,
     prepared_selection,
@@ -151,6 +152,7 @@ def prepare(args):
         "version": 1,
         "profile": profile(args),
         "settings": settings,
+        "router_backend": ROUTER_BACKEND_ID,
         "sources": [digest(data), digest(pivots), digest(codes)],
         "builder": digest(builder),
         "bufann_libraries": {path.name: digest(path) for path in libraries},
@@ -235,6 +237,7 @@ def prepare(args):
             "version": 1,
             "profile": profile(args),
             "settings": settings,
+            "router_backend": ROUTER_BACKEND_ID,
             "nlist_selection": selection,
             "cache_key": key,
             "cache_hit": hit,
@@ -286,6 +289,8 @@ def run(args):
         "profile changed since prepare",
     )
     selection = prepared_selection(prepared)
+    require(prepared.get("router_backend") == ROUTER_BACKEND_ID,
+            "prepared router backend is incompatible; prepare a fresh FAISS base")
     mutation = mutation_identity(args, work)
     if mutation is not None:
         require(

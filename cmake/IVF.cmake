@@ -29,19 +29,23 @@ target_include_directories(ivf_cost_model_core PUBLIC "${IVF_ROOT}/include")
 target_compile_features(ivf_cost_model_core PUBLIC cxx_std_20)
 target_link_libraries(ivf_cost_model_core PUBLIC ivf_numeric_policy)
 
-option(IVF_BUILD_ROUTING "Build centroid HNSW router (fetches pinned hnswlib)" OFF)
+option(IVF_BUILD_ROUTING "Build centroid FAISS HNSW router (fetches pinned CPU FAISS)" OFF)
 if(IVF_BUILD_ROUTING)
-    include("${CMAKE_CURRENT_LIST_DIR}/Hnswlib.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/Faiss.cmake")
     add_library(
         ivf_router STATIC
         "${IVF_ROOT}/src/bufann/ivf_router.cpp" "${IVF_ROOT}/src/bufann/ivf_patched_graph.cpp"
-        "${IVF_ROOT}/src/bufann/ivf_pca.cpp")
+        "${IVF_ROOT}/src/bufann/ivf_pca.cpp" "${IVF_ROOT}/src/bufann/ivf_faiss.cpp")
     target_link_libraries(
         ivf_router
         PUBLIC ivf_centroids
-        PRIVATE ivf_hnswlib_headers)
+        PRIVATE ivf_faiss_cpu)
+    ivf_native_link_policy(ivf_router)
 
     add_library(ivf_lists STATIC "${IVF_ROOT}/src/bufann/ivf_lists.cpp"
                                  "${IVF_ROOT}/src/bufann/ivf_posting_lists.cpp")
     target_link_libraries(ivf_lists PUBLIC ivf_router Threads::Threads)
+    foreach(target ivf_contracts ivf_centroids ivf_cost_model_core ivf_lists)
+        ivf_native_link_policy(${target})
+    endforeach()
 endif()

@@ -231,26 +231,23 @@ namespace {
         std::filesystem::copy_file(prefix + suffix, damaged + suffix);
       std::fstream output(damaged + ".hnsw",
                           std::ios::binary | std::ios::in | std::ios::out);
-      if (fault == 0) {  // Invalid allocation stride in native header.
+      if (fault == 0) {  // Invalid FAISS neighbor allocation length.
         const uint64_t huge = UINT64_MAX;
-        output.seekp(24);
+        output.seekp(32);
         output.write(reinterpret_cast<const char*>(&huge), sizeof(huge));
       } else if (fault == 1) {  // Out-of-range level-0 target.
-        const uint32_t one = 1, invalid_id = nlist;
-        output.seekp(96);
-        output.write(reinterpret_cast<const char*>(&one), sizeof(one));
+        const uint32_t invalid_id = nlist;
+        output.seekp(48 + uint64_t(nlist) * 12);
         output.write(reinterpret_cast<const char*>(&invalid_id),
                      sizeof(invalid_id));
       } else if (fault ==
-                 2) {  // Invalid label despite unchanged centroid table.
-        const uint64_t invalid_label = nlist;
-        output.seekp(96 + 4 + 8 * options.degree + 4 * dim);
-        output.write(reinterpret_cast<const char*>(&invalid_label),
-                     sizeof(invalid_label));
-      } else {  // Implausible upper-layer allocation length.
-        const uint32_t huge = UINT32_MAX;
-        output.seekp(96 +
-                     uint64_t(nlist) * (4 + 8 * options.degree + 4 * dim + 8));
+                 2) {  // Coordinates disagree with the independent centroid table.
+        const float invalid = std::numeric_limits<float>::quiet_NaN();
+        output.seekp(-std::streamoff(uint64_t(nlist) * dim * 4), std::ios::end);
+        output.write(reinterpret_cast<const char*>(&invalid), sizeof(invalid));
+      } else {  // Invalid first adjacency offset.
+        const uint64_t huge = UINT64_MAX;
+        output.seekp(40 + uint64_t(nlist) * 4);
         output.write(reinterpret_cast<const char*>(&huge), sizeof(huge));
       }
       output.close();
@@ -258,6 +255,8 @@ namespace {
       rejects([&] { CentroidRouter::load(damaged); });
     }
     rejects([&] { router->search(query, 0); });
+    rejects([&] { parse_router_mode("hnswlib"); });
+    rejects([&] { parse_router_mode("patched-full"); });
     rejects([&] { router->search(query, nlist + 1); });
     rejects(
         [&] { router->search(std::span<const float>(query).first(12), 1); });
@@ -311,7 +310,12 @@ namespace {
     auto tied = ties->search(ones, 7);
     for (uint32_t i = 0; i < 7; ++i)
       require(tied[i].list_id == i && tied[i].squared_distance == 0,
-              "all-list tie order invalid");
+               "all-list tie order invalid");
+    const auto partial_ties = ties->search(ones, 3);
+    require(partial_ties == ties->search(ones, 3) &&
+                std::is_sorted(partial_ties.begin(), partial_ties.end(), [](auto a, auto b) {
+                  return a.list_id < b.list_id;
+                }), "FAISS returned-candidate tie order is unstable");
     auto singleton = CentroidRouter::build(13, std::span<const float>(ones));
     const auto single_prefix = (root / "singleton").string();
     singleton->save(single_prefix);

@@ -22,7 +22,7 @@ from common import (
     write_json,
 )
 
-MODES = ("exact", "hnswlib", "patched-full", "refined", "pca", "pca-refined")
+MODES = ("exact", "faiss", "faiss-full", "refined", "pca", "pca-refined")
 
 
 def main():

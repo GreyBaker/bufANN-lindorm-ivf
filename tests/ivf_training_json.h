@@ -1,11 +1,16 @@
 #pragma once
 #include "bufann/ivf_centroids.h"
+#include "bufann/ivf_router.h"
 #include "ivf_cli.h"
 
 namespace ivf_cli {
   inline void training_settings(std::ostream& out, bool& first,
                                 const diskann::ivf::BuildConfig& config) {
     using namespace diskann::ivf;
+    bufann_bench::json_kv(out, first, "training_graph_backend",
+                          config.trainer_mode == TrainerMode::Exact ? "none"
+                          : trainer_reuses_graph(config.trainer_mode) ? optimized_router_backend_id
+                          : router_backend_id);
     bufann_bench::json_kv(out, first, "trainer_mode",
                           trainer_mode_name(config.trainer_mode));
     bufann_bench::json_kv(out, first, "trainer_init",

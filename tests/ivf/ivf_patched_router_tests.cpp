@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -130,7 +131,7 @@ namespace {
                          q.size() * sizeof(float));
     }
     const std::array<RouterMode, 6> modes{
-        RouterMode::Exact,   RouterMode::Hnswlib, RouterMode::PatchedFull,
+        RouterMode::Exact,   RouterMode::Faiss, RouterMode::FaissFull,
         RouterMode::Refined, RouterMode::PCA,     RouterMode::PCARefined};
     RouterOptions options;
     options.native_modes = true;
@@ -161,16 +162,12 @@ namespace {
           require(
               hits == loaded->search(query, probe, false, nullptr, {mode, 3}),
               "Reload changed hits");
-          if (mode == RouterMode::PatchedFull)
-            require(hits == router->search(query, probe, false, nullptr,
-                                           {RouterMode::Hnswlib}),
-                    "Patch-off search differs from vanilla");
           for (auto hit : hits)
             for (auto gt : truth)
               if (hit.list_id == gt.list_id)
                 recall += 1.0 / (queries * probe);
           require(
-              stats.distance_count_available == (mode != RouterMode::Hnswlib),
+              stats.distance_count_available == (mode != RouterMode::Faiss),
               "Distance counter mislabeled");
           distances += stats.distance_evaluations;
         }
@@ -232,10 +229,18 @@ namespace {
                 bytes((root / "refine_b").string()),
             "Frozen refinement nondeterministic");
     if (!graph->diagnostics().reinserted_nodes) {
-      const size_t upper_offset =
-          96 + size_t(n) * (4 + 8 * options.degree + dim * 4 + 8);
-      require(bytes(prefix + ".hnsw").substr(upper_offset) ==
-                  bytes((root / "refine_a").string()).substr(upper_offset),
+      auto upper = [&](const std::string& blob) {
+        std::string result;
+        for (uint32_t id=0;id<n;++id) {
+          uint64_t begin=0,end=0;
+          std::memcpy(&begin,blob.data()+40+n*4+id*8,8);
+          std::memcpy(&end,blob.data()+40+n*4+(id+1)*8,8);
+          begin+=2*options.degree;
+          result+=blob.substr(48+n*12+begin*4,(end-begin)*4);
+        }
+        return result;
+      };
+      require(upper(bytes(prefix + ".hnsw")) == upper(bytes((root / "refine_a").string())),
               "Refinement changed upper layers without isolated reinsertion");
     }
     std::vector<float> duplicates(600, 1);
@@ -255,17 +260,13 @@ namespace {
     auto duplicate_router =
         CentroidRouter::build(3, duplicates, duplicate_options);
     for (uint32_t breadth : {8u, 32u, 200u})
-      require(
-          duplicate_router->search({duplicates.data(), 3}, 1, false, nullptr,
-                                   {RouterMode::PatchedFull, 3, breadth}) ==
-              duplicate_router->search({duplicates.data(), 3}, 1, false,
-                                       nullptr,
-                                       {RouterMode::Hnswlib, 3, breadth}),
-          "Duplicate patch-off parity failed");
+      require(duplicate_router->search({duplicates.data(), 3}, 1, false, nullptr,
+                                   {RouterMode::FaissFull, 3, breadth}).front().squared_distance == 0,
+          "Duplicate FAISS candidate reranking failed");
     auto plain = CentroidRouter::build(dim, v);
     rejects([&] {
       plain->search({q.data(), dim}, 1, false, nullptr,
-                    {RouterMode::PatchedFull});
+                    {RouterMode::FaissFull});
     });
     const auto plain_prefix = (root / "plain").string();
     plain->save(plain_prefix);
@@ -279,7 +280,7 @@ namespace {
       require(backend_at != std::string::npos,
               "Missing stock producer identity");
       for (const auto* backend :
-           {"hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"}) {
+            {"hnswlib-0.8.0-stock1", "hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"}) {
         auto rejected = descriptor;
         rejected.replace(backend_at, std::string(router_backend_id).size(),
                          backend);
@@ -305,6 +306,17 @@ namespace {
     }
     const auto corrupt = prefix + ".refined.hnsw";
     {
+      const auto descriptor = bytes(prefix + ".router");
+      auto incompatible = descriptor;
+      const auto at = incompatible.find(optimized_router_backend_id);
+      require(at != std::string::npos, "Optimized FAISS identity missing");
+      incompatible.replace(at, std::string(optimized_router_backend_id).size(), "unknown-optimized-variant");
+      { std::ofstream file(prefix + ".router"); file << incompatible; }
+      rejects([&] { CentroidRouter::load(prefix); }, "Unsupported optimized FAISS router producer");
+      require(bytes(prefix + ".router") == incompatible, "Rejected optimized producer was rewritten");
+      { std::ofstream file(prefix + ".router"); file << descriptor; }
+    }
+    {
       std::fstream file(corrupt,
                         std::ios::binary | std::ios::in | std::ios::out);
       char         byte = 1;
@@ -326,7 +338,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(root);
     pca_tests();
     router_tests(root);
-    std::cout << "Patched hnswlib/PCA fixtures passed\n";
+    std::cout << "Optimized FAISS HNSW/PCA fixtures passed\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

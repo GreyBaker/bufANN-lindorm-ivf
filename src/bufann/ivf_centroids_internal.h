@@ -40,7 +40,7 @@ namespace diskann::ivf::detail {
       std::span<const float> centroids, const BuildConfig& config,
       const RouterOptions& options);
   // Shared sampling/reduction logic; optional graph assignment does not make
-  // the dependency-light exact trainer depend on hnswlib. Factory builds are
+  // the dependency-light exact trainer depend on FAISS. Factory builds are
   // serial, assignment must be immutable/thread-safe, and exceptions propagate
   // to caller.
   CentroidTraining train_centroids_impl(

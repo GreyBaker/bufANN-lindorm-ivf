@@ -51,7 +51,7 @@ class SharedOrchestrationTests(unittest.TestCase):
             "trainer_mode": "ann-reuse-seeded",
             "init": "random_partition",
             "training_breadth": "64",
-            "router_mode": "hnswlib",
+            "router_mode": "faiss",
             "router_rerank_factor": "3",
         }
         with patch.dict(os.environ, {"IVF_NLIST": "8"}, clear=True):
@@ -402,6 +402,7 @@ class SharedOrchestrationTests(unittest.TestCase):
         common.write_json(work / "prepared.json", {
             "version": 1, "profile": settings.profile(args),
             "settings": {"page_size": "4096", "nlist": "2"},
+            "router_backend": settings.ROUTER_BACKEND_ID,
             "query": str(query), "query_identity": common.digest(query),
             "truth": str(truth), "truth_identity": common.digest(truth),
             "manifest_identity": common.digest(Path(str(prefix) + ".manifest")),

@@ -18,7 +18,7 @@
 
 namespace {
   using namespace diskann::ivf;
-  RouterMode         fixture_mode = RouterMode::Hnswlib;
+  RouterMode         fixture_mode = RouterMode::Faiss;
   constexpr uint32_t dim = 13, chunks = 3, rows = 180, base = 160, first = 5;
   void               require(bool ok, const char* message) {
     if (!ok)
@@ -141,7 +141,7 @@ namespace {
     training.build_threads = 4;
     const auto    trained = train_centroids_hnsw(vectors, training);
     RouterOptions routing;
-    routing.native_modes = fixture_mode != RouterMode::Hnswlib;
+    routing.native_modes = fixture_mode != RouterMode::Faiss;
     routing.mode = fixture_mode;
     auto       router = CentroidRouter::build(dim, trained.centroids, routing);
     const auto lists = PostingLists::build<T>(vectors, codes_path, *router,
@@ -571,9 +571,12 @@ namespace {
       while (in >> token)
         tokens.push_back(token);
       in.close();
-      require(tokens.size() == (routing.native_modes ? 35u : 13u),
+      require(tokens.size() == (routing.native_modes ? 36u : 13u) &&
+                  tokens[0] == (routing.native_modes ? "IVFROUTER4" : "IVFROUTER3") &&
+                  tokens[1] == router_backend_id &&
+                  (!routing.native_modes || tokens[13] == optimized_router_backend_id),
               "unexpected router descriptor fixture");
-      tokens[6] = std::to_string(training.nlist + 1000);
+      tokens[3] = std::to_string(training.nlist + 1000);
       std::ofstream out(mismatched_router + ".router");
       for (const auto& value : tokens)
         out << value << ' ';

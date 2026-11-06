@@ -36,7 +36,7 @@ def main():
             source_identity = digest(data)
             pq_identity = {suffix: digest(Path(str(pq) + suffix))
                            for suffix in ("_pq_pivots.bin", "_pq_compressed.bin")}
-            for mode in ("hnswlib", "pca-refined"):
+            for mode in ("faiss", "pca-refined"):
                 references = None
                 for threads in (1, 4):
                     prefix = root / f"{dtype}-{mode}-{threads}"
@@ -46,7 +46,7 @@ def main():
                                "--nlist", "8", "--trainer_mode", "exact", "--init", "random_partition",
                                "--max_reps", "1", "--sample_rate", "1", "--seed", "31",
                                "--build_threads", str(threads), "--memory_budget_gb", "1",
-                               "--optimized_modes", "1" if mode != "hnswlib" else "0", "--router_mode", mode]
+                               "--optimized_modes", "1" if mode != "faiss" else "0", "--router_mode", mode]
                     result = subprocess.run(command, text=True, capture_output=True, timeout=90)
                     assert result.returncode == 0, (command, result.stdout, result.stderr)
                     record, = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{"baseline":')]
@@ -60,7 +60,7 @@ def main():
                     assert record["pq_chunks"] == chunks
                     components = {suffix: digest(Path(str(prefix) + suffix))
                                    for suffix in (".centroids.bin", ".hnsw", ".router", ".lists", ".heap", ".pq.bin")}
-                    if mode != "hnswlib":
+                    if mode != "faiss":
                         components.update({suffix: digest(Path(str(prefix) + suffix))
                                            for suffix in (".patched.hnsw", ".refined.hnsw", ".pca")})
                     if references is None:

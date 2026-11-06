@@ -2,8 +2,9 @@
 #include "bufann/ivf_patched_graph.h"
 #include "bufann/ivf_pca.h"
 #include "../../src/bufann/ivf_centroids_internal.h"
-#include <ivf_patched/hnswlib.h>
+#include "../../src/bufann/ivf_faiss_internal.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <filesystem>
@@ -177,49 +178,31 @@ namespace {
     config.training_breadth = 0;
     rejects([&] { train_centroids_ann(path, config, options); });
   }
-  void raw_seed_and_reinsert() {
-    ivf_hnswlib::L2Space                space(2);
-    ivf_hnswlib::HierarchicalNSW<float> graph(&space, 3, 2, 8, 10);
-    const float                         values[]{0, 0, 10, 10, 20, 20};
-    for (uint32_t id = 0; id < 3; ++id)
-      graph.addPoint(values + id * 2, id);
-    graph.setEf(1);
-    graph.replaceBottomIVF(0, {});
-    graph.replaceBottomIVF(1, {});
-    graph.replaceBottomIVF(2, {});
-    graph.enterpoint_node_ = 2;
-    graph.maxlevel_ = 0;
-    const auto global = graph.searchKnnIVF(values, 1);
-    const auto seeded =
-        graph.searchKnnIVF(values, 1, nullptr, nullptr, {0}, true);
-    require(global.top().second == 2 && seeded.top().second == 0,
+  void raw_seed_and_reinsert(const std::filesystem::path& root) {
+    const float values[]{0, 0, 10, 10, 20, 20};
+    auto graph = faiss_detail::build(2, values, {2,8,10});
+    std::fill(graph->hnsw.neighbors.begin(),graph->hnsw.neighbors.end(),-1);
+    graph->hnsw.entry_point=2; graph->hnsw.max_level=0;
+    const std::array<uint32_t,1> entry{0}, invalid{3};
+    require(faiss_detail::search(*graph,{values,2},1,1).front().id==2 &&
+            faiss_detail::search(*graph,{values,2},1,1,entry,{},0,nullptr,true).front().id==0,
             "Seeded traversal still uses global descent");
-    require(graph.searchKnnIVF(values, 1, nullptr, nullptr, {}, true)
-                    .top()
-                    .second == 2,
+    require(faiss_detail::search(*graph,{values,2},1,1,{}, {},0,nullptr,true).front().id==2,
             "Missing seed fallback");
-    rejects(
-        [&] { graph.searchKnnIVF(values, 1, nullptr, nullptr, {3}, true); });
-    graph.maxlevel_ = *std::max_element(graph.element_levels_.begin(),
-                                        graph.element_levels_.begin() + 3);
-    for (uint32_t id = 0; id < 3; ++id)
-      if (graph.element_levels_[id] == graph.maxlevel_)
-        graph.enterpoint_node_ = id;
-    auto        levels = graph.element_levels_;
-    const float moved[]{20, 20, 0, 0, 10, 10};
-    for (uint32_t id = 0; id < 3; ++id)
-      graph.replaceVectorIVF(id, moved + id * 2);
-    for (uint32_t id = 0; id < 3; ++id)
-      graph.reinsertFromIVF(id, {(id + 1) % 3});
-    require(levels == graph.element_levels_ && graph.cur_element_count == 3,
-            "Reuse changed levels or IDs");
-    for (uint32_t id = 0; id < 3; ++id) {
-      const auto* data =
-          reinterpret_cast<const float*>(graph.getDataByInternalId(id));
-      require(data[0] == moved[id * 2] && data[1] == moved[id * 2 + 1] &&
-                  graph.getExternalLabel(id) == id,
-              "Coordinates/labels stale");
-    }
+    rejects([&] { faiss_detail::search(*graph,{values,2},1,1,invalid,{},0,nullptr,true); });
+    // The middle node can bridge the two endpoints. Reinsertion must permit
+    // traversal through the node being refreshed while filtering it from the
+    // result, or sequential rewiring can silently isolate an endpoint.
+    auto maintained=PatchedCentroidGraph::build(2,values,{2,8,10});
+    const auto before=(root/"before-refresh.graph").string(), after=(root/"after-refresh.graph").string();
+    maintained->save(before);
+    const float moved[]{20,20,0,0,10,10}; maintained->refresh(moved); maintained->save(after);
+    std::array<char,52> old_layout{}, new_layout{};
+    std::ifstream old_file(before,std::ios::binary),new_file(after,std::ios::binary);
+    old_file.read(old_layout.data(),old_layout.size()); new_file.read(new_layout.data(),new_layout.size());
+    require(old_layout==new_layout,"Reuse changed FAISS levels/IDs/header");
+    for (uint32_t id=0;id<3;++id)
+      require(maintained->search({moved+id*2,2},3,8).front().id==id,"Refreshed FAISS coordinates/labels stale");
   }
   void joined_refresh(const std::filesystem::path& root) {
     BuildConfig config;
@@ -391,7 +374,7 @@ int main(int argc, char** argv) {
     require(argc == 2, "scratch required");
     const std::filesystem::path root(argv[1]);
     std::filesystem::create_directories(root);
-    raw_seed_and_reinsert();
+    raw_seed_and_reinsert(root);
     joined_refresh(root);
     moving_projection();
     assignment_oracle();

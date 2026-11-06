@@ -110,7 +110,7 @@ namespace ivf_cli {
       const auto native = args.u32("--optimized_modes", 0);
       check(native <= 1, "optimized_modes must be 0 or 1");
       routing.native_modes = native != 0;
-      routing.mode = parse_router_mode(args.get("--router_mode", "hnswlib"));
+      routing.mode = parse_router_mode(args.get("--router_mode", "faiss"));
       routing.refine_breadth = args.u32("--refine_ef", 128);
       routing.pca_variance = args.real("--pca_variance", .95);
       routing.router_rerank_factor = args.real("--router_rerank_factor", 3);
@@ -132,7 +132,7 @@ namespace ivf_cli {
       check(routing.rerank_factor >= 1 && routing.breadth > 0 &&
                 routing.breadth <= INT32_MAX &&
                 (defaults.native_modes || routing.mode == RouterMode::Exact ||
-                 routing.mode == RouterMode::Hnswlib),
+                 routing.mode == RouterMode::Faiss),
             "Query router settings invalid or native modes not built");
       return routing;
     }
@@ -193,6 +193,8 @@ namespace ivf_cli {
       emit("router_seed", routing.seed);
       emit("router_mode", router_mode_name(routing.mode));
       emit("assignment_router_mode", router_mode_name(routing.mode));
+      emit("router_backend", router_backend_id);
+      emit("optimized_router_backend", routing.native_modes ? optimized_router_backend_id : "not_built");
       emit("optimized_modes_built", routing.native_modes);
       emit("pca_retained_dim", router->projected_dim());
       emit("pca_retained_variance", router->retained_variance());
@@ -1076,6 +1078,8 @@ namespace ivf_cli {
       emit("base_count", m.training.base_count);
       emit("source_rows", m.source_rows);
       emit("assignment_router_mode", router_mode_name(m.routing.mode));
+      emit("router_backend", router_backend_id);
+      emit("optimized_router_backend", m.routing.native_modes ? optimized_router_backend_id : "not_built");
       training_settings(record, first, m.training);
       emit("router_degree", m.routing.degree);
       emit("construction_breadth", m.routing.construction_breadth);
@@ -1338,8 +1342,14 @@ namespace ivf_cli {
       emit("router_distance_evaluations", total.router_distances);
       emit("router_distance_counted_queries", total.router_counted_queries);
       emit("router_distance_count_scope",
-           "patched_graph_plus_full_centroid_rerank_or_exact_enumeration_"
-           "hnswlib_graph_unavailable");
+           "optimized_faiss_graph_plus_full_centroid_rerank_or_exact_enumeration_"
+           "vanilla_faiss_graph_unavailable");
+      if (!updating) {
+        emit("router_backend", router_backend_id);
+        emit("optimized_router_backend", manifest.routing.native_modes ? optimized_router_backend_id : "not_built");
+      }
+      emit("vanilla_router_policy", "upstream_hnsw_search_per_call_ef_returns_nprobe_no_oversampling");
+      emit("router_stage_timing_policy", "graph_us_excludes_projection_and_double_output_rerank_not_end_to_end_raw_faiss");
       emit("query_threads", config.query_threads);
       emit("active_query_threads", workers);
       emit("query_count", queries.rows);

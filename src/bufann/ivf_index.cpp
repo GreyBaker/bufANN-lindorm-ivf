@@ -182,7 +182,7 @@ namespace diskann::ivf {
       in >> backend;
       check(
           backend == router_backend_id,
-          "Unsupported IVF index producer; rebuild with hnswlib-0.8.0-stock1");
+          "Unsupported IVF index producer; rebuild with faiss-1.9.0-cpu1");
       IndexManifest m;
       m.format_version = uint32_t(version.back() - '0');
       std::string dtype;

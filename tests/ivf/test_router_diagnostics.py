@@ -50,7 +50,7 @@ def main():
                 "--router_breadth",
                 "128",
             ]
-            for mode in ("exact", "hnswlib", "patched-full", "refined", "pca", "pca-refined"):
+            for mode in ("exact", "faiss", "faiss-full", "refined", "pca", "pca-refined"):
                 path = root / (dtype + "_" + mode + ".json")
                 cmd = command + ["--router_mode", mode, "--result_file", str(path)]
                 completed = subprocess.run(cmd, text=True, capture_output=True, timeout=90)
@@ -60,7 +60,7 @@ def main():
                 assert record["query_rows"] == 4 and 0 <= record["centroid_recall_fraction"] <= 1
                 assert not record["production_qualified"] and record["router_qps"] > 0
                 assert 0 <= record["assignment_agreement_fraction"] <= 1
-                assert record["distance_counted_queries"] == (0 if mode == "hnswlib" else 4)
+                assert record["distance_counted_queries"] == (0 if mode == "faiss" else 4)
                 if mode == "exact":
                     assert (
                         record["centroid_recall_fraction"] == 1

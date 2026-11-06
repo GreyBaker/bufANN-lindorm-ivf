@@ -11,10 +11,10 @@ from ivf_test_support import run_native_cli as run, write_ids, write_matrix, wri
 
 def reject_historical_producers(search, path, original):
     """Reject retired labels in every framing; never relabel test-owned inputs."""
-    assert original.split()[3] == "hnswlib-0.8.0-stock1"
+    assert original.split()[3] == "faiss-1.9.0-cpu1"
     try:
-        for backend in ("hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"):
-            rejected = original.replace("hnswlib-0.8.0-stock1", backend)
+        for backend in ("hnswlib-0.8.0-stock1", "hnswlib-0.8.0-prefetch1", "hnswlib-0.8.0-nomv", "unknown"):
+            rejected = original.replace("faiss-1.9.0-cpu1", backend)
             path.write_text(rejected)
             result = run(search)
             assert "Unsupported IVF index producer" in result.stderr
