@@ -350,20 +350,21 @@ def profile(args):
     }
 
 
-def build_settings():
+def build_settings(env=None):
+    env = os.environ if env is None else env
     result = {
-        key: os.environ.get("IVF_" + key.upper(), value) for key, value in BUILD_DEFAULTS.items()
+        key: env.get("IVF_" + key.upper(), value) for key, value in BUILD_DEFAULTS.items()
     }
     # Preserve legacy cache keys unless the new trainer/settings are requested.
     for key, default in (("training_rerank_factor", "3"), ("training_refine_breadth", "128")):
-        value = os.environ.get("IVF_" + key.upper())
+        value = env.get("IVF_" + key.upper())
         if result["trainer_mode"] in ("lv", "lv-plus") or value is not None:
             result[key] = default if value is None else value
     # Query-only mode/factor overrides do not alter the build/cache identity.
-    result["router_mode"] = os.environ.get("IVF_ASSIGNMENT_ROUTER_MODE", "faiss")
-    result["router_rerank_factor"] = os.environ.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
-    if os.environ.get("IVF_COST_MODEL_REPORT"):
-        chosen = read_cost_model_report(os.environ["IVF_COST_MODEL_REPORT"])["selected_nlist"]
+    result["router_mode"] = env.get("IVF_ASSIGNMENT_ROUTER_MODE", "faiss")
+    result["router_rerank_factor"] = env.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
+    if env.get("IVF_COST_MODEL_REPORT"):
+        chosen = read_cost_model_report(env["IVF_COST_MODEL_REPORT"])["selected_nlist"]
         require(
             result["nlist"] is None or int(result["nlist"]) == chosen,
             "IVF_NLIST disagrees with cost-model selection",

@@ -248,6 +248,11 @@ def check_cache(path, full_count, states, k_out, expected_queries=None, worst_qu
 
 def resolved_plan(args):
     """Return ordered states and the coverage report's resolved plan fields."""
+    if getattr(args, "query_only", False):
+        require(0 < args.base_count < args.full_count <= 0xFFFFFFFF,
+                "require 0 < base < full <= UINT32_MAX")
+        require(args.k_out <= args.base_count, "K exceeds the query base population")
+        return [State("query", args.base_count)], {"base_count": args.base_count, "query_only": True}
     inserts = args.insert_count if args.insert_count is not None else args.full_count - args.base_count
     deletes = args.delete_count if args.delete_count is not None else args.full_count - args.base_count
     states = make_states(args.full_count, args.base_count, inserts, deletes, args.mixed_rounds,
@@ -272,6 +277,7 @@ def parser(cached_required=True, report_option=True):
     p.add_argument("--cached-gt", required=cached_required, type=Path)
     p.add_argument("--full-count", required=True, type=positive)
     p.add_argument("--base-count", required=True, type=positive)
+    p.add_argument("--query-only", action="store_true", help="check only the unchanged base population")
     p.add_argument("--insert-count", type=positive, help="default: full minus base")
     p.add_argument("--delete-count", type=positive, help="default: full minus base")
     p.add_argument("--mixed-rounds", type=positive, default=10)

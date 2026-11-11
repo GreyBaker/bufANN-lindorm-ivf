@@ -549,8 +549,8 @@ class SharedOrchestrationTests(unittest.TestCase):
 
     def test_readme_uses_checked_in_runners_not_executable_markdown(self):
         text = (Path(__file__).resolve().parents[2] / "benchmark/IVF/README.md").read_text()
-        for mode in ("workloads", "sift100m-wide", "sift100m-refine"):
-            self.assertIn(f"bash benchmark/IVF/experiment.sh {mode}", text)
+        self.assertIn("python3 benchmark/IVF/experiment.py", text)
+        self.assertNotIn("benchmark/IVF/experiment.sh", text)
         self.assertNotIn("exec python3 - <<", text)
         self.assertNotIn("grid-search-guide.md", text)
 

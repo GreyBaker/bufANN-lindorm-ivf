@@ -81,6 +81,15 @@ class DepthLayoutTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GT framing mismatch"):
             depth.recommend(self.arguments())
 
+    def test_query_only_advice_does_not_scan_for_delete_underflow(self):
+        ids = struct.pack('<6I', 80, 81, 90, 80, 81, 90)
+        distances = struct.pack('<6f', 0, 1, 4, 0, 1, 4)
+        self.cache.write_bytes(struct.pack('<II', 2, 3) + ids + distances)
+        with patch.object(depth, 'scan_source', side_effect=AssertionError('must not scan')):
+            report = depth.recommend(self.arguments(['--query-only']))
+        self.assertEqual(report['source_distance_passes'], 0)
+        self.assertEqual([s['name'] for s in report['cached_coverage']['states']], ['query'])
+
     def test_truncated_header_still_precedes_memory_guard(self):
         self.cache.write_bytes(b"short")
         with self.assertRaisesRegex(ValueError, "truncated GT header"):

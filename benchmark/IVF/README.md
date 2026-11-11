@@ -6,9 +6,8 @@ These scripts prepare and run IVF query-only, insertion, deletion and mixed-upda
 workloads on Linux/WSL. Run the commands below from the repository root.
 
 **Choose a workflow:** [full-scale SIFT setup](#quickstart-sift),
-[all four workloads](#4-configure-and-run-all-four-workloads),
-[wide query grid](#quickstart-sift100m-wide-query-only-grid),
-[reuse/refinement](#follow-up-reuse-the-first-run-and-refine-100k-400k), or
+[fixed query sweep](#4-configure-and-run-the-query-sweep),
+[preparation reuse](#preparation-reuse-and-retained-evidence), or
 [recall diagnostics](#investigating-the-approximately-99559-recall-ceiling).
 The numbered sections immediately below describe the lower-level scripts for
 custom datasets and ablations; the quickstart supplies its own fixed preset.
@@ -488,7 +487,7 @@ the call site rather than creating another orchestration layer:
 | `benchmark/IVF/settings.py` | Declared settings, admission and query flag formatting; callers validate warmup before any mutation |
 | `benchmark/IVF/harness.py` | Bundle ownership and common native-open arguments; sequential workload sequencing stays explicit |
 | `benchmark/IVF/common.sh` | Fresh work-directory claims, run-tag output selection and query/sequential prefix GT staging |
-| `benchmark/IVF/experiment.sh` | SIFT100M recipe settings, fixed grid loops, GT preflight and successful private-heap cleanup |
+| `benchmark/IVF/experiment.py` | Fixed SIFT100M query sweep, preparation reuse, shared GT and CSV collection |
 | `benchmark/IVF/sift/_profile.sh` | Dataset/tool shell bootstrap; sequential and mixed arithmetic remain in separate profiles |
 | `benchmark/scripts/check_gt_coverage.py` | Ordered live-state plans, GT plane layout and cached-row scratch estimates |
 | `include/bufann/ivf_numeric_internal.h` | Unchecked ordered float ADC, double exact-L2 and distance/ID ordering; caller validation remains local |
@@ -703,74 +702,68 @@ This recipe measures **Recall@10**; Recall@100 needs deeper GT and fresh prepara
 Keep final queries out of tuning: freeze settings using base-only calibration or
 a separate tuning set before scoring them.
 
-## 4. Configure and run all four workloads
+## 4. Configure and run the query sweep
 
-For a **query-only grid over nlist, nprobe and router breadth**, use the
-[copyable SIFT100M wide-grid instructions](#quickstart-sift100m-wide-query-only-grid)
-**instead of this step** after completing steps 1–3. Both recipes use the checked-in
-`experiment.sh` runner; this README is the only experiment document required.
+After steps 1–3, run from the repository root in the same persistent Bash terminal.
+`experiment.py` is a Python controller with one fixed SIFT100M query-only mode:
+no selector, arguments or dry run. It does not prepare or execute insertion,
+deletion or mixed workloads.
+Those workloads remain available through the individual prepare/run scripts.
 
-**Training limit:** every main recipe uses **15 passes on all 90M base rows**,
+**Training limit:** the sweep uses **15 passes on all 90M base rows**,
 plus final assignment: **1.44B searches**, admitted by the separate native
-**3B assignment-search guard**. Conflicting `IVF_MAX_REPS` overrides are rejected
-by the main runner; individual workload/native interfaces remain configurable.
+**3B assignment-search guard**. The runner replaces inherited IVF tuning with
+its fixed preset; individual workload/native interfaces remain configurable.
 This guard applies to **LV+ as well as the other trainers**. These are fixed pass
 caps, not convergence-based stopping or paper-mandated iteration counts. Full
 training can be expensive; LV+ does not reduce the number of sampled rows here.
 
-**Separate PCA/routing allowance:** at 200K centroids and 128 dimensions, one
-PCA covariance calculation counts `200000 * 128 * 129 / 2 = 1651200000`
-operations, already above the inherited 1B routing-work default. The recipe
-declares a finite 3B allowance for covariance plus solver/validation headroom.
+**Separate PCA/routing allowance:** at 500K centroids and 128 dimensions, one
+PCA covariance calculation counts `500000 * 128 * 129 / 2 = 4128000000`
+operations. The sweep declares a finite **10B** allowance, leaving headroom for
+PCA solver/validation and graph refinement without removing the work guard.
 It applies to training PCA and optimized final-router work; it does **not**
 replace the separate 3B training-assignment cap or guarantee that every graph
 operation fits. Keep guards enabled and retain any subsequent work-limit failure.
 
 ```bash
-export EVAL_TEMPFILES="$HOME/project/ann-eval/run01"  # must not exist
+export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-query-grid"
 export EVAL_CACHED="$HOME/project/ann-eval/cache"
-export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=15
-export IVF_INSERT_THREADS=8 IVF_INSERT_INPUT_POLICY=staged IVF_WARMUP_QUERIES=0
-unset IVF_GT_FILE
-bash benchmark/IVF/experiment.sh workloads --dry-run
+python3 benchmark/IVF/experiment.py
 ```
 
-Review the preview, then execute:
-
-```bash
-bash benchmark/IVF/experiment.sh workloads
-```
-
-The SIFT100M runner checks the profile and shared GT,
-then prepares/runs **query, insert, delete, update**, stopping at the first failure.
-It clears stale count, scheduler-seed, run-tag and cost-model overrides. Effective
-settings are recorded in `settings.env`; subprocesses do not change your shell exports.
-The existing prepare/run scripts perform input, cache and native-result validation.
+Retain the verified `DATA_BIN`, `QUERY_BIN`, `IVF_PQ_PREFIX` and `IVF_BUILD_DIR`
+locations from steps 1–3. Only locations are configurable in this runner; there
+are no tuning or resource overrides. The defaults use the dataset's shared inputs,
+PQ prefix `$(dirname "$DATA_BIN")/pq/pq64`, build tree `build/ivf-benchmark`, and
+the work/cache locations above. PQ64 validation checks full-source code shape and
+length, pivot dimensions and 64 chunks; native tools perform detailed validation.
+Settings are recorded in each sweep's `settings.env`; the runner does not change
+your parent shell's exports.
 
 | Recipe setting | Value |
 |---|---|
-| Training | Full-base LV+, 20 workers, seed 0; 15 passes plus final assignment |
+| Training | Full-base LV+, 16 workers, seed 0; 15 passes plus final assignment |
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
-| Workload search | nlist 200K, nprobe 64, router breadth 128, Recall@10 |
+| Query grid | Seven nlist values × fifteen nprobe values; router breadth 128; Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
-| Updates | 10% tail inserts/base deletes; 10 mixed rounds; update-driven, 16 foreground workers |
-| Sequential insertion | 8 workers, staged inputs; override with `IVF_INSERT_THREADS=1 IVF_INSERT_INPUT_POLICY=streaming` |
-| Warmup | 0 for workloads; 64 for grids, unless explicitly overridden |
+| Other workers | 16 mixed/OpenMP workers configured; no mixed workload runs; MKL uses one worker |
+| Warmup | 64 serial frozen-centroid queries per pass in the same native process |
+| Routing work allowance | 10,000,000,000 counted operations; separate assignment-search guard unchanged |
 
-Resources and execution-policy exports above remain overridable; main recipes fix 15 passes.
-Other training/search settings are fixed; use the individual workload scripts for
-other experiments. `IVF_TIMEOUT_S` defaults to 86400 seconds **per script or GT
-command**, using GNU `timeout`. There are no total/per-index deadline managers.
+Each prepare/query/GT command has a fixed **86400-second timeout**, using the
+shared Python process-group runner. Configurations and native processes execute
+sequentially; the complete grid may take days. There are no total/per-index deadline managers.
 Check free space on both input and work/cache filesystems before starting.
 
 `ensure_gt.py` ignores nonexistent shell paths, finds
-existing caches, and checks every query against every declared live population.
+existing caches, and checks every query against the 90M-row query-only base
+(`--query-only`), not unused insert/delete/mixed populations.
 It reuses a passing cache unchanged. Otherwise it recommends a sufficient depth,
 generates exact full-source GT with the existing helper, and checks the new file
 before returning its path. With no cache, it starts at K=1000; that is a starting
-depth, not a coverage guarantee. Set `IVF_GENERATE_GT=0` for `experiment.sh` to
-check/recommend without permitting an exact scan. For custom GT plans, call
+depth, not a coverage guarantee. This runner permits generation when no suitable
+cache exists. For check-only use or custom GT plans, call
 `ensure_gt.py --help`; `--gt-generator` selects a helper and `--cached-gt` prefers
 an existing cache. `IVF_BUILD_DIR` supplies the default generator location.
 
@@ -783,8 +776,8 @@ error, not permission to bypass validation. On failure, inspect that run's
 `error.json` and `generate-k*.log`, fix the cause, and rerun the same command.
 `ensure_gt.py` exits 3 when generation is needed and 1/2 on errors. No failure
 returns a GT path; the experiment runner exits nonzero and retains the phase log.
-The runner checks the GT command's exit status and returned path before preparing
-any index; a failed GT gate cannot fall through to benchmark execution.
+The runner checks the GT command's exit status before preparing any index;
+a failed GT gate cannot fall through to benchmark execution.
 
 Recommendation scans require NumPy and original uint8 squared-L2 inputs in at most
 128 dimensions. Defaults admit 32 scan queries and 256 MiB estimated scan workspace;
@@ -797,8 +790,7 @@ workload; existing exact-cache provenance remains your responsibility.
 
 GT runs entirely before index preparation and QPS measurement, without changing
 ANN settings, timing or scoring policy. Deeper shared GT does not make ten-column
-derived GT fully tie-aware. Preserve completed results; retry failed workloads in
-a fresh `EVAL_TEMPFILES` root with the same verified `EVAL_CACHED` bundle.
+derived GT fully tie-aware. Preserve completed results and failed evidence.
 
 Memory budgets check workspace estimates, not hard RAM caps. Keep these settings
 fixed across preparation and execution. Cache hits restore an index, not measure
@@ -810,137 +802,33 @@ rejects a budget smaller than the native per-frame allowance (payload plus
 4,096 bytes/frame); native composed admission still accounts for lists, locators,
 router and worker scratch. Passing this cheap lower-bound check is not a total-RAM
 guarantee. No existing manifests/cache identities are rewritten.
-Keep cache storage enabled for the normal four-workload loop: identical source,
-PQ, builder/library and build settings allow insert/delete/update preparation to
-restore the immutable base instead of repeating training. Restoration uses real
-verified copies, not shared writable heaps; it still takes I/O and disk space.
-`EVAL_CACHE_NO_STORE=1` prevents storing a new bundle but does **not** disable cache
-hits. Use an unused cache root (or a new `IVF_CACHE_TAG`) for a deliberately fresh
-build. Do not rebuild binaries or change build settings between those workload
-preparations if the goal is reuse.
+Cache restoration uses real verified copies, not shared writable heaps; it still
+takes I/O and disk space. Use a fresh cache location when measuring construction.
+Do not change binaries or build settings between preparations if the goal is reuse.
 
-Each workload starts independently from the same profile base. Insertions
-from the insert test do **not** carry into the delete test.
-Sequential insertion uses `IVF_INSERT_THREADS` (one by default); deletion remains
-serial. `QUERY_THREADS` controls later scoring. These insertion controls do not
-change the mixed worker split selected by `NTHREADS`. Centroids, PCA and PQ stay
-frozen across updates; the execution controls do not change ANN search budgets.
+### Fixed grid
 
-If selecting the optional staged-input policy, all requested insertion coordinates
-must pass memory admission before mutation. For this uint8/128D recipe the staged
-payload is 1.28 GB for SIFT100M's 10M inserts,
-in addition to pool/list/router/worker memory. Its version-2 insertion timing
-excludes source loading; streaming version 1 includes worker reads. Do not compare
-the two foreground rates as an isolated worker speedup. Keep preparation and
-writeback costs alongside mutation throughput.
-
-`IVF_WARMUP_QUERIES=64`, if explicitly selected, runs 64 serial frozen-centroid
-queries on the same index object before the timed final pass for sequential/query
-runs. In mixed runs it instead executes once before the continuous workload.
-It uses neither
-final queries nor GT, discards results and reports separate warmup time. It does
-not count toward the 10,000 scored queries or mixed foreground queries, and does
-not require a separate query process: mutation, writeback and scoring share the pool.
-Declare a fixed policy before evaluation; zero warmup is not a cold-cache guarantee.
-See [Insertion workers, input staging and same-process warmup](#insertion-workers-input-staging-and-same-process-warmup)
-for native options, failure behavior and matched-policy examples.
-
-These settings run **10 rounds**, each inserting/deleting 1M rows.
-There is **no required query ratio or total query quota**.
-IVF's `update_driven` mode replays the query pool until all mutations complete
-across all rounds, joins admitted queries, then scores all 10,000 queries once.
-One native process, mutable session and worker pool span the entire workload.
-Mutation rounds stay ordered; query workers can cross boundaries. Coordinates
-use one reusable largest-round staging buffer; initial staging is outside
-`mixed_wall_s`, later-round staging is included while queries continue. There is
-no checkpoint, reopen, worker restart, intermediate warmup or per-round recall.
-Record
-the actual query count and overlap. This workload does not require reproducing
-the external SPFresh tester's scheduler or scoring cadence.
-
-## 5. Read results and repeat
-
-Outputs are under `$EVAL_TEMPFILES/$DATASET/IVF/` in `query/`, `insert/`,
-`delete/` and `update/`.
-Retain logs, structured results and input identities.
-For sequential/query runs, inspect `execution_protocol.json` for the declared
-input/worker/warmup policy and native process wall cost (protocol version 2);
-`result.json` retains the native query, mutation and writeback metrics unchanged.
-The driver writes these metrics directly; no duplicate
-native/extracted JSON files are produced. Mixed runs retain
-`rounds/round_<r>.json` accounting records (no intermediate recall), one native
-root `result.json`, final `neighbors.bin`, one private heap, `round_schedule.txt`,
-`run.log`, and a version-3 `summary.json`. Query attribution to rounds is by
-completion, including queries crossing a boundary. `mixed_wall_s` is the single
-continuous interval, not summed worker time. Root final-pass `query_qps` is not
-concurrent foreground QPS. No workload creates a mutable checkpoint. Keep failed
-logs and owned heaps; a failed mutation session must not be reused.
-
-For three query repetitions at the same frozen settings:
-
-```bash
-bash benchmark/IVF/sift/query_sweep.sh \
-  --tag full-scale-repeated \
-  --nprobes 32 --rerank-factors 3 --threads 8 \
-  --repeats 3 --warmups 0 \
-  --memory-budget-gb 96 --buffer-frames 262144 --timeout 86400
-```
-
-This inherits the fixed `IVF_WARMUP_QUERIES` from step 4. With its default `0`,
-there is no explicit centroid warmup. Sweep `--warmups 1`, if separately declared,
-would add a discarded **whole driver process** per configuration; it does not
-warm the next process's buffer pool and is not equivalent to centroid warmup.
-Keep both policies consistent across repetitions and record them with results.
-
-For another complete run, choose a fresh work root and repeat the recipe in step 4
-without changing the frozen settings:
-
-```bash
-export EVAL_TEMPFILES="$HOME/project/ann-eval/run02"
-bash benchmark/IVF/experiment.sh workloads
-```
-
-Choose a new root for each repetition so preparation starts from the same IVF
-base. Do not delete failed evidence or change settings in response to final-set
-results. Tagged reruns from an existing IVF prepared base are also supported;
-the fresh-root recipe makes each repetition explicit.
-
-# Quickstart: SIFT100M wide query-only grid
-
-Use this **instead of step 4** of the SIFT quickstart after completing its
-[dependencies/build](#1-install-dependencies-and-get-the-project) and
-[SIFT100M input preparation](#3-prepare-the-inputs-once). Rebuild the IVF tools
-if they predate the query-only mutable-session change. Run from the repository
-root in the same persistent Bash terminal. No insert, delete or mixed workload
-is prepared or executed.
-
-This experiment prepares an independent index at each of the following **nlist
-values, in this exact order**:
+Indexes are prepared or reused in this exact **nlist order**:
 
 ```text
-100, 1000, 10000, 100000, 200000, 300000
+1000, 10000, 100000, 200000, 300000, 400000, 500000
 ```
 
-For each index, search a wide, fixed powers-of-two probe grid, never exceeding
-that index's list count:
+Every index uses these **nprobe values**, with requested router breadth **128**:
 
-| nlist | nprobe values | Query passes |
-|---:|---|---:|
-| 100 | 1, 2, 4, 8, 16, 32, 64 | 7 |
-| 1,000 | 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 | 10 |
-| 10,000; 100,000; 200,000; 300,000 | 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 | 14 each |
+```text
+16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 384, 512
+```
 
-There are **73 query passes**, each scoring all 10,000 queries, and six index
-preparations/cache restorations. The initial corpus remains **90M of the 100M
-source rows**, exactly as in the ordinary SIFT100M quickstart; this does not
+There are **105 query passes**, each scoring all 10,000 queries. Up to seven
+preparations/cache restorations are needed on a fresh root. The initial corpus
+remains **90M of the 100M source rows**; this does not
 silently switch to a 100M-live index. PQ64 and checked GT are reused across
 indexes, but centroids and routers are trained independently at each nlist.
 
-Fixed settings are full-base LV+ training with 15 passes, PCA-refined query/assignment
-routing, PCA variance 0.95, both rerank factors 3, requested router breadth 128,
-eight query workers, and 64 serial centroid warmup queries per pass. Effective
-query traversal breadth is `max(128, min(nlist, 3*nprobe))`, so high probes also
-increase router effort. This is not an exact reproduction of Lindorm's PQ4/SIMD
+Requested breadth is fixed, but native candidate admission may still increase
+traversal effort at high probes. No effective-breadth column is emitted.
+This is not an exact reproduction of Lindorm's PQ4/SIMD
 implementation or a matched-recall comparison by itself.
 
 Query-only execution forks each immutable base into a **private mutable session
@@ -951,116 +839,42 @@ its private `query.heap` and `query.heap.pq.bin` are deleted. Results, neighbors
 logs, prepared bases, and verified cache bundles are retained. Failed passes keep
 their artifacts; cleanup never recursively removes directories.
 
-## Wide-grid setup and preview
+## 5. Read results and repeat
 
-Retain the verified `DATA_BIN`, `QUERY_BIN`, `IVF_PQ_PREFIX`, and `IVF_BUILD_DIR`
-from steps 1–3. Choose a fresh absolute work root. Each command has a one-day
-timeout by default (`IVF_TIMEOUT_S`); the complete grid may take days.
+### Preparation reuse and retained evidence
 
-```bash
-export DATASET=sift100m
-export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-wide-grid-01"  # must not exist
-export EVAL_CACHED="$HOME/project/ann-eval/cache"
-export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=15
-export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
-unset IVF_GT_FILE
-bash benchmark/IVF/experiment.sh sift100m-wide --dry-run
-```
-
-Review the preview, then execute (this can take days):
+Use the same `EVAL_TEMPFILES` root to repeat the sweep:
 
 ```bash
-bash benchmark/IVF/experiment.sh sift100m-wide
+python3 benchmark/IVF/experiment.py
 ```
 
-### Follow-up: reuse the first run and refine 100K-400K
-
-For a second, exploratory run after the wide grid, use the commands below instead
-of the wide-grid commands. Keep the previous run intact;
-successful private query heaps need not exist, but its prepared base indexes,
-`prepared.json` files and `selected_gt.txt` must still exist. Use the same verified
-source/query/PQ inputs and retain the original base bundles unchanged.
-
-```bash
-export DATASET=sift100m
-export IVF_GRID_PREVIOUS_ROOT="$HOME/project/ann-eval/sift100m-wide-grid-01"
-export EVAL_TEMPFILES="$HOME/project/ann-eval/sift100m-refine-grid-01"  # fresh
-export EVAL_CACHED="$HOME/project/ann-eval/cache"
-# Keep the SAME DATA_BIN, QUERY_BIN, IVF_PQ_PREFIX and trained-base settings.
-export IVF_MEMORY_BUDGET_GB=96 IVF_QUERY_MEMORY_BUDGET_GB=96
-export IVF_MAX_REPS=15
-export IVF_BUFFER_FRAMES=262144 QUERY_THREADS=8 IVF_WARMUP_QUERIES=64
-unset IVF_GT_FILE
-bash benchmark/IVF/experiment.sh sift100m-refine --dry-run
-```
-
-Review the preview, then execute:
-
-```bash
-bash benchmark/IVF/experiment.sh sift100m-refine
-```
-
-This mode executes **80 passes**, in nlist order **100K, 200K, 300K, 400K**:
-
-- Probes at every nlist: **16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192,
-  224, 256, 384, 512**. This tightens the region around 90% and 95% recall and
-  retains low/high-effort anchors. A target not reached is reported, not assumed.
-- Requested breadth **128** everywhere; additionally **64 at probes 16/32**,
-  **256 at probes 48/64**, and **512 at probe 128**. These produce distinct
-  effective breadths. In particular, 64 and 128 are identical at probes >=48,
-  and 256 is ineffective once `3*nprobe >=256`; those duplicate trials are omitted.
-- Both rerank factors remain **3**, PCA variance remains **0.95**, and all query
-  passes still score the same 10,000 queries. Do not silently change the vector
-  shortlist or scoring definition while comparing nlist or breadth.
-
-**Reuse:** the first three indexes are queried directly from their existing
-prepared work trees, not retrained or re-copied into new preparations. New tagged
-query outputs live under those prepared trees' `runs/` directories; original
-results and prepared bases are not overwritten. Tags incorporate the new root's
-identity. Only 400K is prepared in the new root, with normal verified-cache reuse
-if a matching build already exists. PQ and source files are reused unchanged.
+Preparations live at stable paths:
+`$EVAL_TEMPFILES/nlist-N/sift100m/IVF/query/`. Completed matching preparations
+are queried directly; missing preparations are created with normal verified-cache
+reuse. Reuse requires matching fixed build settings, FAISS backend and PQ pivots.
+The lower-level harness still verifies prepared query/GT/index identities.
 Centroids/graphs/PCA cannot be reused between different nlist values.
 
-The previous `selected_gt.txt` supplies the full-source GT cache. Coverage is
-rechecked **without `--generate`**: missing/insufficient GT stops this follow-up
-rather than triggering a new full exact scan. Existing per-base derived GT is
-reused for old indexes; 400K derives equivalent base GT from the shared cache.
-Neither reuse nor deeper full-source GT guarantees that the derived ten-column
-scoring file contains all boundary ties (see saturation discussion below).
+Each invocation owns fresh evidence in `$EVAL_TEMPFILES/sweeps/run-0001/`,
+`run-0002/`, etc. Keep `settings.env`, `grid.tsv`, `results.csv`,
+`selected_gt.txt`, logs and `heap-cleanup.log`. The CSV contains native
+nlist/probe/requested breadth, Recall@10, QPS, query time and `output_dir`.
+Native `result.json` and `execution_protocol.json` remain in each tagged run
+under the preparation's `runs/run-0001_np16_rb128/`, etc.
 
-The 400K build uses a finite **5B routing-work allowance** because PCA covariance
-alone costs `400000 * 128 * 129 / 2 = 3302400000` operations. Existing bases retain
-their original settings and identities; their 3B allowance is not edited. All
-training guards remain enabled. Rebuild/restore is allowed only for the new 400K
-index; missing previous bases cause a failure, not an accidental retraining job.
-
-The new root holds `settings.env`, `grid.tsv`, `results.csv`, logs, and `heap-cleanup.log`.
-Use each CSV row's `output_dir` to find its native result: reused-index outputs
-are deliberately outside the new root. Successful private heaps are deleted as
-before, and originals/caches are preserved. This is post-observation exploratory
-tuning, not an independent held-out validation of the original sweep.
-
-### Runner options and retained evidence
-
-`bash benchmark/IVF/experiment.sh --help` shows the three supported recipes.
-The optional second argument `--dry-run` previews the schedule without reading
-inputs or creating paths. Paths and resources use environment variables, like the
-BufANN/SPFresh scripts. There are no legacy modes, compatibility options, nested
-deadline controllers or extra JSON plan/summary formats. No grid includes nlist 1M.
-
-Keep `settings.env`, `grid.tsv`, `results.csv`, `selected_gt.txt` and logs. The CSV
-contains native nlist/probe/breadth, Recall@10, QPS, query time and output path.
-Native `result.json` and `execution_protocol.json` remain in each run directory.
-The runner stops on failure and preserves its files; inspect the last command's
-log and retry in a fresh root. It checks previous `prepared.json` files exist;
-you are responsible for choosing matching previous experiment inputs/settings.
-The lower-level harness still verifies prepared query/GT/index identities.
-Freeze the settings and warmup policy before evaluation.
+The runner stops at the first failure and preserves evidence. A subsequent
+invocation reuses completed preparations and reruns the complete query grid with
+new tags. Partial or incompatible preparations are not overwritten: inspect the
+failure and choose another root if necessary. In particular, older 20-thread or
+3B/5B routing-allowance builds are not relabeled as this preset. Shared GT coverage
+is rechecked on every invocation; existing per-preparation derived GT is retained.
+Freeze settings and warmup policy before evaluation; post-observation tuning is
+not independent held-out validation.
 
 ### Investigating the approximately 99.559% recall ceiling
 
-The first wide grid approaches 99.559% at several different list counts. Over
+The historical 73-pass wide grid approached 99.559% at several list counts. Over
 10,000 queries at k=10, this corresponds to about **441 missing hit slots out of
 100,000**, not necessarily 441 failed queries. A stable aggregate does not prove
 the same individual neighbors were missed at each setting.

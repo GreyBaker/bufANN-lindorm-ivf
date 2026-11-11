@@ -127,6 +127,18 @@ print("generator stdout must not contaminate the returned path")
         self.assertEqual(out.getvalue(), first[1])
         self.assertTrue((self.root / "groundtruth/.gt/run-0001/result.json").is_file())
 
+    def test_query_only_reuses_cache_that_does_not_cover_deletions(self):
+        cache(self.gt, self.base, 12)  # Ten tail IDs, then two IDs in the query-only base.
+        before = self.gt.read_bytes()
+        with patch.object(manager.depth, 'recommend', side_effect=AssertionError('must not scan')):
+            code, stdout, stderr, calls = self.run_manager(['--query-only', '--generate'])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout.strip(), str(self.gt.resolve()))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.gt.read_bytes(), before)
+        plan = json.loads((self.latest() / 'plan.json').read_text())
+        self.assertEqual([state['name'] for state in plan['states']], ['query'])
+
     def test_missing_export_discovers_legacy_cache(self):
         cache(self.gt, self.base, 100)
         with patch.dict(os.environ, GT_BIN_KCACHED=str(self.root / "full-query.gt-old-stale.bin")):

@@ -110,6 +110,25 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(output.read_text())["plan"], plan)
 
+    def test_query_only_plan_and_coverage_ignore_mutation_populations(self):
+        args = self.plan_args(['--query-only', '--insert-count', '5'])
+        states, plan = coverage.resolved_plan(args)
+        self.assertEqual(states, [coverage.State('query', 90)])
+        self.assertEqual(coverage.planned_states(args), states)
+        self.assertEqual(plan, {'base_count': 90, 'query_only': True})
+        write_gt(self.gt, [[80, 81, 90]])
+        self.assertEqual(self.cli().returncode, 3)  # Delete population underflows.
+        output = self.root / 'query-only.json'
+        result = self.cli(['--query-only', '--json-output', str(output)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(output.read_text())
+        self.assertEqual(report['plan'], plan)
+        self.assertEqual([s['name'] for s in report['states']], ['query'])
+        for extra, error in ((['--base-count', '100'], 'require 0 < base'),
+                             (['--k-out', '91'], 'K exceeds the query base')):
+            with self.assertRaisesRegex(ValueError, error):
+                coverage.resolved_plan(self.plan_args(['--query-only', *extra]))
+
     def test_resolved_plan_retains_validation_order(self):
         for extra, error in ((["--base-count", "100", "--k-out", "1000"], "require 0 < base"),
                              (["--insert-count", "5"], "mixed inserts: count must divide rounds"),
