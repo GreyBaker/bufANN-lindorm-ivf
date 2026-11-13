@@ -11,6 +11,7 @@
 
 #include "bufann/inplace_backend.h"
 #include "bufann/ivf_io.h"
+#include "bufann/ivf_defaults.h"
 #include "bufann/ivf_pin_admission.h"
 
 namespace diskann::ivf {
@@ -20,8 +21,8 @@ namespace diskann::ivf {
   struct HeapOptions {
     uint32_t dim = 0;
     uint32_t id_capacity = 0;
-    uint32_t page_size = 4096;
-    uint32_t buffer_frames = 64;
+    uint32_t page_size = defaults::page_size;
+    uint32_t buffer_frames = defaults::buffer_frames;
   };
   struct BatchCopyResult {
     std::vector<uint8_t> present;

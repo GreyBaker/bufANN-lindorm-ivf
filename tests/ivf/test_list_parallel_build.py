@@ -45,7 +45,8 @@ def main():
                                "--data_file", str(data), "--pq_prefix", str(pq), "--index_prefix", str(prefix),
                                "--nlist", "8", "--trainer_mode", "exact", "--init", "random_partition",
                                "--max_reps", "1", "--sample_rate", "1", "--seed", "31",
-                               "--build_threads", str(threads), "--memory_budget_gb", "1",
+                                "--build_threads", str(threads), "--memory_budget_gb", "1",
+                                "--buffer_frames", "64",
                                "--optimized_modes", "1" if mode != "faiss" else "0", "--router_mode", mode]
                     result = subprocess.run(command, text=True, capture_output=True, timeout=90)
                     assert result.returncode == 0, (command, result.stdout, result.stderr)

@@ -59,12 +59,12 @@ def fixture(args, root, dtype, fmt):
     for count in (None, 0, 5):
         cmd, output, _, _, _, gold = command(count)
         record = run(cmd, "query")
-        check(record, count or 0)
+        check(record, 64 if count is None else count)
         assert read_results(output) == [row[:4] for row in gold]
         raw = output.read_bytes()
         first = raw if first is None else first
         assert raw == first
-        if count is None:
+        if count == 0:
             base_allowance = record["estimated_workspace_bytes"]
     budget = format((base_allowance + 8) / (1 << 30), ".17g")
     for count in (0, 5):

@@ -15,7 +15,7 @@ from common import (
 from harness import ROUTER_BACKEND_ID, component_digests, driver_open_command, prepare as prepare_base
 from settings import (
     prepared_selection, profile, query_policy_flags, query_router_flags, query_search_flags,
-    runtime_resources, warmup_queries,
+    MIXED_THREADS, runtime_resources, warmup_queries,
 )
 
 
@@ -111,7 +111,7 @@ def run(args):
         dest = output / name
         require_absent(dest, f"mixed output exists: {dest}")
     scheduler = os.environ.get("IVF_SCHEDULER", "update_driven")
-    threads = os.environ.get("NTHREADS", "16")
+    threads = os.environ.get("NTHREADS", MIXED_THREADS)
     require(
         scheduler in ("update_driven", "weighted", "fixed_8_8")
         and threads.isdigit()

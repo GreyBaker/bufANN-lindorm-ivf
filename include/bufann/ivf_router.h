@@ -40,13 +40,13 @@ namespace diskann::ivf {
     uint32_t   query_breadth = 128;
     uint32_t   insert_breadth = 64;
     uint32_t   seed = 100;
-    uint64_t   memory_budget_bytes = 1024ull * 1024 * 1024;
-    bool       native_modes = false;
-    RouterMode mode = RouterMode::Faiss;  // Persisted build/insert default.
+    uint64_t   memory_budget_bytes = defaults::memory_budget_bytes;
+    bool       native_modes = true;
+    RouterMode mode = RouterMode::PCARefined;  // Persisted build/insert default.
     uint32_t   refine_breadth = 128;
     bool       refine_reverse_edges = false;
     double     pca_variance = .95, router_rerank_factor = 3;
-    uint64_t   native_work_limit = 1000000000;
+    uint64_t   native_work_limit = defaults::routing_work_limit;
   };
   struct CentroidHit {
     uint32_t list_id;
@@ -68,7 +68,7 @@ namespace diskann::ivf {
     void save(const std::string& prefix) const;
     static std::unique_ptr<CentroidRouter> load(
         const std::string& prefix,
-        uint64_t           memory_budget_bytes = 1024ull * 1024 * 1024);
+        uint64_t           memory_budget_bytes = defaults::memory_budget_bytes);
     ~CentroidRouter();
     CentroidRouter(const CentroidRouter&) = delete;
     CentroidRouter& operator=(const CentroidRouter&) = delete;

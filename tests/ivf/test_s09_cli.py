@@ -98,6 +98,8 @@ def main():
                     build += ["--training_rerank_factor", "2.25", "--training_refine_breadth", "16"]
                 if native:
                     build += ["--optimized_modes", "1", "--router_mode", "pca-refined"]
+                else:
+                    build += ["--optimized_modes", "0", "--router_mode", "faiss"]
                 record = run(build, "build")
                 assert (
                     record["trainer_mode"] == mode and record["trainer_init"] == "random_partition"
@@ -227,7 +229,7 @@ def main():
                     ["--trainer_mode", "unknown"],
                     ["--init", "unknown"],
                     ["--training_breadth", "0"],
-                    ["--training_rerank_factor", "4"],
+                    ["--trainer_mode", "ann-reuse-seeded", "--training_rerank_factor", "4"],
                     ["--trainer_mode", "lv", "--init", "sample"],
                     ["--trainer_mode", "lv", "--training_refine_breadth", "0"],
                 )
@@ -250,6 +252,8 @@ def main():
                     "7",
                     "--optimized_modes",
                     str(version - 1),
+                    "--router_mode",
+                    "faiss",
                 ]
                 run(legacy, "build")
                 manifest = Path(str(prefix) + ".manifest")
@@ -335,7 +339,7 @@ def main():
         os.environ["IVF_NLIST"] = "4"
         settings = harness.build_settings()
         assert (
-            settings["trainer_mode"] == "ann-reuse-seeded"
+            settings["trainer_mode"] == "lv-plus"
             and settings["init"] == "random_partition"
         )
         for key, value in (

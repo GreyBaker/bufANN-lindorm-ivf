@@ -68,6 +68,9 @@ namespace {
         }
     }
     BuildConfig config;
+    config.trainer_mode = TrainerMode::AnnRebuild;
+    config.init = CentroidInit::Sample;
+    config.build_threads = 1;
     config.data_type = type;
     config.dim = 13;
     config.base_count = 240;
@@ -76,6 +79,12 @@ namespace {
     config.sample_rate = .8;
     config.seed = 777;
     RouterOptions options;
+    require(options.native_modes && options.mode == RouterMode::PCARefined &&
+                options.native_work_limit == 10000000000ull &&
+                options.memory_budget_bytes == (96ull << 30),
+            "implementation router defaults changed");
+    options.native_modes = false;
+    options.mode = RouterMode::Faiss;
     options.insert_breadth = 8;
     auto exact = train_centroids(path, config);
     auto ann = train_centroids_hnsw(path, config, options);
@@ -118,6 +127,8 @@ namespace {
     for (auto& x : centroids)
       x = random_value();
     RouterOptions options;
+    options.native_modes = false;
+    options.mode = RouterMode::Faiss;
     options.query_breadth = 192;
     options.insert_breadth = 96;
     auto router = CentroidRouter::build(dim, centroids, options);
@@ -333,6 +344,8 @@ namespace {
       }
     }
     BuildConfig config;
+    config.trainer_mode = TrainerMode::AnnRebuild;
+    config.init = CentroidInit::Sample;
     config.dim = 13;
     config.base_count = 32;
     config.nlist = 4;

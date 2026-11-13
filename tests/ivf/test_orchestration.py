@@ -29,30 +29,32 @@ class SharedOrchestrationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def test_legacy_build_settings_and_query_override_isolation(self):
+    def test_build_defaults_and_query_override_isolation(self):
         expected = {
             "nlist": "8",
             "sample_rate": "1",
             "max_reps": "15",
             "seed": "0",
-            "build_threads": "1",
-            "memory_budget_gb": "1",
+            "build_threads": "16",
+            "memory_budget_gb": "96",
             "page_size": "4096",
-            "buffer_frames": "64",
+            "buffer_frames": "262144",
             "router_degree": "16",
             "construction_breadth": "200",
             "query_breadth": "128",
             "insert_breadth": "64",
             "router_seed": "100",
-            "optimized_modes": "0",
+            "optimized_modes": "1",
             "refine_ef": "128",
             "pca_variance": "0.95",
-            "routing_work_limit": "1000000000",
-            "trainer_mode": "ann-reuse-seeded",
+            "routing_work_limit": "10000000000",
+            "trainer_mode": "lv-plus",
             "init": "random_partition",
             "training_breadth": "64",
-            "router_mode": "faiss",
+            "router_mode": "pca-refined",
             "router_rerank_factor": "3",
+            "training_rerank_factor": "3",
+            "training_refine_breadth": "128",
         }
         with patch.dict(os.environ, {"IVF_NLIST": "8"}, clear=True):
             self.assertEqual(settings.build_settings(), expected)
@@ -77,10 +79,12 @@ class SharedOrchestrationTests(unittest.TestCase):
             actual = settings.build_settings()
             self.assertEqual(actual["training_rerank_factor"], "3")
             self.assertNotIn("training_refine_breadth", actual)
-        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
-            ValueError, "set IVF_NLIST"
-        ):
-            settings.build_settings()
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(settings.build_settings(), dict(expected, nlist="400000"))
+            self.assertEqual(settings.query_search_flags(),
+                             ["--nprobe", "96", "--rerank_factor", "3", "--query_threads", "8"])
+            self.assertEqual(settings.warmup_queries(), "64")
+            self.assertEqual(settings.build_settings(settings.DEFAULT_ENV), dict(expected, nlist="400000"))
 
     def test_historical_and_declared_report_policy(self):
         report = {
@@ -167,10 +171,10 @@ class SharedOrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "result framing/query range"):
             audit(gt, result, base_count=3, k=1, query_offset=1)
 
-    def test_resource_lower_bound_and_unchanged_defaults(self):
+    def test_resource_lower_bound_and_implementation_defaults(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(settings.runtime_resources(4096),
-                             {"buffer_frames": "64", "page_size": "4096", "memory_budget_gb": "1"})
+                              {"buffer_frames": "262144", "page_size": "4096", "memory_budget_gb": "96"})
             os.environ.update(IVF_BUFFER_FRAMES="262144", IVF_MEMORY_BUDGET_GB="96", IVF_NLIST="8")
             self.assertEqual(settings.build_settings()["buffer_frames"], "262144")
             self.assertEqual(settings.runtime_resources(4096)["memory_budget_gb"], "96")
@@ -226,7 +230,8 @@ class SharedOrchestrationTests(unittest.TestCase):
         args = argparse.Namespace(work_dir=self.root, workload="insert", output_dir=self.root / "runs",
                                   update_count=10000000, dim=128, dtype="float")
         for policy, expected in (("unknown", "IVF_INSERT_INPUT_POLICY"), ("staged", "staging and frame")):
-            with patch.dict(os.environ, {"IVF_INSERT_INPUT_POLICY": policy}, clear=True), \
+            with patch.dict(os.environ, {"IVF_INSERT_INPUT_POLICY": policy, "IVF_MEMORY_BUDGET_GB": "1",
+                                         "IVF_BUFFER_FRAMES": "64"}, clear=True), \
                  patch.object(common.subprocess, "Popen") as launch, self.assertRaisesRegex(ValueError, expected):
                 harness.run(args)
             launch.assert_not_called()
@@ -234,7 +239,7 @@ class SharedOrchestrationTests(unittest.TestCase):
 
     def test_independent_warmup_setting_and_preflight(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(settings.warmup_queries(), "0")
+            self.assertEqual(settings.warmup_queries(), "64")
             for value in ("0", "1", "100000"):
                 os.environ["IVF_WARMUP_QUERIES"] = value
                 self.assertEqual(settings.warmup_queries(), value)
@@ -331,10 +336,10 @@ class SharedOrchestrationTests(unittest.TestCase):
     def test_query_flags_preserve_defaults_order_and_validated_warmups(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(settings.query_search_flags(), [
-                "--nprobe", "1", "--rerank_factor", "2", "--query_threads", "1",
+                "--nprobe", "96", "--rerank_factor", "3", "--query_threads", "8",
             ])
             self.assertEqual(settings.query_policy_flags(settings.warmup_queries()),
-                             ["--warmup_queries", "0"])
+                             ["--warmup_queries", "64"])
             os.environ.update(IVF_NPROBE="4", IVF_RERANK_FACTOR="3.0", QUERY_THREADS="2",
                               IVF_ROUTER_MODE="pca", IVF_ROUTER_RERANK_FACTOR="5",
                               IVF_ROUTER_BREADTH="64", IVF_WARMUP_QUERIES="7")
@@ -446,6 +451,7 @@ class SharedOrchestrationTests(unittest.TestCase):
         env = {
             "IVF_DRIVER_BIN": "fake-driver", "IVF_MEMORY_BUDGET_GB": "3",
             "IVF_QUERY_MEMORY_BUDGET_GB": "2", "IVF_WARMUP_QUERIES": "7",
+            "IVF_BUFFER_FRAMES": "64",
             "IVF_ROUTER_MODE": "pca", "IVF_SCHEDULER": "weighted", "NTHREADS": "8",
         }
         with patch.dict(os.environ, env, clear=True), \
@@ -495,7 +501,8 @@ class SharedOrchestrationTests(unittest.TestCase):
                 (work / (workload + "_ids.bin")).write_bytes(struct.pack("<II", 1, row))
                 (work / "mutation_prepared.json").write_text(json.dumps(harness.mutation_identity(args, work)))
                 # Exercise both sides of the shared-session minimum-budget rule.
-                with patch.dict(os.environ, {"IVF_MEMORY_BUDGET_GB": "3" if workload == "insert" else "1"}):
+                with patch.dict(os.environ, {"IVF_MEMORY_BUDGET_GB": "3" if workload == "insert" else "1",
+                                             "IVF_BUFFER_FRAMES": "64"}):
                     harness.run(args)
                 command = commands[-1]
                 self.assertEqual(command[command.index("--workload") + 1], workload + "_then_search")
@@ -513,7 +520,7 @@ class SharedOrchestrationTests(unittest.TestCase):
             "fake-driver", "--validate_inputs", "0", "--data_type", "float", "--metric", "l2",
             "--dim", "2", "--nlist", "2", "--index_prefix", str(prefix),
         ]
-        search = ["--nprobe", "1", "--rerank_factor", "2", "--query_threads", "1"]
+        search = ["--nprobe", "96", "--rerank_factor", "3", "--query_threads", "8"]
         policy = ["--router_mode", "pca", "--warmup_queries", "7"]
         query_out = work / "query-run"
         self.assertEqual(commands[0], opening + [

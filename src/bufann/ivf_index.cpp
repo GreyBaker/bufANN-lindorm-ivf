@@ -184,6 +184,12 @@ namespace diskann::ivf {
           backend == router_backend_id,
           "Unsupported IVF index producer; rebuild with faiss-1.9.0-cpu1");
       IndexManifest m;
+      // Missing fields in older manifests retain their historical meaning,
+      // independently of defaults used for new builds.
+      m.training.trainer_mode = TrainerMode::AnnRebuild;
+      m.training.init = CentroidInit::Sample;
+      m.routing.native_modes = false;
+      m.routing.mode = RouterMode::Faiss;
       m.format_version = uint32_t(version.back() - '0');
       std::string dtype;
       in >> dtype;

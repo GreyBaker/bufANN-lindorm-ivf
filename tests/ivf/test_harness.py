@@ -95,6 +95,8 @@ def main():
             IVF_GT_FILE=str(truth),
             IVF_MAX_REPS="2",
             IVF_BUILD_THREADS="2",
+            IVF_BUFFER_FRAMES="64",
+            IVF_MEMORY_BUDGET_GB="1",
             IVF_NPROBE="2",
             IVF_RERANK_FACTOR="3",
             QUERY_THREADS="2",
@@ -360,7 +362,7 @@ def main():
             assert protocol["native_driver_process_count"] == 1
             assert "same_session_scoring" in protocol["process_boundary_policy"]
             assert protocol["application_cache_transfer_between_driver_processes"] is False
-            assert protocol["explicit_warmup_query_count"] == 0
+            assert protocol["explicit_warmup_query_count"] == 64
             assert protocol["canonical_native_query_metrics_rewritten"] is False
             assert protocol["harness_workflow_wall_s"] >= protocol["native_process_wall_s"] >= final["driver_workflow_time_s"]
             assert final["writeback_dirty_pages_after"] == 0 and final["update_protocol_version"] == 4

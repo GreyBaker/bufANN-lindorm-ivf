@@ -112,6 +112,7 @@ def main():
                 IVF_NLIST="1",
                 IVF_MAX_REPS="1",
                 IVF_BUILD_THREADS="1",
+                IVF_MEMORY_BUDGET_GB="1",
                 IVF_BUFFER_FRAMES="2",
                 UPDATE_PERCENT="25",
                 UPDATE_BATCH="8",

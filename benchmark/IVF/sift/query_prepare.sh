@@ -2,7 +2,6 @@
 set -euo pipefail
 WORKLOAD=query
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_profile.sh"
-ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing pivots plus full-source PQ codes}"
 [[ -f "$DATA_BIN" && -f "$QUERY_BIN" ]] || error "stage the configured .bin inputs first"
 ivf_prepare_work_dir

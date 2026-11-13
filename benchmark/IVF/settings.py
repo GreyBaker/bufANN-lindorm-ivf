@@ -1,7 +1,7 @@
 """IVF build settings and frozen calibration-selection contracts.
 
-Keep environment/CLI defaults separate from the native library's legacy defaults.
-Legacy cache-key fields and historical report interpretations are intentional.
+New build/query defaults match the native implementation. Explicit overrides,
+legacy cache-key fields and historical report interpretations are preserved.
 """
 
 import json
@@ -15,27 +15,46 @@ ROUTER_BACKEND_ID = "faiss-1.9.0-cpu1"
 
 
 BUILD_DEFAULTS = {
-    "nlist": None,
+    "nlist": "400000",
     "sample_rate": "1",
     "max_reps": "15",
     "seed": "0",
-    "build_threads": "1",
-    "memory_budget_gb": "1",
+    "build_threads": "16",
+    "memory_budget_gb": "96",
     "page_size": "4096",
-    "buffer_frames": "64",
+    "buffer_frames": "262144",
     "router_degree": "16",
     "construction_breadth": "200",
     "query_breadth": "128",
     "insert_breadth": "64",
     "router_seed": "100",
-    "optimized_modes": "0",
+    "optimized_modes": "1",
     "refine_ef": "128",
     "pca_variance": "0.95",
-    "routing_work_limit": "1000000000",
-    "trainer_mode": "ann-reuse-seeded",
+    "routing_work_limit": "10000000000",
+    "trainer_mode": "lv-plus",
     "init": "random_partition",
     "training_breadth": "64",
 }
+
+QUERY_DEFAULTS = {"nprobe": "96", "rerank_factor": "3", "query_threads": "8"}
+WARMUP_QUERIES = "64"
+MIXED_THREADS = "16"
+ASSIGNMENT_ROUTER_MODE = "pca-refined"
+
+# Shared normal-run environment, also used to freeze the experiment preset.
+# Paths, datasets, PQ formats, sweep grids and timeouts are not library defaults.
+DEFAULT_ENV = {"IVF_" + key.upper(): value for key, value in BUILD_DEFAULTS.items()}
+DEFAULT_ENV.update({
+    "IVF_TRAINING_RERANK_FACTOR": "3", "IVF_TRAINING_REFINE_BREADTH": "128",
+    "IVF_ASSIGNMENT_ROUTER_MODE": ASSIGNMENT_ROUTER_MODE, "IVF_BUILD_ROUTER_RERANK_FACTOR": "3",
+    "IVF_ROUTER_MODE": ASSIGNMENT_ROUTER_MODE, "IVF_ROUTER_RERANK_FACTOR": "3", "IVF_ROUTER_BREADTH": "128",
+    "IVF_NPROBE": QUERY_DEFAULTS["nprobe"], "IVF_RERANK_FACTOR": QUERY_DEFAULTS["rerank_factor"],
+    "QUERY_THREADS": QUERY_DEFAULTS["query_threads"], "IVF_WARMUP_QUERIES": WARMUP_QUERIES,
+    "IVF_QUERY_MEMORY_BUDGET_GB": BUILD_DEFAULTS["memory_budget_gb"], "NTHREADS": MIXED_THREADS,
+    "OMP_NUM_THREADS": BUILD_DEFAULTS["build_threads"], "OMP_THREAD_LIMIT": BUILD_DEFAULTS["build_threads"],
+    "MKL_NUM_THREADS": "1",
+})
 
 # Calibration has its own sampling, scan-profile and work allowances. Preserve
 # its existing spellings/values rather than normalizing historical plan settings.
@@ -88,9 +107,8 @@ def query_router_flags():
 
 def query_search_flags():
     return flags({
-        "nprobe": os.environ.get("IVF_NPROBE", "1"),
-        "rerank_factor": os.environ.get("IVF_RERANK_FACTOR", "2"),
-        "query_threads": os.environ.get("QUERY_THREADS", "1"),
+        key: os.environ.get("QUERY_THREADS" if key == "query_threads" else "IVF_" + key.upper(), value)
+        for key, value in QUERY_DEFAULTS.items()
     })
 
 
@@ -114,7 +132,7 @@ def insertion_input_policy():
 
 
 def warmup_queries():
-    value = int(os.environ.get("IVF_WARMUP_QUERIES", "0"))
+    value = int(os.environ.get("IVF_WARMUP_QUERIES", WARMUP_QUERIES))
     require(0 <= value <= 100000, "IVF_WARMUP_QUERIES must be in [0, 100000]")
     return str(value)
 
@@ -361,17 +379,14 @@ def build_settings(env=None):
         if result["trainer_mode"] in ("lv", "lv-plus") or value is not None:
             result[key] = default if value is None else value
     # Query-only mode/factor overrides do not alter the build/cache identity.
-    result["router_mode"] = env.get("IVF_ASSIGNMENT_ROUTER_MODE", "faiss")
+    result["router_mode"] = env.get("IVF_ASSIGNMENT_ROUTER_MODE", ASSIGNMENT_ROUTER_MODE)
     result["router_rerank_factor"] = env.get("IVF_BUILD_ROUTER_RERANK_FACTOR", "3")
     if env.get("IVF_COST_MODEL_REPORT"):
         chosen = read_cost_model_report(env["IVF_COST_MODEL_REPORT"])["selected_nlist"]
         require(
-            result["nlist"] is None or int(result["nlist"]) == chosen,
+            "IVF_NLIST" not in env or int(result["nlist"]) == chosen,
             "IVF_NLIST disagrees with cost-model selection",
         )
         result["nlist"] = str(chosen)
-    require(
-        result["nlist"] is not None, "set IVF_NLIST explicitly or provide IVF_COST_MODEL_REPORT"
-    )
     validate_resources(result)
     return result

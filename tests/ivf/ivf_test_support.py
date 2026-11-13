@@ -187,8 +187,10 @@ def build_tiny_population(build_executable, root, dtype, fmt, *,
     write_matrix(Path(str(pq) + "_pq_compressed.bin"), [bytes(2)] * 64, "B")
     build = [build_executable, "--validate_inputs", "0", "--data_type", dtype,
              "--data_file", str(data), "--pq_prefix", str(pq), "--index_prefix", str(prefix),
-             "--dim", "3", "--base_count", "8", "--nlist", "2", "--max_reps", "2",
-             "--build_threads", "2", "--query_breadth", "2", "--insert_breadth", "2"]
+              "--dim", "3", "--base_count", "8", "--nlist", "2", "--max_reps", "2",
+              "--build_threads", "2", "--query_breadth", "2", "--insert_breadth", "2",
+              "--buffer_frames", "64", "--memory_budget_gb", "1",
+              "--trainer_mode", "ann-reuse-seeded", "--optimized_modes", "0", "--router_mode", "faiss"]
     run_build(build, "build")
     source_hash = hashlib.sha256(data.read_bytes()).hexdigest()
     originals = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in work.glob("base.*")}

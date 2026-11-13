@@ -150,6 +150,11 @@ namespace {
     check(element_size(DataType::Float) == 4, "float size");
     rejects([] { parse_data_type("UInt8"); }, "unexpected dtype accepted");
     BuildConfig build;
+    check(build.nlist == 400000 && build.max_reps == 15 &&
+              build.build_threads == 16 && build.memory_budget_gb == 96 &&
+              build.trainer_mode == TrainerMode::LVPlus &&
+              build.init == CentroidInit::RandomPartition,
+          "implementation build defaults changed");
     build.dim = 128;
     build.base_count = 1000;
     build.nlist = 100;
@@ -168,6 +173,9 @@ namespace {
     build.memory_budget_gb = std::numeric_limits<double>::infinity();
     rejects([&] { build.validate(); }, "infinite budget accepted");
     SearchConfig search;
+    check(search.nprobe == 96 && search.rerank_factor == 3 && search.query_threads == 8,
+          "implementation search defaults changed");
+    search.nprobe = 1;  // Tiny one-list contract, not the production default.
     search.recall_at = 3;
     search.rerank_factor = 1.5;
     search.validate(1);

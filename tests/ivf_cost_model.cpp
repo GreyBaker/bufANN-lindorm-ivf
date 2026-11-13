@@ -279,6 +279,8 @@ int main(int argc, char** argv) {
     config.build_threads = args.u32("--build_threads", 1);
     config.memory_budget_gb =
         double(budget - retained) / (1024.0 * 1024 * 1024);
+    // Calibration retains its independent, historical control defaults.
+    config.trainer_mode = TrainerMode::AnnReuseSeeded;
     ivf_cli::read_training_settings(args, config);
     RouterOptions routing;
     routing.mode = parse_router_mode(args.get("--router_mode", "faiss"));

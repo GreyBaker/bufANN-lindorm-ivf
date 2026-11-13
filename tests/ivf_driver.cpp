@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
              "search_only|insert_only|delete_only|insert_then_search|delete_then_search|search_after_update|mixed\n"
              "  [--pq_prefix PATH] [--gt_file PATH] [--recall_at N] "
              "[--query_threads N]\n"
-             "  [--warmup_queries 0..100000] (default 0, frozen base-centroid "
+              "  [--warmup_queries 0..100000] (default 64, frozen base-centroid "
              "inputs; no GT)\n"
              "  [--nprobe N] [--rerank_factor F] [--metric l2]\n"
              "  [--full_data_file PATH --insert_ids_file PATH "
@@ -133,11 +133,11 @@ int main(int argc, char** argv) {
     if (dim == 0)
       throw std::invalid_argument("dim must be positive");
     SearchConfig config;
-    config.nprobe = args.u32("--nprobe", 1);
+    config.nprobe = args.u32("--nprobe", config.nprobe);
     config.recall_at = args.u32("--recall_at", 10);
-    config.query_threads = args.u32("--query_threads", 1);
-    config.rerank_factor = args.real("--rerank_factor", 2.0);
-    config.validate(args.u32("--nlist"));
+    config.query_threads = args.u32("--query_threads", config.query_threads);
+    config.rerank_factor = args.real("--rerank_factor", config.rerank_factor);
+    config.validate(args.u32("--nlist", defaults::nlist));
     const std::string prefix = args.require("--index_prefix");
     const std::string workload = args.require("--workload");
     if (workload != "search_only" && workload != "insert_only" &&

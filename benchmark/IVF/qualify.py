@@ -32,6 +32,7 @@ from common import (
     values,
     write_json,
 )
+from settings import BUILD_DEFAULTS
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -506,7 +507,7 @@ def main():
             p.add_argument(
                 "--routing-work-limit",
                 type=positive,
-                default=1000000000,
+                default=int(BUILD_DEFAULTS["routing_work_limit"]),
                 help="per-setup refinement/PCA work allowance",
             )
             p.add_argument(
@@ -519,7 +520,7 @@ def main():
                 p.add_argument("--" + field, required=True)
             p.add_argument("--repeats", type=positive, required=True)
             p.add_argument("--warmups", type=int, default=0)
-            p.add_argument("--buffer-frames", type=positive, default=64)
+            p.add_argument("--buffer-frames", type=positive, default=int(BUILD_DEFAULTS["buffer_frames"]))
             p.add_argument("--recall-at", type=positive, required=True)
             p.add_argument(
                 "--min-recall",

@@ -49,7 +49,7 @@ requirement to use the same files or download pipeline as SPFresh.
 ## 3. Generate ground truth
 
 For uint8 squared-L2 prefix/tail-update workloads, use the
-[one-command GT workflow](#4-configure-and-run-all-four-workloads) after configuring the
+[one-command GT workflow](#4-configure-and-run-the-query-sweep) after configuring the
 actual update plan. The SIFT quickstart below integrates it in step 4. The legacy
 helper below remains available for independently generated inputs:
 
@@ -117,11 +117,31 @@ workers and searches until mutations complete, with no query-ratio/count quota.
 `QUERY_THREADS` controls post-update scoring, not that split.
 Recall is scored after workers join, separately from concurrent query timing.
 
-Query defaults: `IVF_NPROBE=1`,
-`IVF_RERANK_FACTOR=2`, `QUERY_THREADS=1` and the profile's `RECALL_AT`.
-The example explicitly selects full-base LV+ training and optimized final routing;
-it does not change CLI/harness defaults. See the ablation settings below for other
-training and router choices. The full-scale quickstart handles SIFT100M's pass cap.
+### Implementation defaults
+
+New library/CLI builds and the workload harness use the same defaults:
+
+| Setting | Default |
+|---|---|
+| Lists / probes | `nlist=400000`, `nprobe=96` |
+| Training | Full-base LV+, random partition, 15 passes, seed 0, 16 build workers |
+| Assignment / query router | PCA-refined; PCA variance 0.95; breadth 128; centroid rerank factor 3 |
+| Training routing | Breadth 64, rerank factor 3, refinement breadth 128 |
+| Vector reranking / query workers | Factor 3 / 8 workers |
+| Resources | 96 GiB allowance, 4096-byte pages, 262144 frames (1 GiB payload) |
+| Routing work | Finite 10B allowance; independent 3B assignment-search guard unchanged |
+| Warmup / mixed workers | 64 frozen-centroid warmup queries / 16 mixed workers |
+
+Defaults live in `include/bufann/ivf_defaults.h`, native configuration structs,
+and `benchmark/IVF/settings.py`; `experiment.py` imports the shared Python preset.
+Native flags and workload environment variables still override them. Smaller
+datasets/tests must explicitly select smaller list/probe counts and buffer pools;
+there is no automatic clamping. Budgets are admission estimates, not hard RAM caps.
+Query routing without an override uses the index's persisted router settings,
+including for older indexes. Existing artifacts are not relabeled or migrated;
+new default build settings produce different cache identities where appropriate.
+Calibration and diagnostic control profiles keep their own explicit settings.
+Dataset paths, external PQ width and sweep grids are not implementation defaults.
 
 Work files live in `eval_tempfiles/<dataset>/IVF/<workload>/`; reusable immutable
 bundles live in `eval_cached/<dataset>/IVF/`. Runs retain logs, one native
@@ -266,14 +286,13 @@ most 65,536 completion-order samples, labeled in the result. Actual query counts
 and overlaps may be zero for very short batches. Already-admitted queries join
 before final stable-state scoring. Mixed execution does not export checkpoints.
 
-CLI/harness training defaults are `IVF_TRAINER_MODE=ann-reuse-seeded`,
+CLI/harness training defaults are `IVF_TRAINER_MODE=lv-plus`,
 `IVF_INIT=random_partition`, `IVF_TRAINING_BREADTH=64`, `IVF_SAMPLE_RATE=1`,
 `IVF_MAX_REPS=15` and `IVF_SEED=0`.
-The operational examples and quickstart explicitly override the trainer to
-`lv-plus` while keeping `IVF_SAMPLE_RATE=1`: every initial-base row participates
+The operational examples and quickstart retain `IVF_SAMPLE_RATE=1`: every initial-base row participates
 in training. Sampling examples below are optional ablations, not quickstart steps.
 
-`IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert router (default `faiss`);
+`IVF_ASSIGNMENT_ROUTER_MODE` freezes the base/insert router (default `pca-refined`);
 `IVF_ROUTER_MODE` overrides queries. `exact` enumerates centroids; `faiss-full`,
 `refined`, `pca` and `pca-refined` require `IVF_OPTIMIZED_MODES=1` at preparation.
 Centroids, routers and final PCA stay frozen across updates. Centroid controls
@@ -281,7 +300,7 @@ Centroids, routers and final PCA stay frozen across updates. Centroid controls
 `IVF_RERANK_FACTOR`. See native `--help` for more settings.
 `IVF_BUILD_ROUTER_RERANK_FACTOR` sets the persisted base/insert centroid factor;
 `IVF_ROUTER_RERANK_FACTOR` overrides the query centroid factor. Selecting LV+
-alone does not enable optimized final routing; the recipe selects `pca-refined`
+alone does not determine final routing; new builds default to `pca-refined`
 for both base/insertion assignment and queries, with optimized artifacts enabled
 before preparation.
 
@@ -410,7 +429,7 @@ matched-recall baseline comparisons.
   artifacts and reconstruct into fresh work/cache roots after fixing the cause.
   Rebuilding the driver does not repair an already inconsistent heap.
 - Immutable streaming heap construction fills each page before advancing, rather
-  than cycling over 256 partially filled pages with the default 64 buffer frames.
+  than cycling over 256 partially filled pages with a small 64-frame buffer pool.
   This avoids bulk-load page thrashing without enlarging the query buffer budget.
   Mutable IVF preparation also fills pages locally, with backend allocation/writes
   caller-serialized even when routing/PQ insertion workers are parallel. Generic
@@ -796,8 +815,8 @@ Memory budgets check workspace estimates, not hard RAM caps. Keep these settings
 fixed across preparation and execution. Cache hits restore an index, not measure
 a new build; use a fresh cache root when measuring fresh construction.
 The full-scale recipe explicitly requests 262,144 frames (1 GiB page payload).
-CLI/harness fallbacks remain 64 frames and a 1 GiB total allowance for small runs;
-they are not full-scale profile defaults. Python preparation/runtime admission
+CLI/harness defaults now use these same resources; small runs must explicitly
+request smaller pools/allowances. Python preparation/runtime admission
 rejects a budget smaller than the native per-frame allowance (payload plus
 4,096 bytes/frame); native composed admission still accounts for lists, locators,
 router and worker scratch. Passing this cheap lower-bound check is not a total-RAM
