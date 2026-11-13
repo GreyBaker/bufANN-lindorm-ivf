@@ -107,15 +107,15 @@ namespace ivf_cli {
       routing.insert_breadth = args.u32("--insert_breadth", 64);
       routing.seed = args.u32("--router_seed", 100);
       routing.memory_budget_bytes = budget;
-      const auto native = args.u32("--optimized_modes", 0);
+      const auto native = args.u32("--optimized_modes", routing.native_modes);
       check(native <= 1, "optimized_modes must be 0 or 1");
       routing.native_modes = native != 0;
-      routing.mode = parse_router_mode(args.get("--router_mode", "faiss"));
+      routing.mode = parse_router_mode(args.get("--router_mode", router_mode_name(routing.mode)));
       routing.refine_breadth = args.u32("--refine_ef", 128);
       routing.pca_variance = args.real("--pca_variance", .95);
       routing.router_rerank_factor = args.real("--router_rerank_factor", 3);
       routing.native_work_limit =
-          args.integer("--routing_work_limit", 1000000000);
+          args.integer("--routing_work_limit", defaults::routing_work_limit);
       return routing;
     }
     RoutingRequest query_routing_request(const Arguments&     args,
@@ -143,7 +143,7 @@ namespace ivf_cli {
       const auto    budget = budget_bytes(config.memory_budget_gb);
       HeapOptions   heap{config.dim, args.u32("--id_capacity", vectors.rows),
                        args.u32("--page_size", 4096),
-                       args.u32("--buffer_frames", 64)};
+                       args.u32("--buffer_frames", defaults::buffer_frames)};
       const auto    routing = build_routing_options(args, budget);
       const auto    start = Clock::now();
       TrainingStats training_stats;
@@ -443,7 +443,7 @@ namespace ivf_cli {
       MixedPlan plan;
       plan.fixed_8_8 = scheduler == "fixed_8_8";
       plan.update_driven = scheduler == "update_driven";
-      plan.pool_threads = args.u32("--pool_threads", 16);
+      plan.pool_threads = args.u32("--pool_threads", defaults::mixed_threads);
       if (plan.update_driven)
         args.reject_present(
             {"--query_ratio", "--query_count", "--scheduler_seed"},
@@ -664,7 +664,7 @@ namespace ivf_cli {
     template<typename T>
     std::unique_ptr<MutableIndex<T>> open_mutable(const Arguments& args,
                                                   uint64_t         budget) {
-      const MutableIndexOptions options{args.u32("--buffer_frames", 64),
+      const MutableIndexOptions options{args.u32("--buffer_frames", defaults::buffer_frames),
                                         budget};
       const auto format = args.get("--index_format", "immutable");
       check(format == "immutable", "Only immutable bases can be opened; updated sessions cannot be reopened");
@@ -1006,7 +1006,7 @@ namespace ivf_cli {
         const auto fixed = args.get("--scheduler", "weighted") == "fixed_8_8";
         const auto driven =
             args.get("--scheduler", "weighted") == "update_driven";
-        const auto threads = args.u32("--pool_threads", 16);
+        const auto threads = args.u32("--pool_threads", defaults::mixed_threads);
         emit("scheduler", driven  ? "update_driven"
                           : fixed ? "fixed_8_8"
                                   : "weighted_remaining_ops");
@@ -1093,7 +1093,7 @@ namespace ivf_cli {
       emit("input_manifest_hash_fnv1a", manifest.hash);
       emit("source_bytes", m.sources[0].bytes);
       emit("source_hash_fnv1a", m.sources[0].hash);
-      emit("buffer_pool_frames", args.u32("--buffer_frames", 64));
+      emit("buffer_pool_frames", args.u32("--buffer_frames", defaults::buffer_frames));
       emit("cache_policy",
            "uncontrolled_after_full_source_and_bundle_hash_and_private_copy");
     }
@@ -1106,7 +1106,7 @@ namespace ivf_cli {
            "--router_mode", "--router_rerank_factor", "--router_breadth"},
           "not used by mutation-only execution; use insert_then_search or delete_then_search");
       validate_driver_paths(args, true);
-      const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
+      const auto     budget = budget_bytes(args.real("--memory_budget_gb", defaults::memory_budget_gb));
       DriverProgress opening("open_private_copy_verify");
       const auto     start = Clock::now();
       auto           index = open_mutable<T>(args, budget);
@@ -1152,7 +1152,7 @@ namespace ivf_cli {
       DriverProgress loading("query_input_validation_load");
       const bool     is_mixed = args.require("--workload") == "mixed";
       const bool updating = args.require("--workload") != "search_only";
-      const auto  budget = budget_bytes(args.real("--memory_budget_gb", 1.0));
+      const auto  budget = budget_bytes(args.real("--memory_budget_gb", defaults::memory_budget_gb));
       const auto& manifest = cli_manifest(*index);
       const auto  dim = manifest.training.dim;
       check(!args.has("--dim") || args.u32("--dim") == dim,
@@ -1160,12 +1160,12 @@ namespace ivf_cli {
       check(!args.has("--nlist") ||
                 args.u32("--nlist") == manifest.training.nlist,
             "CLI/manifest nlist mismatch");
-      SearchConfig config{args.u32("--nprobe", 1), args.u32("--recall_at", 10),
-                          args.real("--rerank_factor", 2.0),
-                          args.u32("--query_threads", 1)};
+      SearchConfig config{args.u32("--nprobe", defaults::nprobe), args.u32("--recall_at", 10),
+                           args.real("--rerank_factor", 3.0),
+                           args.u32("--query_threads", defaults::query_threads)};
       config.validate(manifest.training.nlist);
       const auto routing = query_routing_request(args, manifest.routing);
-      const auto warmup_requested = args.u32("--warmup_queries", 0);
+      const auto warmup_requested = args.u32("--warmup_queries", defaults::warmup_queries);
       validate_warmup_count(warmup_requested);
       const auto queries =
           inspect_vectors(args.require("--query_file"), type, dim);
@@ -1355,7 +1355,7 @@ namespace ivf_cli {
       emit("query_count", queries.rows);
       if (!updating) {
         emit("query_breadth", manifest.routing.query_breadth);
-        emit("buffer_pool_frames", args.u32("--buffer_frames", 64));
+        emit("buffer_pool_frames", args.u32("--buffer_frames", defaults::buffer_frames));
       }
       emit("open_time_s", open_time);
       emit("query_time_s", query_time);
@@ -1515,7 +1515,7 @@ namespace ivf_cli {
                             "not used by search-only execution");
       const auto format = args.get("--index_format", "immutable");
       check(format == "immutable", "Only immutable bases are supported; mutable checkpoint loading was removed");
-      const auto     budget = budget_bytes(args.real("--memory_budget_gb", 1));
+      const auto     budget = budget_bytes(args.real("--memory_budget_gb", defaults::memory_budget_gb));
       DriverProgress opening("open_private_copy_verify");
       const auto     start = Clock::now();
       // A private heap requests a mutable session even for an immutable input
@@ -1529,7 +1529,7 @@ namespace ivf_cli {
       }
       auto index =
           NativeIndex<T>::open(args.require("--index_prefix"),
-                               {args.u32("--buffer_frames", 64), budget});
+                                {args.u32("--buffer_frames", defaults::buffer_frames), budget});
       const auto open_time = seconds(start);
       opening.finish();
       return search_typed<T>(args, type, std::move(index), open_time,

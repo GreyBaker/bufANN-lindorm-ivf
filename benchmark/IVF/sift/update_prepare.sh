@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_mixed_profile.sh"
-ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to existing full-source PQ}"
 [[ -z "${IVF_GT_FILE:-}" ]] || error "mixed prepare derives per-round GT; IVF_GT_FILE is not a per-round GT family"
 ensure_dataset

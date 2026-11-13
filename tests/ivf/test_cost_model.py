@@ -267,6 +267,7 @@ def main():
             run([args.tool, "--help"])
             env = {k: v for k, v in os.environ.items() if not k.startswith("IVF_")}
             env["IVF_COST_MODEL_REPORT"] = str(output / "report.json")
+            env["IVF_BUFFER_FRAMES"] = "64"  # Match this deliberately small calibration budget.
             aliases = {
                 "init": "trainer_init",
                 "sample_rate": "target_sample_rate",

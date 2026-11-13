@@ -28,7 +28,7 @@ def fixture(args, root, dtype, fmt):
         cmd = [args.driver, "--validate_inputs", "0", "--data_type", dtype,
                "--index_prefix", str(prefix), "--workload", workload, "--full_data_file", str(data),
                "--private_heap_path", str(private),
-               "--buffer_frames", str(frames), "--insert_threads", str(workers), "--result_file", str(result)]
+                "--buffer_frames", str(frames), "--insert_threads", str(workers), "--result_file", str(result)]
         if policy is not None:
             cmd += ["--insert_input_policy", policy]
         return cmd + list(extra), saved, private, result
@@ -53,7 +53,7 @@ def fixture(args, root, dtype, fmt):
         cmd[cmd.index("--workload") + 1] = "insert_then_search"
         record = run(cmd + ["--query_file", str(query), "--gt_file", str(truth),
                       "--nprobe", "2", "--recall_at", "4", "--rerank_factor", "16", "--query_threads", "2",
-                      "--search_result_file", str(output)], "query")
+                      "--search_result_file", str(output), "--warmup_queries", "0"], "query")
         check_query(record)
         assert record["query_cache_process_policy"].startswith("same_process_live_mutable_session_after_writeback")
         assert record["recall"] == 100 and record["live_count"] == len(live)
@@ -110,7 +110,7 @@ def fixture(args, root, dtype, fmt):
         cmd, saved, _, _ = update(policy, workers=8, workload="search_after_update",
             extra=["--insert_ids_file", str(insert_ids), "--delete_ids_file", str(delete_ids),
                    "--query_file", str(query), "--gt_file", str(truth), "--nprobe", "2", "--recall_at", "4",
-                   "--rerank_factor", "16", "--search_result_file", str(result)])
+                   "--rerank_factor", "16", "--search_result_file", str(result), "--warmup_queries", "0"])
         record = run(cmd, "query")
         check_update(record, policy)
         check_query(record)

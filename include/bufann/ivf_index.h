@@ -52,8 +52,8 @@ namespace diskann::ivf {
         0;  // Actual fitted projection, digest-bound below.
   };
   struct IndexOpenOptions {
-    uint32_t buffer_frames = 64;
-    uint64_t memory_budget_bytes = 1024ull * 1024 * 1024;
+    uint32_t buffer_frames = defaults::buffer_frames;
+    uint64_t memory_budget_bytes = defaults::memory_budget_bytes;
   };
 
   // Self-contained immutable bundle, fixed suffixes relative to its prefix.
@@ -100,8 +100,8 @@ namespace diskann::ivf {
   extern template class NativeIndex<uint8_t>;
 
   struct MutableIndexOptions {
-    uint32_t buffer_frames = 64;
-    uint64_t memory_budget_bytes = 1024ull * 1024 * 1024;
+    uint32_t buffer_frames = defaults::buffer_frames;
+    uint64_t memory_budget_bytes = defaults::memory_budget_bytes;
     uint64_t list_memory_budget_bytes =
         0;  // 0 uses remaining retained-object budget.
   };

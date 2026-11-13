@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_mutation_profile.sh"
-ivf_require_build_selection
 : "${IVF_PQ_PREFIX:?Set IVF_PQ_PREFIX to pivots plus full-source PQ codes}"
 ensure_dataset
 ivf_prepare_work_dir

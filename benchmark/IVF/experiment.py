@@ -8,7 +8,7 @@ import struct
 import sys
 
 from common import execute, header, read_json, require
-from settings import ROUTER_BACKEND_ID, build_settings
+from settings import DEFAULT_ENV, ROUTER_BACKEND_ID, build_settings
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parents[1]
@@ -19,22 +19,8 @@ TIMEOUT_S = 172800
 NLISTS = (1000, 10000, 100000, 200000, 300000, 400000, 500000)
 PROBES = (16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 384, 512)
 PRESET = {
+    **DEFAULT_ENV,
     "DATASET": "sift100m", "RECALL_AT": "10",
-    "IVF_SAMPLE_RATE": "1", "IVF_TRAINER_MODE": "lv-plus", "IVF_MAX_REPS": "15",
-    "IVF_INIT": "random_partition", "IVF_TRAINING_BREADTH": "64", "IVF_SEED": "0",
-    "IVF_BUILD_THREADS": "16", "IVF_TRAINING_RERANK_FACTOR": "3", "IVF_TRAINING_REFINE_BREADTH": "128",
-    "IVF_OPTIMIZED_MODES": "1", "IVF_ASSIGNMENT_ROUTER_MODE": "pca-refined",
-    "IVF_BUILD_ROUTER_RERANK_FACTOR": "3", "IVF_PCA_VARIANCE": "0.95", "IVF_REFINE_EF": "128",
-    "IVF_QUERY_BREADTH": "128", "IVF_INSERT_BREADTH": "64", "IVF_ROUTER_MODE": "pca-refined",
-    "IVF_ROUTER_RERANK_FACTOR": "3", "IVF_ROUTER_BREADTH": "128", "IVF_RERANK_FACTOR": "3",
-    "IVF_MEMORY_BUDGET_GB": "96", "IVF_QUERY_MEMORY_BUDGET_GB": "96",
-    "IVF_PAGE_SIZE": "4096", "IVF_BUFFER_FRAMES": "262144", "IVF_WARMUP_QUERIES": "64",
-    "QUERY_THREADS": "8", "NTHREADS": "16", "OMP_NUM_THREADS": "16", "OMP_THREAD_LIMIT": "16",
-    "MKL_NUM_THREADS": "1",
-    # At 500K x 128D, PCA covariance alone counts 4.128B operations. Leave
-    # headroom for PCA/refinement, but retain a finite guard on excessive work.
-    # The independent 3B assignment-search guard is unchanged.
-    "IVF_ROUTING_WORK_LIMIT": "10000000000",
 }
 
 

@@ -9,8 +9,8 @@ namespace ivf_cli {
                                      diskann::ivf::BuildConfig& config) {
     using namespace diskann::ivf;
     config.trainer_mode =
-        parse_trainer_mode(args.get("--trainer_mode", "ann-reuse-seeded"));
-    config.init = parse_centroid_init(args.get("--init", "random_partition"));
+        parse_trainer_mode(args.get("--trainer_mode", trainer_mode_name(config.trainer_mode)));
+    config.init = parse_centroid_init(args.get("--init", centroid_init_name(config.init)));
     config.training_breadth = args.u32("--training_breadth", 64);
     config.training_rerank_factor = args.real("--training_rerank_factor", 3);
     config.training_refine_breadth = args.u32("--training_refine_breadth", 128);

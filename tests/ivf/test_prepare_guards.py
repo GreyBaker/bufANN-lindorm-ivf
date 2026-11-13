@@ -29,17 +29,10 @@ def main():
             raise RuntimeError(result.stdout + result.stderr)
         return result
 
-    for extra, success in (
-        ({}, False),
-        ({"IVF_NLIST": "2"}, True),
-        ({"IVF_COST_MODEL_REPORT": "/python-validates-this.json"}, True),
-        ({"IVF_NLIST": "2", "IVF_COST_MODEL_REPORT": "/python-validates-this.json"}, True),
-    ):
-        invoke("ivf_require_build_selection", extra, success)
     for name in ("query_prepare.sh", "_mutation_prepare.sh", "update_prepare.sh"):
         text = (args.repo / "benchmark/IVF/sift" / name).read_text()
-        if "ivf_require_build_selection" not in text or "${IVF_NLIST:?" in text:
-            raise RuntimeError("Preparation bypasses shared selection guard: " + name)
+        if "ivf_require_build_selection" in text or "${IVF_NLIST:?" in text:
+            raise RuntimeError("Preparation rejects the implementation's default nlist: " + name)
     for tag, suffix in (("", ""), ("run-01_A", "/runs/run-01_A")):
         result = invoke('ivf_select_output_dir; printf "%s" "$OUTPUT_DIR"', {"IVF_RUN_TAG": tag})
         assert result.stdout == "/unused/fixture/IVF/query" + suffix
@@ -117,7 +110,7 @@ def main():
     assert result.stdout.splitlines() == [
         "/shared/ann-data/sift100m/groundtruth/sift100m_100000000_gt100.bin",
         "/shared/ann-data/sift100m/pq/pq32-base90000000"]
-    print("IVF shell selection, no-overwrite ownership, run tags and prefix-truth guards passed.")
+    print("IVF default-compatible preparation, no-overwrite ownership, run tags and prefix-truth guards passed.")
 
 
 if __name__ == "__main__":

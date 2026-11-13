@@ -54,7 +54,7 @@ class ExperimentTests(unittest.TestCase):
         (self.root / 'pq_pq_compressed.bin').write_bytes(struct.pack('<II', rows, chunks) + bytes(rows * chunks))
 
     def fake_execute(self, command, log, timeout, cpus, env, stdout_path=None):
-        self.assertEqual(timeout, 86400)
+        self.assertEqual(timeout, 172800)
         self.assertIsNone(cpus)
         self.commands.append(list(command))
         with log.open('x') as file:

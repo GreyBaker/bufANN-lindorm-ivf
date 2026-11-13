@@ -55,6 +55,8 @@ namespace {
     using namespace diskann::ivf;
     fixture<T>(path);
     BuildConfig config;
+    config.trainer_mode = TrainerMode::Exact;
+    config.init = CentroidInit::Sample;  // This fixture exercises the sample-seeded exact control.
     config.data_type = type;
     config.dim = 13;
     config.base_count = 120;

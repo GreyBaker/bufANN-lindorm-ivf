@@ -238,6 +238,8 @@ namespace {
     }
     const auto  prefix = (root / "immutable source").string();
     BuildConfig training;
+    training.trainer_mode = TrainerMode::AnnRebuild;
+    training.init = CentroidInit::Sample;
     training.data_type = type;
     training.dim = dim;
     training.base_count = base;

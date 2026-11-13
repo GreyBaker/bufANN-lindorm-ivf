@@ -49,6 +49,7 @@ namespace {
     rejects([] { CentroidPCA::preflight_work(1, 0, 1000); });
     RouterOptions admission;
     admission.native_modes = true;
+    admission.native_work_limit = 1000000000;  // Exercise the old insufficient guard explicitly.
     admission.memory_budget_bytes = 4ull << 30;
     rejects(
         [&] { CentroidRouter::estimate_build_bytes(128, 200000, admission); },
@@ -64,6 +65,7 @@ namespace {
     training.trainer_mode = TrainerMode::LVPlus;
     training.init = CentroidInit::RandomPartition;
     admission.native_modes = false;
+    admission.mode = RouterMode::Faiss;
     admission.native_work_limit = 1000000000;
     // A nonexistent source proves rejection before sampling or graph work.
     rejects(
@@ -263,7 +265,10 @@ namespace {
       require(duplicate_router->search({duplicates.data(), 3}, 1, false, nullptr,
                                    {RouterMode::FaissFull, 3, breadth}).front().squared_distance == 0,
           "Duplicate FAISS candidate reranking failed");
-    auto plain = CentroidRouter::build(dim, v);
+    RouterOptions plain_options;
+    plain_options.native_modes = false;
+    plain_options.mode = RouterMode::Faiss;
+    auto plain = CentroidRouter::build(dim, v, plain_options);
     rejects([&] {
       plain->search({q.data(), dim}, 1, false, nullptr,
                     {RouterMode::FaissFull});

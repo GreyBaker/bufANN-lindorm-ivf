@@ -432,6 +432,9 @@ namespace diskann::ivf {
     std::string   magic, backend;
     uint32_t      dim = 0, count = 0;
     RouterOptions options;
+    // Legacy router files predate optimized-mode metadata.
+    options.native_modes = false;
+    options.mode = RouterMode::Faiss;
     options.memory_budget_bytes = budget;
     uint64_t vector_bytes = 0, vector_hash = 0, graph_bytes = 0, graph_hash = 0;
     meta >> magic >> backend >> dim >> count >> options.degree >>

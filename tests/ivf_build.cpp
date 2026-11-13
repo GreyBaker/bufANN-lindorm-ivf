@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
              "Usage: ivf_build --validate_inputs 0|1 --data_type "
              "float|int8|uint8\n"
              "  --data_file PATH --index_prefix PATH --pq_prefix PATH --dim N\n"
-             "  --base_count N --nlist N [--sample_rate F] [--max_reps N]\n"
+              "  --base_count N [--nlist N (default 400000)] [--sample_rate F] [--max_reps N]\n"
              "  [--seed N] [--build_threads N] [--memory_budget_gb F] "
              "[--metric l2]\n"
              "Execution settings: [--id_capacity N] [--page_size N] "
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
              "  LV/LV+: --training_rerank_factor 3 --training_refine_breadth "
              "128; PCA95 refit each pass.\n"
              "  [--init sample|random_partition] [--training_breadth N]\n"
-             "  Defaults: ann-reuse-seeded, random_partition, breadth 64.\n"
+              "  Defaults: lv-plus, random_partition, 15 passes, 16 workers, breadth 64.\n"
              "  Training breadth is independent of frozen query/insert router "
              "breadth.\n";
       return 0;
@@ -99,12 +99,12 @@ int main(int argc, char** argv) {
     config.data_type = parse_data_type(args.get("--data_type", "float"));
     config.dim = args.u32("--dim");
     config.base_count = args.u32("--base_count");
-    config.nlist = args.u32("--nlist");
+    config.nlist = args.u32("--nlist", config.nlist);
     config.sample_rate = args.real("--sample_rate", 1.0);
     config.max_reps = args.u32("--max_reps", 15);
-    config.build_threads = args.u32("--build_threads", 1);
+    config.build_threads = args.u32("--build_threads", config.build_threads);
     config.seed = args.integer("--seed");
-    config.memory_budget_gb = args.real("--memory_budget_gb", 1.0);
+    config.memory_budget_gb = args.real("--memory_budget_gb", config.memory_budget_gb);
     ivf_cli::read_training_settings(args, config);
     config.validate();
     const auto vectors = inspect_vectors(args.require("--data_file"),

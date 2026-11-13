@@ -94,6 +94,8 @@ def main():
             str(truth),
             "--recall_at",
             "2",
+            "--nprobe",
+            "1",
         ]
         run(build)
         # Existing PQ artifacts describe the full source, not just its base
@@ -134,7 +136,9 @@ def main():
         run(build + ["--seed", "18446744073709551616"], False)
         run(build + ["--unknown", "1"], False)
         run(build + ["--metric", "cosine"], False)
-        run(driver + ["--workload", "search_only", "--nprobe", "2"], False)
+        bad_probe = driver.copy()
+        bad_probe[bad_probe.index("--nprobe") + 1] = "2"
+        run(bad_probe + ["--workload", "search_only"], False)
         run(driver + ["--workload", "search_only", "--rerank_factor", "0.5"], False)
         run(driver + ["--workload", "search_only", "--rerank_factor", "1e100"], False)
         run(driver + ["--workload", "search_after_update"], False)
