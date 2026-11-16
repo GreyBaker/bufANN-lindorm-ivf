@@ -33,7 +33,7 @@ class SharedOrchestrationTests(unittest.TestCase):
         expected = {
             "nlist": "8",
             "sample_rate": "1",
-            "max_reps": "15",
+            "max_reps": "10",
             "seed": "0",
             "build_threads": "16",
             "memory_budget_gb": "96",
@@ -81,6 +81,7 @@ class SharedOrchestrationTests(unittest.TestCase):
             self.assertNotIn("training_refine_breadth", actual)
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(settings.build_settings(), dict(expected, nlist="400000"))
+            self.assertEqual(settings.CALIBRATION_DEFAULTS["max_reps"], "10")
             self.assertEqual(settings.query_search_flags(),
                              ["--nprobe", "96", "--rerank_factor", "3", "--query_threads", "8"])
             self.assertEqual(settings.warmup_queries(), "64")
@@ -126,6 +127,19 @@ class SharedOrchestrationTests(unittest.TestCase):
         path.write_text('{"version":1,"version":1}')
         with self.assertRaisesRegex(ValueError, "duplicate"):
             settings.read_cost_model_report(path)
+
+    def test_training_ablation_defaults_to_ten_passes(self):
+        import qualify
+
+        argv = ["qualify.py", "train", "--data", "unused.bin", "--trainer", "unused-trainer",
+                "--output", "unused-output", "--dtype", "float", "--dim", "3", "--full-count", "64",
+                "--base-count", "48", "--nlist", "2", "--threads", "1", "--sample-rate", "1",
+                "--evaluation-rows", "4", "--exact-work-limit", "10000", "--assignment-work-limit", "10000",
+                "--evaluation-work-limit", "10000", "--memory-budget-gb", "1", "--timeout", "30"]
+        with patch.object(sys, "argv", argv), patch.object(sys, "platform", "linux"), \
+                patch.object(qualify, "train") as train:
+            self.assertEqual(qualify.main(), 0)
+        self.assertEqual(train.call_args.args[0].iterations, 10)
 
     def test_independent_insertion_worker_setting(self):
         with patch.dict(os.environ, {"NTHREADS": "20"}, clear=True):

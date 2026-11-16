@@ -111,7 +111,7 @@ class ExperimentTests(unittest.TestCase):
         calls = list(self.calls)
         self.assertEqual([int(c['settings']['nlist']) for c in calls if c['script'] == 'query_prepare'], NLISTS)
         self.assertEqual([c['script'] for c in calls], (['query_prepare'] + ['query'] * 15) * 7)
-        fixed = dict(max_reps='15', trainer_mode='lv-plus', build_threads='16', memory_budget_gb='96',
+        fixed = dict(max_reps='10', trainer_mode='lv-plus', build_threads='16', memory_budget_gb='96',
                      page_size='4096', buffer_frames='262144', optimized_modes='1', pca_variance='0.95',
                      routing_work_limit='10000000000', router_mode='pca-refined', router_rerank_factor='3',
                      training_rerank_factor='3', training_refine_breadth='128')
@@ -217,7 +217,7 @@ class ExperimentTests(unittest.TestCase):
             self.invoke()
         path = self.work() / 'prepared.json'
         original = json.loads(path.read_text())
-        for field, value in (('build_threads', '20'), ('routing_work_limit', '3000000000')):
+        for field, value in (('max_reps', '15'), ('build_threads', '20'), ('routing_work_limit', '3000000000')):
             record = json.loads(json.dumps(original))
             record['settings'][field] = value
             path.write_text(json.dumps(record))
@@ -246,7 +246,7 @@ class ExperimentTests(unittest.TestCase):
             before = dict(os.environ)
             env = experiment.environment()
             env['IVF_NLIST'] = '1000'
-            self.assertEqual(build_settings(env)['max_reps'], '15')
+            self.assertEqual(build_settings(env)['max_reps'], '10')
             self.assertEqual(env['INCREMENTAL_GT_BIN'], str(self.root / 'build/tests/incremental_groundtruth'))
             self.assertEqual(dict(os.environ), before)
 

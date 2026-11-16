@@ -75,5 +75,5 @@ Producer IDs are `faiss-1.9.0-cpu1` and `faiss-1.9.0-ivf1` (optimized adapter).
 Router descriptors use versions 3/4; the HNSW component suffixes remain `.hnsw`,
 `.patched.hnsw`, `.refined.hnsw` but their checked contents are FAISS, not hnswlib.
 New prepared/cache identities bind the FAISS backend. All former hnswlib-produced
-bundles are rejected; preserve them and rebuild into fresh FAISS/15-pass prefixes,
+bundles are rejected; preserve them and rebuild into fresh FAISS/10-pass prefixes,
 never relabel them. License/notice and dependency hashes must accompany upgrades.

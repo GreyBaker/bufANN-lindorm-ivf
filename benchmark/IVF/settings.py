@@ -12,12 +12,13 @@ from pathlib import Path
 from common import digest, flags, require
 
 ROUTER_BACKEND_ID = "faiss-1.9.0-cpu1"
+TRAINING_PASSES = "10"  # Mean-update passes, followed by a separate final assignment.
 
 
 BUILD_DEFAULTS = {
     "nlist": "400000",
     "sample_rate": "1",
-    "max_reps": "15",
+    "max_reps": TRAINING_PASSES,
     "seed": "0",
     "build_threads": "16",
     "memory_budget_gb": "96",
@@ -56,8 +57,8 @@ DEFAULT_ENV.update({
     "MKL_NUM_THREADS": "1",
 })
 
-# Calibration has its own sampling, scan-profile and work allowances. Preserve
-# its existing spellings/values rather than normalizing historical plan settings.
+# Calibration shares the training-pass default but has its own sampling,
+# scan-profile and work allowances. Preserve historical report interpretations.
 CALIBRATION_DEFAULTS = {
     "data_type": "float",
     "dim": None,
@@ -68,7 +69,7 @@ CALIBRATION_DEFAULTS = {
     "topk": "10",
     "target_recall": ".90",
     "seed": "0",
-    "max_reps": "15",
+    "max_reps": TRAINING_PASSES,
     "build_threads": "1",
     "memory_budget_gb": "1",
     "trainer_mode": "ann-reuse-seeded",

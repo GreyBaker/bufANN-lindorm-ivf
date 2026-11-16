@@ -199,7 +199,7 @@ Native IVF links sequential MKL ILP64 (`FINTEGER=int64_t`) and GNU OpenMP, witho
 
 The FAISS high-level search wrapper updates global statistics; independent frozen calls instead use unmodified low-level `HNSW::search` with local contexts. `ivf_faiss_contracts` checks parity with the high-level upstream path, unchanged global counters during concurrent calls, independent breadths, and a BLAS-backed numerical oracle.
 
-Index producers must be `faiss-1.9.0-cpu1`; optimized router descriptors additionally bind `faiss-1.9.0-ivf1`. Router descriptor versions 3/4 wrap checked `IVFFAIS1` graph framing. Allocation lengths, levels, offsets, edge identities/levels and centroid bytes are checked before graph use; unchecked upstream `read_index` is not used. The generic `.hnsw`/`.patched.hnsw`/`.refined.hnsw` component suffixes remain, but contain FAISS representations. Previous hnswlib code/dependencies and runtime modes are removed. Historical artifacts remain incompatible evidence, not candidates for relabeling. Fresh FAISS/15-pass preparations are required, including refinement-grid reuse.
+Index producers must be `faiss-1.9.0-cpu1`; optimized router descriptors additionally bind `faiss-1.9.0-ivf1`. Router descriptor versions 3/4 wrap checked `IVFFAIS1` graph framing. Allocation lengths, levels, offsets, edge identities/levels and centroid bytes are checked before graph use; unchecked upstream `read_index` is not used. The generic `.hnsw`/`.patched.hnsw`/`.refined.hnsw` component suffixes remain, but contain FAISS representations. Previous hnswlib code/dependencies and runtime modes are removed. Historical artifacts remain incompatible evidence, not candidates for relabeling. The current experiment requires matching FAISS/10-pass preparations; earlier 15-pass bases are preserved, not silently relabeled or reused as 10-pass builds.
 
 **Sources:** [`dependencies/faiss/README.md`](../dependencies/faiss/README.md), [`cmake/Faiss.cmake`](../cmake/Faiss.cmake), [`ivf_faiss.cpp`](../src/bufann/ivf_faiss.cpp), [`ivf_patched_graph.cpp`](../src/bufann/ivf_patched_graph.cpp).
 
@@ -406,7 +406,7 @@ Thus the model chooses a **routing-plus-scan estimate**, not a proven end-to-end
 
 Build, training, open, query, growth, writeback, and calibration have explicit preflight size/work checks with overflow protection. Estimates include relevant persistent structures, scratch, temporary replacement buffers, and conservative thread-stack allowances. They are **admission estimates, not hard process-RSS caps**.
 
-Training normally permits at most three billion assignment searches: `S × (max_reps + 1)`. Main recipes fix fifteen mean-update passes plus final assignment: 90M rows require 1.44B assignments, while 100M require 1.60B. Exact training still separately limits distance evaluations (default 1B). PCA covariance/solver/validation and refinement retain separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. Raising a PCA/routing limit does not raise the training-search limit.
+Training normally permits at most three billion assignment searches: `S × (max_reps + 1)`. Defaults and main experiments use ten mean-update passes plus final assignment: 90M rows require 990M assignments, while 100M require 1.10B. LV/LV+ refit PCA for each assignment round, including the final round without a mean update; this is distinct from the PCA eigensolver's internal sweeps. Exact training still separately limits distance evaluations (default 1B). PCA covariance/solver/validation and refinement retain separate counted-work limits; those are not comprehensive caps on all graph construction/refresh work. Raising a PCA/routing limit does not raise the training-search limit.
 
 Numeric domains are deliberately separate:
 
@@ -469,15 +469,15 @@ Queries report routing, LUT preparation, scan/selection, fetch, and exact-rerank
 
 | Setting | Committed default / distinction |
 |---|---|
-| Programmatic training | `ann-rebuild`, `sample` initialization. |
-| Native CLI/harness training | `ann-reuse-seeded`, `random_partition`; examples explicitly select LV+. |
-| Training | sample rate 1, 15 mean-update passes, breadth 64. |
+| Programmatic training | `lv-plus`, `random_partition` initialization. |
+| Native CLI/harness training | Same LV+ defaults; calibration controls retain their own trainer profile. |
+| Training | sample rate 1, 10 mean-update passes plus final assignment, breadth 64. |
 | LV training | centroid rerank factor 3, initial refinement breadth 128, 95% PCA variance. |
-| Final router | vanilla `faiss`; optimized modes disabled unless requested. |
+| Final router | `pca-refined`; optimized modes enabled for new builds. |
 | HNSW | degree 16, construction breadth 200, query breadth 128, insertion breadth 64. |
-| Native/library search | nprobe 1, k=10, vector rerank factor 2, one query thread. |
-| Heap/runtime | 4096-byte pages, 64 buffer frames; common small-run memory allowance 1 GiB. |
-| Standalone insertion / warmup | one worker, streaming input, zero warmup. |
+| Native/library search | nlist 400000, nprobe 96, k=10, vector rerank factor 3, eight query workers. |
+| Heap/runtime | 4096-byte pages, 262144 frames (1 GiB payload), 96 GiB memory allowance. |
+| Standalone insertion / warmup | one insertion worker, streaming input; 64 frozen-centroid warmup queries for scoring. |
 | Mixed scheduling | native default `weighted`; shell/Python default `update_driven`, generally 16 foreground workers. |
 
 Large-data recipes explicitly override these. The SIFT recipe uses 64 PQ8 chunks and opts into LV+, optimized artifacts, and `pca-refined` base/insertion and query routing. Its 200K lists, resource allowances, thread counts, and search budgets are example/profile choices—not library defaults, a universal cost-model result, or measured proof of paper equivalence.

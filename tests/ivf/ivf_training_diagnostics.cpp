@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
     config.base_count = args.u32("--base_count");
     config.nlist = args.u32("--nlist");
     config.sample_rate = args.real("--sample_rate", 1);
-    config.max_reps = args.u32("--max_reps", 15);
+    config.max_reps = args.u32("--max_reps", config.max_reps);
     config.seed = args.integer("--seed");
     config.build_threads = args.u32("--build_threads", 1);
     config.memory_budget_gb = args.real("--memory_budget_gb", 1);

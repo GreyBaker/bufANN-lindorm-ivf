@@ -5,6 +5,7 @@
 namespace diskann::ivf::defaults {
   inline constexpr uint32_t nlist = 400000;
   inline constexpr uint32_t nprobe = 96;
+  inline constexpr uint32_t max_reps = 10;  // Mean updates; final assignment is additional.
   inline constexpr uint32_t build_threads = 16;
   inline constexpr uint32_t query_threads = 8;
   inline constexpr uint32_t mixed_threads = 16;

@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
              "  LV/LV+: --training_rerank_factor 3 --training_refine_breadth "
              "128; PCA95 refit each pass.\n"
              "  [--init sample|random_partition] [--training_breadth N]\n"
-              "  Defaults: lv-plus, random_partition, 15 passes, 16 workers, breadth 64.\n"
+              "  Defaults: lv-plus, random_partition, 10 passes, 16 workers, breadth 64.\n"
              "  Training breadth is independent of frozen query/insert router "
              "breadth.\n";
       return 0;
@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
     config.base_count = args.u32("--base_count");
     config.nlist = args.u32("--nlist", config.nlist);
     config.sample_rate = args.real("--sample_rate", 1.0);
-    config.max_reps = args.u32("--max_reps", 15);
+    config.max_reps = args.u32("--max_reps", config.max_reps);
     config.build_threads = args.u32("--build_threads", config.build_threads);
     config.seed = args.integer("--seed");
     config.memory_budget_gb = args.real("--memory_budget_gb", config.memory_budget_gb);

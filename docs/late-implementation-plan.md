@@ -3,6 +3,12 @@
 Status: phases 1–4 implemented and validated on bounded fixtures. Full-scale
 SIFT100M performance/quality and cross-system comparisons remain unqualified.
 
+**Historical plan/evidence:** the 15-pass recipes and validation counts below
+describe those completed phases. As of 2026-11-14, implementation defaults,
+calibration defaults and current experiments use **10 mean-update passes plus
+final assignment**. Current runner settings/reuse policy are documented in
+`benchmark/IVF/README.md`; earlier artifacts/evidence are not rewritten.
+
 Beware that this document may require modification. 
 
 Execute these bodies of work in order, validating each before starting the next:

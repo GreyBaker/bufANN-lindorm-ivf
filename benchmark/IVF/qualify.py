@@ -477,7 +477,6 @@ def main():
                 "full-count",
                 "base-count",
                 "nlist",
-                "iterations",
                 "threads",
                 "evaluation-rows",
                 "exact-work-limit",
@@ -485,6 +484,10 @@ def main():
                 "evaluation-work-limit",
             ):
                 p.add_argument("--" + field, type=positive, required=True)
+            p.add_argument(
+                "--iterations", type=positive, default=int(BUILD_DEFAULTS["max_reps"]),
+                help="mean-update passes before final assignment (default: %(default)s)",
+            )
             p.add_argument("--sample-rate", type=finite, required=True)
             p.add_argument("--seed", type=int, default=0)
             p.add_argument("--router-seed", type=int, default=100)

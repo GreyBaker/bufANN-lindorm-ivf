@@ -150,7 +150,7 @@ namespace {
     check(element_size(DataType::Float) == 4, "float size");
     rejects([] { parse_data_type("UInt8"); }, "unexpected dtype accepted");
     BuildConfig build;
-    check(build.nlist == 400000 && build.max_reps == 15 &&
+    check(build.nlist == 400000 && build.max_reps == 10 &&
               build.build_threads == 16 && build.memory_budget_gb == 96 &&
               build.trainer_mode == TrainerMode::LVPlus &&
               build.init == CentroidInit::RandomPartition,

@@ -38,7 +38,7 @@ namespace diskann::ivf {
     uint32_t base_count = 0;
     uint32_t nlist = defaults::nlist;
     double   sample_rate = 1.0;
-    uint32_t max_reps = 15;
+    uint32_t max_reps = defaults::max_reps;
     uint32_t build_threads = defaults::build_threads;
     uint64_t seed = 0;
     double   memory_budget_gb = defaults::memory_budget_gb;

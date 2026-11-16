@@ -238,12 +238,16 @@ namespace {
 int main(int argc, char** argv) {
   try {
     using namespace diskann::ivf;
-    require(training_assignment_searches(90000000, 15) == 1440000000ull &&
-                training_assignment_searches(100000000, 15) == 1600000000ull &&
-                training_assignment_searches(187500000, 15) == 3000000000ull,
-            "15-pass assignment admission arithmetic");
-    rejects([] { training_assignment_searches(187500001, 15); });
-    rejects([] { training_assignment_searches(UINT64_MAX, 15); });
+    require(defaults::max_reps == 10 &&
+                training_assignment_searches(90000000, defaults::max_reps) == 990000000ull &&
+                training_assignment_searches(100000000, defaults::max_reps) == 1100000000ull &&
+                training_assignment_searches(272727272, defaults::max_reps) == 2999999992ull,
+            "10-pass assignment admission arithmetic");
+    rejects([] { training_assignment_searches(272727273, defaults::max_reps); });
+    rejects([] { training_assignment_searches(UINT64_MAX, defaults::max_reps); });
+    // Explicit historical pass counts remain supported; they are not defaults.
+    require(training_assignment_searches(187500000, 15) == 3000000000ull,
+            "Explicit pass override changed");
     rejects([] { training_assignment_searches(1, UINT64_MAX); });
     require(TrainerLimits{}.max_distance_evaluations == 1000000000,
             "Exact distance guard must remain separate");
@@ -260,10 +264,11 @@ int main(int argc, char** argv) {
     full_passes.dim = 13; full_passes.base_count = 120;
     full_passes.nlist = 4; full_passes.build_threads = 1;
     const auto trained = train_centroids((root / "float.bin").string(), full_passes);
-    require(trained.passes.size() == 16 && trained.objective_history.size() == 15 &&
-                trained.assignment_searches == uint64_t(full_passes.training_count()) * 16 &&
+    require(full_passes.max_reps == 10 && trained.passes.size() == 11 &&
+                trained.objective_history.size() == 10 &&
+                trained.assignment_searches == uint64_t(full_passes.training_count()) * 11 &&
                 trained.passes.back().mean_seconds == 0,
-            "Uniform 15 updates plus final assignment");
+            "Uniform 10 updates plus final assignment");
     std::cout << "IVF exact centroid trainer tests passed\n";
     return 0;
   } catch (const std::exception& error) {

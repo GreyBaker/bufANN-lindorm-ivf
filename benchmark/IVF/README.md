@@ -86,7 +86,7 @@ export IVF_PQ_PREFIX=/absolute/path/to/existing-full-source-pq64/prefix
 export IVF_NLIST=10000 IVF_MEMORY_BUDGET_GB=6 IVF_BUILD_THREADS=20
 export IVF_QUERY_MEMORY_BUDGET_GB=6 IVF_BUFFER_FRAMES=262144
 export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1
-export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS=15
+export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS=10
 export IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0
 export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
 export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined
@@ -124,7 +124,7 @@ New library/CLI builds and the workload harness use the same defaults:
 | Setting | Default |
 |---|---|
 | Lists / probes | `nlist=400000`, `nprobe=96` |
-| Training | Full-base LV+, random partition, 15 passes, seed 0, 16 build workers |
+| Training | Full-base LV+, random partition, 10 passes, seed 0, 16 build workers |
 | Assignment / query router | PCA-refined; PCA variance 0.95; breadth 128; centroid rerank factor 3 |
 | Training routing | Breadth 64, rerank factor 3, refinement breadth 128 |
 | Vector reranking / query workers | Factor 3 / 8 workers |
@@ -155,7 +155,7 @@ Existing paths, including failed runs, are not overwritten. Use a fresh
 `EVAL_TEMPFILES` root to prepare again or `IVF_RUN_TAG` to repeat from the same base.
 Keep inputs trusted and immutable. Only `faiss-1.9.0-cpu1` bundles are accepted,
 with `faiss-1.9.0-ivf1` optimized graphs when enabled. Prepare fresh matching
-FAISS/15-pass bases; former hnswlib bundles and mode names are rejected, never
+FAISS/10-pass bases; former hnswlib bundles and mode names are rejected, never
 relabelled or deleted. Refinement-grid reuse checks both backend and training passes.
 
 ### Insertion workers, input staging and same-process warmup
@@ -288,7 +288,7 @@ before final stable-state scoring. Mixed execution does not export checkpoints.
 
 CLI/harness training defaults are `IVF_TRAINER_MODE=lv-plus`,
 `IVF_INIT=random_partition`, `IVF_TRAINING_BREADTH=64`, `IVF_SAMPLE_RATE=1`,
-`IVF_MAX_REPS=15` and `IVF_SEED=0`.
+`IVF_MAX_REPS=10` and `IVF_SEED=0`.
 The operational examples and quickstart retain `IVF_SAMPLE_RATE=1`: every initial-base row participates
 in training. Sampling examples below are optional ablations, not quickstart steps.
 
@@ -316,8 +316,8 @@ python3 benchmark/IVF/qualify.py train \
   --modes exact,ann-rebuild,ann-reuse,ann-reuse-seeded,ann-reuse-count,ann-reuse-seeded-count,lv,lv-plus \
   --init random_partition --training-breadth 64 \
   --training-rerank-factor 3 --training-refine-breadth 128 \
-  --nlist 256 --sample-rate 0.01 --iterations 3 --seed 0 --threads 4 \
-  --memory-budget-gb 1 --exact-work-limit 20000000 \
+  --nlist 256 --sample-rate 0.01 --iterations 10 --seed 0 --threads 4 \
+  --memory-budget-gb 1 --exact-work-limit 30000000 \
   --assignment-work-limit 100000 --evaluation-rows 1000 \
   --evaluation-work-limit 300000 --routing-work-limit 1000000000 --timeout 1800
 ```
@@ -729,13 +729,16 @@ no selector, arguments or dry run. It does not prepare or execute insertion,
 deletion or mixed workloads.
 Those workloads remain available through the individual prepare/run scripts.
 
-**Training limit:** the sweep uses **15 passes on all 90M base rows**,
-plus final assignment: **1.44B searches**, admitted by the separate native
+**Training limit:** the sweep uses **10 passes on all 90M base rows**,
+plus final assignment: **990M searches**, admitted by the separate native
 **3B assignment-search guard**. The runner replaces inherited IVF tuning with
 its fixed preset; individual workload/native interfaces remain configurable.
 This guard applies to **LV+ as well as the other trainers**. These are fixed pass
 caps, not convergence-based stopping or paper-mandated iteration counts. Full
 training can be expensive; LV+ does not reduce the number of sampled rows here.
+The pass count means ten mean updates. LV/LV+ also refit PCA for the separate
+final assignment round; it performs no further mean update. This does not change
+the PCA eigensolver's internal sweep/convergence limits.
 
 **Separate PCA/routing allowance:** at 500K centroids and 128 dimensions, one
 PCA covariance calculation counts `500000 * 128 * 129 / 2 = 4128000000`
@@ -762,7 +765,7 @@ your parent shell's exports.
 
 | Recipe setting | Value |
 |---|---|
-| Training | Full-base LV+, 16 workers, seed 0; 15 passes plus final assignment |
+| Training | Full-base LV+, 16 workers, seed 0; 10 passes plus final assignment |
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
 | Query grid | Seven nlist values × fifteen nprobe values; router breadth 128; Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
@@ -885,7 +888,7 @@ under the preparation's `runs/run-0001_np16_rb128/`, etc.
 The runner stops at the first failure and preserves evidence. A subsequent
 invocation reuses completed preparations and reruns the complete query grid with
 new tags. Partial or incompatible preparations are not overwritten: inspect the
-failure and choose another root if necessary. In particular, older 20-thread or
+failure and choose another root if necessary. In particular, older 15-pass, 20-thread or
 3B/5B routing-allowance builds are not relabeled as this preset. Shared GT coverage
 is rechecked on every invocation; existing per-preparation derived GT is retained.
 Freeze settings and warmup policy before evaluation; post-observation tuning is

@@ -170,6 +170,20 @@ namespace {
           require(exact_sse == assigned, "Exact oracle mismatch");
       }
     }
+    // Exercise the actual default pass count, not just admission arithmetic.
+    auto default_passes = config;
+    default_passes.max_reps = BuildConfig{}.max_reps;
+    default_passes.trainer_mode = TrainerMode::LVPlus;
+    default_passes.init = CentroidInit::RandomPartition;
+    const auto full = train_centroids_ann(path, default_passes, options);
+    require(default_passes.max_reps == 10 && full.passes.size() == 11 &&
+                full.objective_history.size() == 10 &&
+                full.assignment_searches == uint64_t(default_passes.training_count()) * 11 &&
+                full.assignment_index_refreshes == 10 && full.passes.back().mean_seconds == 0,
+            "Default LV+ must perform ten mean updates plus final assignment");
+    for (const auto& pass : full.passes)
+      require(pass.projected_dim > 0 && pass.pca_seconds > 0,
+              "Default LV+ omitted a PCA refit, including the final assignment round");
     config.trainer_mode = TrainerMode::AnnReuseSeeded;
     rejects([&] { train_centroids_ann(path, config, options, {1, 1, 1}); });
     config.memory_budget_gb = .00001;

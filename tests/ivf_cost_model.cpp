@@ -222,9 +222,10 @@ int main(int argc, char** argv) {
     add(retained, mul(uint64_t(qcount) * candidates.size(), 128));
     add(retained, 65536);
     add(retained,
-        mul(candidates.size(), uint64_t(sizeof(Candidate)) +
-                                   mul(uint64_t(args.u32("--max_reps", 15)) + 1,
-                                       sizeof(TrainingPass) + sizeof(double))));
+        mul(candidates.size(),
+            uint64_t(sizeof(Candidate)) +
+                mul(uint64_t(args.u32("--max_reps", defaults::max_reps)) + 1,
+                    sizeof(TrainingPass) + sizeof(double))));
     add(retained,
         mul(dim,
             256ull * 4 * 4));  // PQ centroid/transpose/LUT storage allowance.
@@ -275,7 +276,7 @@ int main(int argc, char** argv) {
     config.sample_rate = 1;
     config.data_type = DataType::Float;
     config.seed = seed;
-    config.max_reps = args.u32("--max_reps", 15);
+    config.max_reps = args.u32("--max_reps", config.max_reps);
     config.build_threads = args.u32("--build_threads", 1);
     config.memory_budget_gb =
         double(budget - retained) / (1024.0 * 1024 * 1024);
