@@ -36,6 +36,7 @@ class ExperimentTests(unittest.TestCase):
                         EVAL_TEMPFILES=str(self.root / 'output'), EVAL_CACHED=str(self.root / 'cache'))
         self.calls = []
         self.commands = []
+        self.gt_envs = []
         self.gt_status = 0
         self.fail_query = False
         self.fail_prepare = False
@@ -61,6 +62,7 @@ class ExperimentTests(unittest.TestCase):
             file.write('fake command evidence\n')
         if Path(command[1]).name == 'ensure_gt.py':
             self.assertEqual(command[0], sys.executable)
+            self.gt_envs.append(dict(env))
             with stdout_path.open('x') as file:
                 file.write(str(self.root / 'truth.bin') + '\n')
             if self.gt_status:
@@ -116,7 +118,7 @@ class ExperimentTests(unittest.TestCase):
                      routing_work_limit='10000000000', router_mode='pca-refined', router_rerank_factor='3',
                      training_rerank_factor='3', training_refine_breadth='128')
         execution = dict(IVF_ROUTER_MODE='pca-refined', IVF_ROUTER_RERANK_FACTOR='3', IVF_ROUTER_BREADTH='128',
-                         IVF_RERANK_FACTOR='3', IVF_WARMUP_QUERIES='64', IVF_QUERY_MEMORY_BUDGET_GB='96',
+                         IVF_RERANK_FACTOR='3', IVF_WARMUP_QUERIES='0', IVF_QUERY_MEMORY_BUDGET_GB='96',
                          QUERY_THREADS='8', NTHREADS='16', OMP_NUM_THREADS='16', OMP_THREAD_LIMIT='16',
                          MKL_NUM_THREADS='1', INSERT_POINTS=None, IVF_COST_MODEL_REPORT=None)
         for call in calls:
@@ -144,6 +146,23 @@ class ExperimentTests(unittest.TestCase):
         self.assertTrue((self.evidence(2) / 'results.csv').is_file())
         for path, contents in before.items():
             self.assertEqual(path.read_bytes(), contents, str(path))
+
+    def test_gt_has_16_openmp_and_mkl_threads_without_changing_ann(self):
+        self.fail_query = True
+        with self.assertRaisesRegex(ValueError, r'command failed \(7\)'):
+            self.invoke(OMP_NUM_THREADS='2', OMP_THREAD_LIMIT='2', MKL_NUM_THREADS='2')
+        self.assertEqual(len(self.gt_envs), 1)
+        expected = dict(OMP_NUM_THREADS='16', OMP_THREAD_LIMIT='16', MKL_NUM_THREADS='16')
+        self.assertEqual({k: self.gt_envs[0][k] for k in expected}, expected)
+        self.assertEqual(self.commands[0][self.commands[0].index('--num-threads') + 1], '16')
+        for call in self.calls:
+            self.assertEqual(call['env']['OMP_NUM_THREADS'], '16')
+            self.assertEqual(call['env']['OMP_THREAD_LIMIT'], '16')
+            self.assertEqual(call['env']['MKL_NUM_THREADS'], '1')
+        evidence = (self.evidence() / 'settings.env').read_text()
+        for key, value in expected.items():
+            self.assertIn(f'GT_{key}={value}\n', evidence)
+        self.assertIn('MKL_NUM_THREADS=1\n', evidence)
 
     def test_no_mode_or_dry_run_arguments(self):
         for arg in ('workloads', 'sift100m-wide', 'sift100m-refine', '--dry-run'):

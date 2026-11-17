@@ -560,12 +560,21 @@ sudo apt update
 
 sudo apt install build-essential cmake git curl python3 tmux \
   libboost-dev libaio-dev libgoogle-perftools-dev \
-  libmkl-full-dev libomp-dev python3-numpy
+  libmkl-full-dev libomp-dev python3-numpy jq
 ```
 
 Accept the MKL license if prompted. This uses Ubuntu-packaged MKL and its
 `iomp5`-compatible OpenMP runtime, not a separate oneAPI installation. Record
 these versions when comparing performance with other builds.
+
+If necessary, add disk space to the relevant portion. 
+
+```bash
+lsblk
+sudo mkfs.ext4 -F /dev/diskname
+cd ~
+sudo mkdir -p project && sudo mount /dev/diskname project && sudo chown $USER: project
+```
 
 For remote work, start a persistent terminal before continuing.
 
@@ -769,7 +778,8 @@ your parent shell's exports.
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
 | Query grid | Seven nlist values × fifteen nprobe values; router breadth 128; Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
-| Other workers | 16 mixed/OpenMP workers configured; no mixed workload runs; MKL uses one worker |
+| Other workers | 16 mixed/OpenMP workers configured; no mixed workload runs; ANN MKL uses one worker |
+| Shared GT generation | 16 OpenMP threads and 16 MKL threads in a GT-only child environment |
 | Warmup | 64 serial frozen-centroid queries per pass in the same native process |
 | Routing work allowance | 10,000,000,000 counted operations; separate assignment-search guard unchanged |
 
@@ -777,6 +787,12 @@ Each prepare/query/GT command has a fixed **86400-second timeout**, using the
 shared Python process-group runner. Configurations and native processes execute
 sequentially; the complete grid may take days. There are no total/per-index deadline managers.
 Check free space on both input and work/cache filesystems before starting.
+
+The sweep gives `ensure_gt.py` its own `OMP_NUM_THREADS=16`, `OMP_THREAD_LIMIT=16`
+and `MKL_NUM_THREADS=16`, and requests `--num-threads 16` for the native generator.
+These GT-only settings are recorded with a `GT_` prefix in `settings.env` and do
+not change the ANN thread settings. They apply to newly started GT generation,
+not an already-running process; passing existing GT is still reused unchanged.
 
 `ensure_gt.py` ignores nonexistent shell paths, finds
 existing caches, and checks every query against the 90M-row query-only base

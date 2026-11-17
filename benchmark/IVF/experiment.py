@@ -93,13 +93,15 @@ def run():
     validate_pq64(env["IVF_PQ_PREFIX"])
     root = Path(env["EVAL_TEMPFILES"])
     evidence = next_run(root)
+    # GT uses large BLAS multiplies; do not inherit ANN's single-threaded MKL policy.
+    gt_env = dict(env, OMP_NUM_THREADS="16", OMP_THREAD_LIMIT="16", MKL_NUM_THREADS="16")
     execute([
         sys.executable, str(REPO / "benchmark/scripts/ensure_gt.py"),
         "--base-file", env["DATA_BIN"], "--query-file", env["QUERY_BIN"],
         "--full-count", str(FULL_COUNT), "--base-count", str(BASE_COUNT), "--query-only",
         "--k-out", "10", "--expected-queries", "10000", "--num-threads", "16",
         "--cache-dir", env["GT_ARTIFACT_DIR"], "--cached-gt", env["GT_BIN_KCACHED"], "--generate",
-    ], evidence / "groundtruth.log", TIMEOUT_S, None, env=env, stdout_path=evidence / "selected_gt.txt")
+    ], evidence / "groundtruth.log", TIMEOUT_S, None, env=gt_env, stdout_path=evidence / "selected_gt.txt")
     env["GT_BIN_KCACHED"] = (evidence / "selected_gt.txt").read_text().strip()
     require(Path(env["GT_BIN_KCACHED"]).is_file(), "GT helper did not return a usable path")
     names = set(PRESET) | {"DATA_BIN", "QUERY_BIN", "IVF_BUILD_DIR", "IVF_PQ_PREFIX", "EVAL_TEMPFILES",
@@ -107,6 +109,8 @@ def run():
     with (evidence / "settings.env").open("x") as out:
         for name in sorted(names):
             out.write(f"{name}={shlex.quote(env[name])}\n")
+        for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS"):
+            out.write(f"GT_{name}={shlex.quote(gt_env[name])}\n")
         out.write("TRAINING_ASSIGNMENT_SEARCH_LIMIT=3000000000\n")
     with (evidence / "grid.tsv").open("x", newline="") as out:
         grid = csv.writer(out, delimiter="\t")
