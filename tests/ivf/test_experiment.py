@@ -126,8 +126,10 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual({k: call['env'].get(k) for k in execution}, execution)
         with (self.evidence() / 'results.csv').open() as file:
             reader = csv.DictReader(file)
-            self.assertNotIn('effective_breadth', reader.fieldnames)
+            fields = ['nlist', 'nprobe', 'router_breadth', 'recall_at_10_percent', 'query_qps', 'query_time_s']
+            self.assertEqual(reader.fieldnames, fields)
             rows = list(reader)
+        self.assertTrue(all(set(row) == set(fields) for row in rows))
         expected = [(nl, np, 128) for nl in NLISTS for np in PROBES]
         self.assertEqual([(int(r['nlist']), int(r['nprobe']), int(r['router_breadth'])) for r in rows], expected)
         with (self.evidence() / 'grid.tsv').open() as file:

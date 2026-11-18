@@ -897,7 +897,9 @@ Centroids/graphs/PCA cannot be reused between different nlist values.
 Each invocation owns fresh evidence in `$EVAL_TEMPFILES/sweeps/run-0001/`,
 `run-0002/`, etc. Keep `settings.env`, `grid.tsv`, `results.csv`,
 `selected_gt.txt`, logs and `heap-cleanup.log`. The CSV contains native
-nlist/probe/requested breadth, Recall@10, QPS, query time and `output_dir`.
+nlist/probe/requested breadth, Recall@10, QPS and query time, with no output-directory
+column. Repeated query-sweep trial records likewise use run tags rather than
+duplicating output-directory paths.
 Native `result.json` and `execution_protocol.json` remain in each tagged run
 under the preparation's `runs/run-0001_np16_rb128/`, etc.
 

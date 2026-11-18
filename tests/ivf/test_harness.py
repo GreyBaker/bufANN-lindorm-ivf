@@ -95,6 +95,7 @@ def main():
             IVF_GT_FILE=str(truth),
             IVF_MAX_REPS="2",
             IVF_BUILD_THREADS="2",
+            IVF_WARMUP_QUERIES="64",  # Keep this fixture's policy independent of runtime defaults.
             IVF_BUFFER_FRAMES="64",
             IVF_MEMORY_BUDGET_GB="1",
             IVF_NPROBE="2",
@@ -161,7 +162,11 @@ def main():
             for g in summary["groups"]
         )
         assert all(
-            Path(t["output_dir"]).joinpath("neighbors.bin").is_file()
+            "output_dir" not in t and (work / "runs" / t["run_tag"] / "neighbors.bin").is_file()
+            for t in summary["trial_records"]
+        )
+        assert all(
+            "output_dir" not in json.loads((sweep_root / (t["run_tag"] + ".json")).read_text())
             for t in summary["trial_records"]
         )
         assert json.loads((sweep_root / "plan.json").read_text())["affinity"]["explicitly_pinned"]

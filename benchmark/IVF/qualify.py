@@ -391,7 +391,6 @@ def sweep(args):
                 trial,
                 metrics=record,
                 process_wall_s=wall,
-                output_dir=str(path),
                 result_identity=digest(path / "result.json"),
                 neighbors_identity=digest(path / "neighbors.bin"),
             )

@@ -118,7 +118,7 @@ def run():
         grid.writerows((nl, np, 128) for nl in NLISTS for np in PROBES)
     with (evidence / "results.csv").open("x", newline="") as out:
         results = csv.writer(out)
-        results.writerow(("nlist", "nprobe", "router_breadth", "recall_at_10_percent", "query_qps", "query_time_s", "output_dir"))
+        results.writerow(("nlist", "nprobe", "router_breadth", "recall_at_10_percent", "query_qps", "query_time_s"))
         out.flush()
         for nlist in NLISTS:
             env.update(IVF_NLIST=str(nlist), EVAL_TEMPFILES=str(root / f"nlist-{nlist}"))
@@ -137,8 +137,8 @@ def run():
                         evidence / f"nl{nlist}-np{probe}.log", TIMEOUT_S, None, env=env)
                 folder = work / "runs" / env["IVF_RUN_TAG"]
                 result = read_json(folder / "result.json")
-                results.writerow([result[key] for key in ("nlist", "nprobe", "router_breadth", "recall", "query_qps", "query_time_s")]
-                                 + [str(folder)])
+                results.writerow(result[key] for key in
+                                 ("nlist", "nprobe", "router_breadth", "recall", "query_qps", "query_time_s"))
                 out.flush()
                 (folder / "query.heap").unlink()
                 (folder / "query.heap.pq.bin").unlink()
