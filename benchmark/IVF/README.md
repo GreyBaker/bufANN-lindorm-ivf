@@ -77,25 +77,17 @@ no DiskANN/Vamana graph is needed.
 ## 5. Prepare and run IVF
 
 Choose a centroid count and resource budget before evaluating final queries.
-The SIFT1M example below uses the configuration exercised by the local WSL run;
-it is not the SIFT100M configuration or a change to library/harness defaults:
+The SIFT1M example below overrides only its list/probe counts and memory budgets;
+training and routing otherwise use the defaults documented below:
 
 ```bash
 export DATASET=sift1m
 export IVF_PQ_PREFIX=/absolute/path/to/existing-full-source-pq64/prefix
-export IVF_NLIST=10000 IVF_MEMORY_BUDGET_GB=6 IVF_BUILD_THREADS=20
-export IVF_QUERY_MEMORY_BUDGET_GB=6 IVF_BUFFER_FRAMES=262144
-export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1
-export IVF_SAMPLE_RATE=1 IVF_TRAINER_MODE=lv-plus IVF_MAX_REPS=10
-export IVF_INIT=random_partition IVF_TRAINING_BREADTH=64 IVF_SEED=0
-export IVF_TRAINING_RERANK_FACTOR=3 IVF_TRAINING_REFINE_BREADTH=128
-export IVF_OPTIMIZED_MODES=1 IVF_ASSIGNMENT_ROUTER_MODE=pca-refined
-export IVF_BUILD_ROUTER_RERANK_FACTOR=3 IVF_PCA_VARIANCE=0.95 IVF_REFINE_EF=128
-export IVF_QUERY_BREADTH=128 IVF_INSERT_BREADTH=64
-export IVF_ROUTER_MODE=pca-refined IVF_ROUTER_RERANK_FACTOR=3 IVF_ROUTER_BREADTH=128
+export IVF_NLIST=10000 IVF_MEMORY_BUDGET_GB=6
+export IVF_QUERY_MEMORY_BUDGET_GB=6
 
 bash benchmark/IVF/sift/query_prepare.sh
-export IVF_NPROBE=32 IVF_RERANK_FACTOR=3 QUERY_THREADS=8
+export IVF_NPROBE=32
 bash benchmark/IVF/sift/query.sh
 
 UPDATE_PERCENT=10 bash benchmark/IVF/sift/insert_prepare.sh
@@ -104,8 +96,7 @@ UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete_prepare.sh
 UPDATE_PERCENT=10 bash benchmark/IVF/sift/delete.sh
 
 UPDATE_PERCENT=10 UPDATE_BATCH=10000 bash benchmark/IVF/sift/update_prepare.sh
-UPDATE_PERCENT=10 UPDATE_BATCH=10000 IVF_SCHEDULER=update_driven NTHREADS=16 \
-  QUERY_THREADS=8 bash benchmark/IVF/sift/update.sh
+UPDATE_PERCENT=10 UPDATE_BATCH=10000 bash benchmark/IVF/sift/update.sh
 ```
 
 Sequential insertion defaults to one worker; bounded parallel insertion is opt-in
@@ -124,7 +115,7 @@ New library/CLI builds and the workload harness use the same defaults:
 | Setting | Default |
 |---|---|
 | Lists / probes | `nlist=400000`, `nprobe=96` |
-| Training | Full-base LV+, random partition, 10 passes, seed 0, 16 build workers |
+| Training | Full-base LV+, random partition, 10 passes, seed 0; preparation uses all available logical CPUs |
 | Assignment / query router | PCA-refined; PCA variance 0.95; breadth 128; centroid rerank factor 3 |
 | Training routing | Breadth 64, rerank factor 3, refinement breadth 128 |
 | Vector reranking / query workers | Factor 3 / 8 workers |
@@ -142,6 +133,18 @@ including for older indexes. Existing artifacts are not relabeled or migrated;
 new default build settings produce different cache identities where appropriate.
 Calibration and diagnostic control profiles keep their own explicit settings.
 Dataset paths, external PQ width and sweep grids are not implementation defaults.
+
+Query/insert/delete/update preparation defaults `IVF_BUILD_THREADS` to the number
+of logical processors available to the process (respecting CPU affinity, like
+SPFresh's `nproc`). Set `IVF_BUILD_THREADS=N` to override, including in
+`experiment.py`. Preparation-only OpenMP defaults follow that count; standalone
+scripts retain explicit `OMP_NUM_THREADS`/`OMP_THREAD_LIMIT` overrides. The sweep
+sets both preparation OpenMP values to its selected build-worker count. Query
+workers, mixed workers and ANN MKL=1 are unchanged. Shared GT generation uses
+the preparation count for both OpenMP and MKL in a separate child environment.
+This selects worker counts; serial graph/heap phases remain serial.
+Direct native tools retain their 16-worker default. A changed build-worker count
+changes preparation/cache identity; preserve older trees and use a fresh root.
 
 Work files live in `eval_tempfiles/<dataset>/IVF/<workload>/`; reusable immutable
 bundles live in `eval_cached/<dataset>/IVF/`. Runs retain logs, one native
@@ -645,10 +648,12 @@ source "benchmark/datasets/$DATASET.sh"
 printf 'Dataset=%s total=%s base=%s updates=%s\n' \
   "$DATASET" "$NPTS_FULL" "$NPTS_BASE" "$UPDATE_POINTS"
 
-export OMP_NUM_THREADS=20 MKL_NUM_THREADS=1 IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
+export IVF_PQ_PREFIX="$DATA_ROOT/pq/pq64"
 
 (
   set -euo pipefail
+  # PQ-only: avoid nested BLAS teams without capping later preparation/GT.
+  export MKL_NUM_THREADS=1
   # PQ helpers can overwrite outputs; refuse existing PQ before downloading.
   for output in "${IVF_PQ_PREFIX}"_*; do
     [[ ! -e "$output" && ! -L "$output" ]] || {
@@ -749,6 +754,9 @@ The pass count means ten mean updates. LV/LV+ also refit PCA for the separate
 final assignment round; it performs no further mean update. This does not change
 the PCA eigensolver's internal sweep/convergence limits.
 
+Preparation and GT automatically use all available logical CPUs; no thread
+exports are needed. `IVF_BUILD_THREADS` is the optional preparation override.
+
 **Separate PCA/routing allowance:** at 500K centroids and 128 dimensions, one
 PCA covariance calculation counts `500000 * 128 * 129 / 2 = 4128000000`
 operations. The sweep declares a finite **10B** allowance, leaving headroom for
@@ -764,8 +772,9 @@ python3 benchmark/IVF/experiment.py
 ```
 
 Retain the verified `DATA_BIN`, `QUERY_BIN`, `IVF_PQ_PREFIX` and `IVF_BUILD_DIR`
-locations from steps 1–3. Only locations are configurable in this runner; there
-are no tuning or resource overrides. The defaults use the dataset's shared inputs,
+locations from steps 1–3. Locations and `IVF_BUILD_THREADS` are configurable in
+this runner; other tuning/resource settings remain fixed. The defaults use the
+dataset's shared inputs,
 PQ prefix `$(dirname "$DATA_BIN")/pq/pq64`, build tree `build/ivf-benchmark`, and
 the work/cache locations above. PQ64 validation checks full-source code shape and
 length, pivot dimensions and 64 chunks; native tools perform detailed validation.
@@ -774,12 +783,12 @@ your parent shell's exports.
 
 | Recipe setting | Value |
 |---|---|
-| Training | Full-base LV+, 16 workers, seed 0; 10 passes plus final assignment |
+| Training | Full-base LV+, all available logical CPUs (or `IVF_BUILD_THREADS`), seed 0; 10 passes plus final assignment |
 | Routing | PCA-refined for assignment/query; PCA variance 0.95; both rerank factors 3 |
 | Query grid | Seven nlist values × fifteen nprobe values; router breadth 128; Recall@10 |
 | Resources | 96 GiB build/query allowances, 262144 frames, 8 query workers |
-| Other workers | 16 mixed/OpenMP workers configured; no mixed workload runs; ANN MKL uses one worker |
-| Shared GT generation | 16 OpenMP threads and 16 MKL threads in a GT-only child environment |
+| Other workers | Preparation OpenMP follows build workers; query/mixed OpenMP remains 16; ANN MKL uses one worker |
+| Shared GT generation | Preparation worker count for OpenMP and MKL in a GT-only child environment |
 | Warmup | 64 serial frozen-centroid queries per pass in the same native process |
 | Routing work allowance | 10,000,000,000 counted operations; separate assignment-search guard unchanged |
 
@@ -788,10 +797,12 @@ shared Python process-group runner. Configurations and native processes execute
 sequentially; the complete grid may take days. There are no total/per-index deadline managers.
 Check free space on both input and work/cache filesystems before starting.
 
-The sweep gives `ensure_gt.py` its own `OMP_NUM_THREADS=16`, `OMP_THREAD_LIMIT=16`
-and `MKL_NUM_THREADS=16`, and requests `--num-threads 16` for the native generator.
+The sweep gives `ensure_gt.py` its own `OMP_NUM_THREADS`, `OMP_THREAD_LIMIT`
+and `MKL_NUM_THREADS`, all set to the preparation worker count, and requests
+the same `--num-threads` count for the native generator.
 These GT-only settings are recorded with a `GT_` prefix in `settings.env` and do
-not change the ANN thread settings. They apply to newly started GT generation,
+not change the ANN thread settings. Preparation OpenMP settings are recorded
+with a `PREP_` prefix. They apply to newly started GT generation,
 not an already-running process; passing existing GT is still reused unchanged.
 
 `ensure_gt.py` ignores nonexistent shell paths, finds
@@ -906,8 +917,9 @@ under the preparation's `runs/run-0001_np16_rb128/`, etc.
 The runner stops at the first failure and preserves evidence. A subsequent
 invocation reuses completed preparations and reruns the complete query grid with
 new tags. Partial or incompatible preparations are not overwritten: inspect the
-failure and choose another root if necessary. In particular, older 15-pass, 20-thread or
-3B/5B routing-allowance builds are not relabeled as this preset. Shared GT coverage
+failure and choose another root if necessary. In particular, older 15-pass builds,
+different build-worker counts or 3B/5B routing-allowance builds are not relabeled
+as this preset. Shared GT coverage
 is rechecked on every invocation; existing per-preparation derived GT is retained.
 Freeze settings and warmup policy before evaluation; post-observation tuning is
 not independent held-out validation.

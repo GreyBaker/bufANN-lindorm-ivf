@@ -8,7 +8,9 @@ import struct
 import sys
 
 from common import execute, header, read_json, require
-from settings import DEFAULT_ENV, ROUTER_BACKEND_ID, build_settings
+from settings import (
+    DEFAULT_ENV, ROUTER_BACKEND_ID, build_settings, build_thread_count, preparation_environment,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parents[1]
@@ -25,7 +27,7 @@ PRESET = {
 
 
 def environment():
-    """Keep location choices, not inherited experiment tuning."""
+    """Keep locations and the preparation-worker override, not experiment tuning."""
     def location(name, default):
         return str(Path(os.environ.get(name) or default).expanduser().absolute())
 
@@ -38,6 +40,7 @@ def environment():
                "INSERT_CAP", "DELETE_CAP", "EVAL_CACHE_NO_STORE"}
     env = {k: v for k, v in os.environ.items() if not k.startswith("IVF_") and k not in ignored}
     env.update(PRESET)
+    env["IVF_BUILD_THREADS"] = build_thread_count()
     env.update(
         DATA_BIN=data, QUERY_BIN=location("QUERY_BIN", Path(dataset) / "query.10K.bin"),
         IVF_BUILD_DIR=build, IVF_PQ_PREFIX=location("IVF_PQ_PREFIX", Path(data).parent / "pq/pq64"),
@@ -90,16 +93,20 @@ def check_preparation(work, env):
 
 def run():
     env = environment()
+    # Preparation may use every CPU without changing query/mixed OpenMP policy.
+    prepare_env = preparation_environment(dict(
+        env, OMP_NUM_THREADS=env["IVF_BUILD_THREADS"], OMP_THREAD_LIMIT=env["IVF_BUILD_THREADS"]))
     validate_pq64(env["IVF_PQ_PREFIX"])
     root = Path(env["EVAL_TEMPFILES"])
     evidence = next_run(root)
     # GT uses large BLAS multiplies; do not inherit ANN's single-threaded MKL policy.
-    gt_env = dict(env, OMP_NUM_THREADS="16", OMP_THREAD_LIMIT="16", MKL_NUM_THREADS="16")
+    threads = env["IVF_BUILD_THREADS"]
+    gt_env = dict(env, OMP_NUM_THREADS=threads, OMP_THREAD_LIMIT=threads, MKL_NUM_THREADS=threads)
     execute([
         sys.executable, str(REPO / "benchmark/scripts/ensure_gt.py"),
         "--base-file", env["DATA_BIN"], "--query-file", env["QUERY_BIN"],
         "--full-count", str(FULL_COUNT), "--base-count", str(BASE_COUNT), "--query-only",
-        "--k-out", "10", "--expected-queries", "10000", "--num-threads", "16",
+        "--k-out", "10", "--expected-queries", "10000", "--num-threads", threads,
         "--cache-dir", env["GT_ARTIFACT_DIR"], "--cached-gt", env["GT_BIN_KCACHED"], "--generate",
     ], evidence / "groundtruth.log", TIMEOUT_S, None, env=gt_env, stdout_path=evidence / "selected_gt.txt")
     env["GT_BIN_KCACHED"] = (evidence / "selected_gt.txt").read_text().strip()
@@ -111,6 +118,8 @@ def run():
             out.write(f"{name}={shlex.quote(env[name])}\n")
         for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT", "MKL_NUM_THREADS"):
             out.write(f"GT_{name}={shlex.quote(gt_env[name])}\n")
+        for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT"):
+            out.write(f"PREP_{name}={shlex.quote(prepare_env[name])}\n")
         out.write("TRAINING_ASSIGNMENT_SEARCH_LIMIT=3000000000\n")
     with (evidence / "grid.tsv").open("x", newline="") as out:
         grid = csv.writer(out, delimiter="\t")
@@ -129,7 +138,9 @@ def run():
             else:
                 print(f"Preparing nlist={nlist}; log: {evidence / f'nl{nlist}-prepare.log'}", flush=True)
                 execute(["bash", str(SCRIPT_DIR / "sift/query_prepare.sh")],
-                        evidence / f"nl{nlist}-prepare.log", TIMEOUT_S, None, env=env)
+                        evidence / f"nl{nlist}-prepare.log", TIMEOUT_S, None,
+                        env=dict(prepare_env, IVF_NLIST=str(nlist), EVAL_TEMPFILES=env["EVAL_TEMPFILES"],
+                                 GT_BIN_KCACHED=env["GT_BIN_KCACHED"]))
             for probe in PROBES:
                 env.update(IVF_NPROBE=str(probe), IVF_RUN_TAG=f"{evidence.name}_np{probe}_rb128")
                 print(f"Query nlist={nlist} nprobe={probe} breadth=128; logs: {evidence}", flush=True)

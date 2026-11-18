@@ -182,6 +182,10 @@ if(IVF_BUILD_CONTRACT_TESTS)
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_orchestration.py"
                      --scratch "${CMAKE_CURRENT_BINARY_DIR}/orchestration_fixtures")
     set_tests_properties(ivf_shared_orchestration PROPERTIES TIMEOUT 30)
+    add_test(NAME ivf_preparation_threads
+             COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_preparation_threads.py"
+                     --scratch "${CMAKE_CURRENT_BINARY_DIR}/preparation_thread_fixtures")
+    set_tests_properties(ivf_preparation_threads PROPERTIES TIMEOUT 30)
     add_test(NAME ivf_sift_download
              COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/test_sift_download.py")
     set_tests_properties(ivf_sift_download PROPERTIES TIMEOUT 30)

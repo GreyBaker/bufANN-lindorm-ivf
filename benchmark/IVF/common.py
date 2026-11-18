@@ -122,13 +122,13 @@ def flags(settings):
     return [part for key, value in settings.items() for part in ("--" + key, str(value))]
 
 
-def command_log(command, path):
+def command_log(command, path, *, env=None):
     """Stream an untimed prepare/run command to both the console and owned log."""
     with Path(path).open("x") as log:
         log.write("Command: " + repr(command) + "\n")
         log.flush()
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
         with process:
             for line in process.stdout:

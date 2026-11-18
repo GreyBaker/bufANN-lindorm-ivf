@@ -35,7 +35,7 @@ class SharedOrchestrationTests(unittest.TestCase):
             "sample_rate": "1",
             "max_reps": "10",
             "seed": "0",
-            "build_threads": "16",
+            "build_threads": str(settings.logical_processors()),
             "memory_budget_gb": "96",
             "page_size": "4096",
             "buffer_frames": "262144",

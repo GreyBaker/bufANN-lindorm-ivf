@@ -1,7 +1,8 @@
 """IVF build settings and frozen calibration-selection contracts.
 
-New build/query defaults match the native implementation. Explicit overrides,
-legacy cache-key fields and historical report interpretations are preserved.
+Build/query defaults match native settings except CPU-sized preparation workers.
+Explicit overrides, legacy cache-key fields and historical report interpretations
+are preserved.
 """
 
 import json
@@ -15,12 +16,37 @@ ROUTER_BACKEND_ID = "faiss-1.9.0-cpu1"
 TRAINING_PASSES = "10"  # Mean-update passes, followed by a separate final assignment.
 
 
+def logical_processors():
+    """Available logical CPUs, respecting taskset/cpuset restrictions like nproc."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def build_thread_count(env=None):
+    env = os.environ if env is None else env
+    value = env.get("IVF_BUILD_THREADS") or str(logical_processors())
+    require(value.isdecimal() and int(value) > 0, "IVF_BUILD_THREADS must be a positive integer")
+    return value
+
+
+def preparation_environment(env=None):
+    """Preparation-only defaults; never change the caller's query environment."""
+    result = dict(os.environ if env is None else env)
+    threads = build_thread_count(result)
+    result["IVF_BUILD_THREADS"] = threads
+    for name in ("OMP_NUM_THREADS", "OMP_THREAD_LIMIT"):
+        result[name] = result.get(name) or threads
+    return result
+
+
 BUILD_DEFAULTS = {
     "nlist": "400000",
     "sample_rate": "1",
     "max_reps": TRAINING_PASSES,
     "seed": "0",
-    "build_threads": "16",
+    "build_threads": str(logical_processors()),
     "memory_budget_gb": "96",
     "page_size": "4096",
     "buffer_frames": "262144",
@@ -53,7 +79,7 @@ DEFAULT_ENV.update({
     "IVF_NPROBE": QUERY_DEFAULTS["nprobe"], "IVF_RERANK_FACTOR": QUERY_DEFAULTS["rerank_factor"],
     "QUERY_THREADS": QUERY_DEFAULTS["query_threads"], "IVF_WARMUP_QUERIES": WARMUP_QUERIES,
     "IVF_QUERY_MEMORY_BUDGET_GB": BUILD_DEFAULTS["memory_budget_gb"], "NTHREADS": MIXED_THREADS,
-    "OMP_NUM_THREADS": BUILD_DEFAULTS["build_threads"], "OMP_THREAD_LIMIT": BUILD_DEFAULTS["build_threads"],
+    "OMP_NUM_THREADS": MIXED_THREADS, "OMP_THREAD_LIMIT": MIXED_THREADS,
     "MKL_NUM_THREADS": "1",
 })
 
@@ -374,6 +400,7 @@ def build_settings(env=None):
     result = {
         key: env.get("IVF_" + key.upper(), value) for key, value in BUILD_DEFAULTS.items()
     }
+    result["build_threads"] = build_thread_count(env)
     # Preserve legacy cache keys unless the new trainer/settings are requested.
     for key, default in (("training_rerank_factor", "3"), ("training_refine_breadth", "128")):
         value = env.get("IVF_" + key.upper())

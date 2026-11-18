@@ -16,6 +16,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'benchmark/IVF'))
 import experiment
+import settings
 from settings import ROUTER_BACKEND_ID, build_settings
 
 SCRATCH = None
@@ -25,6 +26,9 @@ PROBES = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192, 224, 256, 384, 512]
 
 class ExperimentTests(unittest.TestCase):
     def setUp(self):
+        self.cpu_count = patch.object(settings, 'logical_processors', return_value=24)
+        self.cpu_count.start()
+        self.addCleanup(self.cpu_count.stop)
         self.temp = tempfile.TemporaryDirectory(prefix='query recipe ', dir=SCRATCH)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -109,11 +113,11 @@ class ExperimentTests(unittest.TestCase):
     def test_fixed_grid_results_and_repeated_preparation_reuse(self):
         self.invoke(INSERT_POINTS='1', IVF_MAX_REPS='2', IVF_ROUTING_WORK_LIMIT='1',
                     IVF_COST_MODEL_REPORT='missing', IVF_NLIST='1', QUERY_THREADS='99',
-                    IVF_BUILD_THREADS='99', IVF_WARMUP_QUERIES='0')
+                    IVF_WARMUP_QUERIES='0')
         calls = list(self.calls)
         self.assertEqual([int(c['settings']['nlist']) for c in calls if c['script'] == 'query_prepare'], NLISTS)
         self.assertEqual([c['script'] for c in calls], (['query_prepare'] + ['query'] * 15) * 7)
-        fixed = dict(max_reps='10', trainer_mode='lv-plus', build_threads='16', memory_budget_gb='96',
+        fixed = dict(max_reps='10', trainer_mode='lv-plus', build_threads='24', memory_budget_gb='96',
                      page_size='4096', buffer_frames='262144', optimized_modes='1', pca_variance='0.95',
                      routing_work_limit='10000000000', router_mode='pca-refined', router_rerank_factor='3',
                      training_rerank_factor='3', training_refine_breadth='128')
@@ -123,7 +127,13 @@ class ExperimentTests(unittest.TestCase):
                          MKL_NUM_THREADS='1', INSERT_POINTS=None, IVF_COST_MODEL_REPORT=None)
         for call in calls:
             self.assertEqual({k: call['settings'][k] for k in fixed}, fixed)
-            self.assertEqual({k: call['env'].get(k) for k in execution}, execution)
+            expected_execution = dict(execution)
+            if call['script'] == 'query_prepare':
+                expected_execution.update(OMP_NUM_THREADS='24', OMP_THREAD_LIMIT='24')
+            self.assertEqual({k: call['env'].get(k) for k in execution}, expected_execution)
+        evidence = (self.evidence() / 'settings.env').read_text()
+        self.assertIn('IVF_BUILD_THREADS=24\n', evidence)
+        self.assertIn('PREP_OMP_THREAD_LIMIT=24\n', evidence)
         with (self.evidence() / 'results.csv').open() as file:
             reader = csv.DictReader(file)
             fields = ['nlist', 'nprobe', 'router_breadth', 'recall_at_10_percent', 'query_qps', 'query_time_s']
@@ -136,7 +146,7 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual([tuple(map(int, r)) for r in list(csv.reader(file, delimiter='\t'))[1:]], expected)
         gt = self.commands[0]
         self.assertIn('--query-only', gt)
-        self.assertEqual(gt[gt.index('--num-threads') + 1], '16')
+        self.assertEqual(gt[gt.index('--num-threads') + 1], '24')
         self.assertIn('--generate', gt)
         self.assertEqual(len(list((self.root / 'output').rglob('base.heap'))), 7)
         self.assertEqual(len(list((self.root / 'output').rglob('neighbors.bin'))), 105)
@@ -149,22 +159,37 @@ class ExperimentTests(unittest.TestCase):
         for path, contents in before.items():
             self.assertEqual(path.read_bytes(), contents, str(path))
 
-    def test_gt_has_16_openmp_and_mkl_threads_without_changing_ann(self):
+    def test_gt_uses_preparation_workers_without_changing_ann(self):
         self.fail_query = True
         with self.assertRaisesRegex(ValueError, r'command failed \(7\)'):
             self.invoke(OMP_NUM_THREADS='2', OMP_THREAD_LIMIT='2', MKL_NUM_THREADS='2')
         self.assertEqual(len(self.gt_envs), 1)
-        expected = dict(OMP_NUM_THREADS='16', OMP_THREAD_LIMIT='16', MKL_NUM_THREADS='16')
+        expected = dict(OMP_NUM_THREADS='24', OMP_THREAD_LIMIT='24', MKL_NUM_THREADS='24')
         self.assertEqual({k: self.gt_envs[0][k] for k in expected}, expected)
-        self.assertEqual(self.commands[0][self.commands[0].index('--num-threads') + 1], '16')
+        self.assertEqual(self.commands[0][self.commands[0].index('--num-threads') + 1], '24')
         for call in self.calls:
-            self.assertEqual(call['env']['OMP_NUM_THREADS'], '16')
-            self.assertEqual(call['env']['OMP_THREAD_LIMIT'], '16')
+            threads = '24' if call['script'] == 'query_prepare' else '16'
+            self.assertEqual(call['env']['OMP_NUM_THREADS'], threads)
+            self.assertEqual(call['env']['OMP_THREAD_LIMIT'], threads)
             self.assertEqual(call['env']['MKL_NUM_THREADS'], '1')
         evidence = (self.evidence() / 'settings.env').read_text()
         for key, value in expected.items():
             self.assertIn(f'GT_{key}={value}\n', evidence)
         self.assertIn('MKL_NUM_THREADS=1\n', evidence)
+
+    def test_explicit_preparation_workers_also_apply_to_gt_not_queries(self):
+        self.fail_query = True
+        with self.assertRaisesRegex(ValueError, r'command failed \(7\)'):
+            self.invoke(IVF_BUILD_THREADS='6')
+        self.assertEqual([c['settings']['build_threads'] for c in self.calls], ['6', '6'])
+        self.assertEqual(self.calls[0]['env']['OMP_NUM_THREADS'], '6')
+        self.assertEqual(self.calls[0]['env']['OMP_THREAD_LIMIT'], '6')
+        self.assertEqual(self.calls[1]['env']['QUERY_THREADS'], '8')
+        self.assertEqual(self.calls[1]['env']['OMP_THREAD_LIMIT'], '16')
+        self.assertEqual(self.gt_envs[0]['OMP_NUM_THREADS'], '6')
+        self.assertEqual(self.gt_envs[0]['OMP_THREAD_LIMIT'], '6')
+        self.assertEqual(self.gt_envs[0]['MKL_NUM_THREADS'], '6')
+        self.assertEqual(self.commands[0][self.commands[0].index('--num-threads') + 1], '6')
 
     def test_no_mode_or_dry_run_arguments(self):
         for arg in ('workloads', 'sift100m-wide', 'sift100m-refine', '--dry-run'):

@@ -40,6 +40,7 @@ from settings import (
     read_cost_model_report,
     runtime_resources,
     insertion_threads,
+    preparation_environment,
     insertion_input_policy,
     validate_insertion_staging,
     warmup_queries,
@@ -203,7 +204,7 @@ def prepare(args):
             "--index_prefix",
             str(prefix),
         ] + flags(settings)
-        command_log(command, work / "build.log")
+        command_log(command, work / "build.log", env=preparation_environment())
         components = component_digests(index, args.dataset)
         # Recheck identities after construction; native build additionally does
         # its own before/after source checks. No recovery of partial cache dirs.
