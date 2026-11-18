@@ -21,6 +21,7 @@ assert 'SHA256=f6721f1a479b0bdd8547e5bb0dbfa872643e7ea37686c6bf6fc99fb933b3fe4f'
 assert 'execute_process' not in cmake and 'find_package(Python' not in cmake
 assert 'FINTEGER=int64_t' in cmake and 'mkl_sequential' in cmake
 assert 'REALPATH' in cmake and 'IVF_REFERENCE_BLAS' in cmake
+assert 'target_compile_options(ivf_faiss_cpu PRIVATE -Wno-sign-compare)' in cmake
 assert 'Hnswlib.cmake' not in (a.repo / 'cmake/IVF.cmake').read_text()
 assert not (a.repo / 'cmake/Hnswlib.cmake').exists()
 assert not list((a.repo / 'dependencies/hnswlib').rglob('*.h'))
