@@ -366,7 +366,6 @@ def nlist_selection(args, settings, sources):
         "target_recall": record["target_recall"],
         "rerank_factor": record["rerank_factor"],
         "validation_completed": record.get("validation_completed", False),
-        "production_qualified": False,
     }
     if record["version"] == 2:
         selection.update(

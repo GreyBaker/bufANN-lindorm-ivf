@@ -263,8 +263,7 @@ global PQ8 scanning and heap-backed vector fetching, with frozen routing across
 updates. The experiments below isolate training reuse/seeding, LV/LV+ assignment,
 router choices and centroid-count prediction before comparison with separately
 obtained baseline measurements.
-Functional tests and example settings do not establish production quality or
-paper speedups. Reserve final queries until calibration and tuning are frozen.
+Reserve final queries until calibration and tuning are frozen.
 Comparisons are ANN-mechanism studies, not matched durable-ingestion systems:
 SPFresh may pay asynchronous WAL and maintenance costs absent from this IVF path.
 Disclose those asymmetries and each baseline's actual timing/maintenance policy;
@@ -275,7 +274,7 @@ IVF page writeback does not establish recovery or durable update acknowledgment.
 Use fresh paths, declared work/memory limits and tuning queries only. **Reserve
 final queries until calibration and tuning are frozen.** Keep PQ, source rows and
 unrelated settings fixed; repeat measurements and retain failures/exclusions.
-Plans, identities and logs are retained; summaries are not production qualification.
+Plans, identities and logs are retained.
 
 ### Settings and frozen routing
 

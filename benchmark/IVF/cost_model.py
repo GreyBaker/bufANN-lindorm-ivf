@@ -75,7 +75,6 @@ def main():
             "command": command,
             "timeout_s": args.timeout,
             "official_queries_used": False,
-            "production_qualified": False,
         },
     )
     wall = execute(command, root / "calibration.log", args.timeout, args.cpus)

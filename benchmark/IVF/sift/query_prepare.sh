@@ -11,4 +11,4 @@ ivf_profile_args
 python3 "$REPO_DIR/benchmark/IVF/harness.py" prepare "${PROFILE_ARGS[@]}" \
     --pq-prefix "$IVF_PQ_PREFIX" --query "$WORK_DIR/data/query.bin" --truth "$GT_FILE" \
     --cache-root "$EVAL_CACHED" --recall-at "$RECALL_AT"
-note "Prepared IVF query tree at $WORK_DIR (no production qualification implied)"
+note "Prepared IVF query tree at $WORK_DIR"

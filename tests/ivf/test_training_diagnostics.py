@@ -91,11 +91,7 @@ def main():
                     "bytes": len(raw),
                     "sha256": hashlib.sha256(raw).hexdigest(),
                 }
-            assert (
-                summary["completed"]
-                and summary["gates_passed"]
-                and not summary["production_qualified"]
-            )
+            assert summary["completed"] and summary["gates_passed"]
             assert plan["affinity"]["explicitly_pinned"]
             assert summary["hnsw_over_exact_evaluation_sse_ratio"] <= 1.000001
             assert (

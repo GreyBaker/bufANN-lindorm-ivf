@@ -154,7 +154,7 @@ def main():
         sweep()
         sweep_root = work / "sweeps/fixture"
         summary = json.loads((sweep_root / "summary.json").read_text())
-        assert summary["gates_passed"] and not summary["production_qualified"]
+        assert summary["gates_passed"]
         assert len(summary["groups"]) == 2 and len(summary["trial_records"]) == 6
         assert sum(t["warmup"] for t in summary["trial_records"]) == 2
         assert all(

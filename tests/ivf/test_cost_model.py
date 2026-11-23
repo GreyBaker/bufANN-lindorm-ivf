@@ -127,7 +127,7 @@ def main():
             for key, name in (("python_common", "common.py"), ("settings", "settings.py")):
                 assert report["identities"][key] == harness.digest(repo / "benchmark/IVF" / name)
             assert report["profiled_codes"] == 64 * 2 * 4 and report["per_code_us"] > 0
-            assert not report["production_qualified"] and not report["validation_completed"]
+            assert not report["validation_completed"]
             assert report["affinity"]["explicitly_pinned"]
             sample_ids = [r[0] for r in matrix(output / "native/sample_ids.bin", "I")]
             query_ids = [r[0] for r in matrix(output / "native/query_ids.bin", "I")]

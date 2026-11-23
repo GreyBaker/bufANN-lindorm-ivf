@@ -152,11 +152,7 @@ def main():
                 assert "checkpoint_prefix" not in record and "checkpoint_time_s" not in record
                 assert not list(output.rglob("*.manifest"))
                 assert len(list(output.rglob("private.heap"))) == 1
-                assert (
-                    not summary["production_qualified"]
-                    and summary["concurrent_query_count"] == 128
-                    and summary["final_recall"] == 100
-                )
+                assert summary["concurrent_query_count"] == 128 and summary["final_recall"] == 100
                 for r in range(2):
                     part = json.loads((output / f"rounds/round_{r}.json").read_text())
                     assert (
@@ -196,7 +192,7 @@ def main():
             run(execute, driven_env)
             output = work / "runs/update_driven"
             summary = json.loads((output / "summary.json").read_text())
-            assert summary["final_recall"] == 100 and not summary["production_qualified"]
+            assert summary["final_recall"] == 100
             record = json.loads((output / "result.json").read_text())
             assert record["scheduler"] == "update_driven"
             assert record["insert_count"] == record["delete_count"] == 16

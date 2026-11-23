@@ -173,7 +173,7 @@ namespace {
               "Distance counter mislabeled");
           distances += stats.distance_evaluations;
         }
-        std::cout << "{\"scope\":\"synthetic_s08_not_production\",\"seed\":0,"
+        std::cout << "{\"scope\":\"synthetic_s08\",\"seed\":0,"
                      "\"nprobe\":"
                   << probe << ",\"mode\":\"" << router_mode_name(mode)
                   << "\",\"recall\":" << recall

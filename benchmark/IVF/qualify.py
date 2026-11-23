@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Explicit, non-destructive IVF training comparisons and repeated query sweeps.
 
-Results describe the supplied inputs, not automatic production qualification.
 Completion summaries are written last; failed/partial evidence is never deleted.
 """
 import argparse
@@ -163,7 +162,7 @@ def train(args):
         "timeout_s_per_mode": args.timeout,
         "process_wall_scope": "entire_diagnostic_child_including_evaluation_export_excludes_python_hashes",
         "gates": {"max_sse_ratio": args.max_sse_ratio, "max_peak_rss_mb": args.max_peak_rss_mb},
-        "scope": "same_base_only_training_sample_not_holdout_or_production_acceptance",
+        "scope": "same_base_only_training_sample_not_holdout",
         "modes": modes,
     }
     output.mkdir(parents=True)  # existing destinations, including partial runs, refused
@@ -251,7 +250,6 @@ def train(args):
             "exact_trained_reference_available": exact is not None,
             "evaluation_sse_over_exact_by_mode": ratios,
             "zero_reference_policy": "ratio_1_for_both_zero_null_for_nonzero_approximate_or_absent_reference",
-            "production_qualified": False,
         },
     )
     require(passed, f"declared training gates failed; inspect {output / 'summary.json'}")
@@ -442,7 +440,6 @@ def sweep(args):
             "groups": groups,
             "trial_records": records,
             "aggregation_policy": "min_median_max_across_runs_not_pooled_query_percentiles",
-            "production_qualified": False,
         },
     )
     require(passed, f"declared sweep gates failed; inspect {root / 'summary.json'}")
@@ -532,7 +529,7 @@ def main():
             )
     args = parser.parse_args()
     try:
-        require(sys.platform == "linux", "qualification orchestration targets Linux/WSL")
+        require(sys.platform == "linux", "IVF orchestration targets Linux/WSL")
         (train if args.command == "train" else sweep)(args)
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)

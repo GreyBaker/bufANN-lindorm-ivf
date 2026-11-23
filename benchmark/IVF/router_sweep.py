@@ -85,7 +85,6 @@ def main():
             "identities": identities,
             "affinity": cpu,
             "runtime_environment": runtime_environment(),
-            "production_qualified": False,
             "cache_policy": "uncontrolled_after_input_hashes_no_cache_drop",
             "selection_policy": "mean_recall_and_mean_qps_across_repeats_fastest_observed_per_mode",
         },
@@ -186,7 +185,6 @@ def main():
         args.output / "summary.json",
         {
             "scope": args.scope,
-            "production_qualified": False,
             "completed": True,
             "plan_identity": digest(args.output / "plan.json"),
             "comparison": "fixed_centroid_router_modes_no_spfresh",

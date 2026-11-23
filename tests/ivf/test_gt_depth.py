@@ -275,6 +275,6 @@ class DepthTests(unittest.TestCase):
 
 if __name__ == "__main__":
     if np is None:
-        print("Exact GT depth tests require NumPy; no exact-scan qualification performed.")
+        print("Exact GT depth tests require NumPy.")
         sys.exit(77)
     unittest.main()

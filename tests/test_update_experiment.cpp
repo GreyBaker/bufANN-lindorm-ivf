@@ -353,7 +353,7 @@ static bool smoke_1_disk_query(const std::string& data_root) {
   if (query_data)
     diskann::aligned_free(query_data);
 
-  // sift-8K sanity floor; not a production target
+  // sift-8K sanity floor
   bool pass = (avg_recall >= 0.60);
   std::cout << "  [Smoke 1] " << (pass ? "PASS" : "FAIL") << std::endl;
   return pass;

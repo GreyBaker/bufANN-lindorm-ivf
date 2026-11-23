@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
       if (uint64_t(n) * 32 > m)
         std::cerr << "WARNING: nlist=" << n << " has " << double(m) / n
                   << " sample rows per centroid, below the historical project "
-                     "minimum 32; not production qualified\n";
+                     "minimum 32\n";
       config.nlist = n;
       config.validate();
       auto trained = train_centroids_ann((root / "sample.bin").string(), config,
@@ -417,7 +417,6 @@ int main(int argc, char** argv) {
     emit("version", 2);
     emit("kind", "ivf_cost_model");
     emit("completed", chosen != 0);
-    emit("production_qualified", false);
     emit("min_sample_per_centroid", minimum);
     emit("candidate_eligibility_policy",
          "declared_project_minimum_not_paper_requirement");

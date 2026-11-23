@@ -196,7 +196,6 @@ def run(args):
         output / "summary.json",
         {
             "version": 3,
-            "production_qualified": False,
             "round_results": round_results,
             "final_recall": record["recall"],
             "mixed_wall_s": record["mixed_wall_s"],

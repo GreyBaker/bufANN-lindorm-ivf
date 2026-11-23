@@ -811,7 +811,7 @@ int main(int argc, char** argv) {
     exercise<int8_t>(root / "int8", DataType::Int8);
     exercise<uint8_t>(root / "uint8", DataType::UInt8);
     std::cout << "Mutable native IVF heap/insert/delete/query/writeback "
-                 "fixtures passed (no CLI/production qualification)\n";
+                  "fixtures passed\n";
     return 0;
   } catch (const diskann::ANNException& error) {
     std::cerr << error.message() << '\n';

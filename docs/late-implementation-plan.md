@@ -1,7 +1,6 @@
 # Late implementation plan
 
-Status: phases 1–4 implemented and validated on bounded fixtures. Full-scale
-SIFT100M performance/quality and cross-system comparisons remain unqualified.
+Status: phases 1-4 implemented and validated on bounded fixtures.
 
 **Historical plan/evidence:** the 15-pass recipes and validation counts below
 describe those completed phases. As of 2026-11-14, implementation defaults,
@@ -253,8 +252,8 @@ are covered at the native interface. Fully empty mutation rounds remain invalid.
 One largest-round coordinate buffer is reused. Later-round staging and accounting
 are included in continuous elapsed time, while initial staging is excluded.
 Query counts are attributed by completion; finite-quota workers may wait when a
-round's quota is exhausted, but are never restarted. Full-scale throughput,
-hard-RSS bounds and production qualification are not claimed. The shared
+round's quota is exhausted, but are never restarted. Memory budgets are admission
+estimates rather than enforced RSS limits. The shared
 checkpoint API and sequential mutation checkpoints remain for phase 3; no new
 final writeback or FAISS migration has been implemented.
 
@@ -632,8 +631,7 @@ Median estimated training bytes: rebuild **12,825,144 → 12,825,144**;
 reuse/seeded **12,857,976 → 12,890,744**; LV/LV+
 **12,964,472 → 12,997,240**. Median process-lifetime peak RSS is
 **18.94 → 18.89 MiB** in all five controls, including evaluation/export and
-runtime/allocator effects. These are conservative estimates and tiny-process RSS,
-not evidence of production memory savings.
+runtime/allocator effects. These are conservative estimates and tiny-process RSS.
 
 Routing end-to-end mean microseconds at nprobe=10, one 40-query sweep per mode:
 
@@ -658,7 +656,7 @@ Raw vanilla `graph_us` is separately scoped to the upstream call, including its
 own epoch advancement but excluding local context setup and result conversion.
 
 There is no material quality regression on these bounded fixtures. Mixed timing
-results are retained rather than optimized away or presented as production claims.
+results are retained.
 
 Notes / remaining issues:
 
@@ -722,7 +720,7 @@ Remaining limitations:
 Full-scale SIFT100M training, recall, throughput, memory, skew/drift behavior and
 matched BufANN/SPFresh comparisons still require separately authorized runs with
 fresh FAISS/15-pass preparations. The 50K historical resource smoke and these tiny
-fixtures do not qualify 128D/high-nlist production scale. Timings above are not
+fixtures use different dimensions and list counts. Timings above are not
 paper speedups; instrumentation, graph algorithms and candidate policies differ.
 
 Final graphs/PCA/PQ remain frozen during mutation. Writeback drains pages without

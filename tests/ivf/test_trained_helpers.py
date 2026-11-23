@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Explicit, small trained standalone-helper parity and IVF script integration.
 
-Not a production dataset/training/performance qualification. No Python packages.
+No Python packages.
 """
 import argparse
 import json
@@ -154,7 +154,7 @@ def main():
                 root / "eval_cached"
             ).exists(), "no-store prepare unexpectedly populated cache"
     print(
-        "Trained standalone helpers/native PQ/scripts exact-oracle qualification passed for all dtypes (fixtures only)"
+        "Trained standalone helpers/native PQ/scripts exact-oracle tests passed for all dtypes"
     )
 
 

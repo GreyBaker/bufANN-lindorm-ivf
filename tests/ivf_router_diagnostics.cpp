@@ -159,7 +159,6 @@ namespace {
     };
     emit("kind", "ivf_router_diagnostics");
     emit("version", 1);
-    emit("production_qualified", false);
     emit("data_type", data_type_name(type));
     emit("dim", router->dim());
     emit("nlist", router->nlist());
@@ -240,7 +239,7 @@ int main(int argc, char** argv) {
          "--evaluation_work_limit", "--result_file"});
     if (args.help) {
       std::cout << "Centroid-only routing ablation on one persisted graph "
-                   "family (not production acceptance).\n"
+                   "family.\n"
                    "--index_prefix PREFIX --query_file TYPED_BIN --data_type "
                    "float|int8|uint8\n"
                    "--evaluation_work_limit N [--query_rows N] [--nprobe N] "
